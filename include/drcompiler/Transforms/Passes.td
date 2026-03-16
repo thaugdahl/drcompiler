@@ -97,4 +97,46 @@ def RaiseMallocToMemRefPass
   let constructor = "mlir::createRaiseMallocToMemRefPass()";
 }
 
+def MemoryFissionPass
+    : Pass<"memory-fission", "mlir::ModuleOp">
+{
+  let summary = "Cache-aware loop fission: materialize redundant computation into buffers";
+
+  let description = [{
+    Identifies expensive computation subtrees that are duplicated across
+    multiple loops (typically produced by cgeist -O2 loop fusion) and, when
+    the cost model indicates it is profitable, hoists the shared computation
+    into a separate producer loop backed by a materialization buffer.
+
+    This is the inverse of loop fusion: it introduces memory to avoid
+    redundant computation when the buffer fits in cache and the ALU cost
+    exceeds the load cost.
+
+    The pass fingerprints computation chains within affine.for loop bodies
+    to detect structural duplicates reading from the same source memref.
+  }];
+
+  let options = [
+    Option<"l1Size", "l1-size", "unsigned", "32768",
+           "L1 data cache size in bytes">,
+    Option<"l2Size", "l2-size", "unsigned", "262144",
+           "L2 cache size in bytes">,
+    Option<"l1Latency", "l1-latency", "unsigned", "4",
+           "L1 cache hit latency in cycles">,
+    Option<"l2Latency", "l2-latency", "unsigned", "12",
+           "L2 cache hit latency in cycles">,
+    Option<"l3Latency", "l3-latency", "unsigned", "40",
+           "L3 cache hit latency in cycles">,
+    Option<"testDiagnostics", "test-diagnostics", "bool", "false",
+           "Emit remarks for test diagnostics">
+  ];
+
+  let dependentDialects = [
+    "memref::MemRefDialect", "affine::AffineDialect",
+    "arith::ArithDialect", "math::MathDialect"
+  ];
+
+  let constructor = "mlir::createMemoryFissionPass()";
+}
+
 #endif

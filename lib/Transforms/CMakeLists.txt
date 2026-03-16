@@ -1,5 +1,6 @@
 add_mlir_library(DRCompTransforms
   DataRecomputation.cpp
+  MemoryFission.cpp
   RaiseMallocToMemRef.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -18,6 +19,7 @@ add_mlir_library(DRCompTransforms
     MLIRSCFDialect
     MLIRAffineDialect
     MLIRArithDialect
+    MLIRMathDialect
     MLIRMemRefDialect
     MLIRLLVMDialect
     MLIRPtrDialect
