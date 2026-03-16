@@ -969,10 +969,19 @@ static void printOperandTree(mlir::Value val, unsigned indent = 0) {
 // ===== Recomputation Helpers =====
 
 /// Returns true if the store dominates the load (same function, direct forward).
-static bool isSafeToForward(mlir::memref::StoreOp storeOp,
-                            mlir::memref::LoadOp loadOp,
+static bool isSafeToForward(mlir::Operation *storeOp,
+                            mlir::Operation *loadOp,
                             mlir::DominanceInfo &domInfo) {
-  return domInfo.dominates(storeOp.getOperation(), loadOp.getOperation());
+  return domInfo.dominates(storeOp, loadOp);
+}
+
+/// Extract the value written by a store-like op (memref.store, affine.store).
+static mlir::Value getStoredValue(mlir::Operation *op) {
+  if (auto s = mlir::dyn_cast<mlir::memref::StoreOp>(op))
+    return s.getValueToStore();
+  if (auto s = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
+    return s.getValueToStore();
+  return {};
 }
 
 /// Maximum number of load→store chains to follow during rematerialization.
@@ -1040,18 +1049,18 @@ static bool isRematerializable(
     if (!defOp)
       return false;
 
-    // Special case: chain through SINGLE-provenance memref.load ops.
-    if (auto innerLoad = mlir::dyn_cast<mlir::memref::LoadOp>(defOp)) {
+    // Special case: chain through SINGLE-provenance load ops
+    // (memref.load or affine.load).
+    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(defOp)) {
       if (loadProv && loadSubs && chainDepth < kMaxChainDepth) {
         auto provIt = loadProv->find(defOp);
         if (provIt != loadProv->end()) {
           const auto &provSet = provIt->second;
           if (provSet.size() == 1 && !provSet.contains(nullptr)) {
             auto *uniqueStore = *provSet.begin();
-            if (auto storeOp =
-                    mlir::dyn_cast<mlir::memref::StoreOp>(uniqueStore)) {
-              mlir::Value chainedVal = storeOp.getValueToStore();
-              loadSubs->push_back({innerLoad.getResult(), chainedVal});
+            mlir::Value chainedVal = getStoredValue(uniqueStore);
+            if (chainedVal) {
+              loadSubs->push_back({defOp->getResult(0), chainedVal});
               worklist.push_back(chainedVal);
               ++chainDepth;
               continue;
@@ -1298,63 +1307,61 @@ void DataRecomputationPass::runOnOperation() {
     mlir::DominanceInfo domInfo(moduleOp);
 
     // Collect load/store pairs to process (avoid iterator invalidation).
+    // Handles memref.load/store and affine.load/store uniformly.
     struct SingleLoadEntry {
-      mlir::memref::LoadOp loadOp;
-      mlir::memref::StoreOp storeOp;
+      mlir::Operation *loadOp;
+      mlir::Operation *storeOp;
     };
     llvm::SmallVector<SingleLoadEntry> toProcess;
 
     for (auto &[loadOp, stores] : singleLoads) {
       auto *onlyStore = *stores->begin();
-      auto storeOp = mlir::dyn_cast_or_null<mlir::memref::StoreOp>(onlyStore);
-      if (!storeOp)
+      mlir::Value storedVal = getStoredValue(onlyStore);
+      if (!storedVal)
         continue;
-      auto load = mlir::cast<mlir::memref::LoadOp>(loadOp);
-      toProcess.push_back({load, storeOp});
+      toProcess.push_back({loadOp, onlyStore});
     }
 
     for (auto &entry : toProcess) {
-      mlir::memref::LoadOp loadOp = entry.loadOp;
-      mlir::memref::StoreOp storeOp = entry.storeOp;
-      mlir::Value storedVal = storeOp.getValueToStore();
+      mlir::Operation *loadOp = entry.loadOp;
+      mlir::Operation *storeOp = entry.storeOp;
+      mlir::Value storedVal = getStoredValue(storeOp);
 
-      auto loadFn =
-          loadOp->getParentOfType<mlir::FunctionOpInterface>();
-      auto storeFn =
-          storeOp->getParentOfType<mlir::FunctionOpInterface>();
+      auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
+      auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
 
       if (loadFn == storeFn) {
         // --- Intraprocedural ---
 
         // Strategy 1: Direct value forwarding (store dominates load).
         if (isSafeToForward(storeOp, loadOp, domInfo)) {
-          loadOp.getResult().replaceAllUsesWith(storedVal);
-          loadOp.erase();
+          loadOp->getResult(0).replaceAllUsesWith(storedVal);
+          loadOp->erase();
           continue;
         }
 
         // Strategy 2: Rematerialization (with load chaining).
         llvm::SmallVector<mlir::Operation *> opsToClone;
         llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> loadSubs;
-        if (isRematerializable(storedVal, loadOp.getOperation(), domInfo,
+        if (isRematerializable(storedVal, loadOp, domInfo,
                                opsToClone, /*argMapping=*/nullptr,
                                &loadProv, &loadSubs)) {
           mlir::Value clonedVal = rematerializeAt(
-              storedVal, loadOp.getOperation(), opsToClone,
+              storedVal, loadOp, opsToClone,
               /*argMapping=*/nullptr, loadSubs);
-          loadOp.getResult().replaceAllUsesWith(clonedVal);
-          loadOp.erase();
+          loadOp->getResult(0).replaceAllUsesWith(clonedVal);
+          loadOp->erase();
           continue;
         }
       } else {
         // --- Interprocedural (Strategy 3) ---
-        auto origIt = interproceduralOrigins.find(storeOp.getOperation());
+        auto origIt = interproceduralOrigins.find(storeOp);
         if (origIt == interproceduralOrigins.end())
           continue;
 
         bool replaced = false;
         for (auto &origin : origIt->second) {
-          if (!domInfo.dominates(origin.callSiteOp, loadOp.getOperation()))
+          if (!domInfo.dominates(origin.callSiteOp, loadOp))
             continue;
 
           mlir::Region *calleeBody = origin.callee.getCallableRegion();
@@ -1370,14 +1377,14 @@ void DataRecomputationPass::runOnOperation() {
 
           llvm::SmallVector<mlir::Operation *> opsToClone;
           llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> loadSubs;
-          if (isRematerializable(storedVal, loadOp.getOperation(), domInfo,
+          if (isRematerializable(storedVal, loadOp, domInfo,
                                  opsToClone, &argMapping,
                                  &loadProv, &loadSubs)) {
             mlir::Value clonedVal = rematerializeAt(
-                storedVal, loadOp.getOperation(), opsToClone, &argMapping,
+                storedVal, loadOp, opsToClone, &argMapping,
                 loadSubs);
-            loadOp.getResult().replaceAllUsesWith(clonedVal);
-            loadOp.erase();
+            loadOp->getResult(0).replaceAllUsesWith(clonedVal);
+            loadOp->erase();
             replaced = true;
             break;
           }

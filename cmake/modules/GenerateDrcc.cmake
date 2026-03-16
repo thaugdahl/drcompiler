@@ -2,7 +2,7 @@
 # with the real dr-opt path after the build-system generator expression
 # has been resolved.
 file(READ "${INPUT_FILE}" content)
-string(REPLACE "@DROPT_EXECUTABLE@" "${DROPT}" content "${content}")
+string(REPLACE "%%DROPT_EXECUTABLE%%" "${DROPT}" content "${content}")
 file(WRITE "${OUTPUT_FILE}" "${content}")
 # Make executable.
 file(CHMOD "${OUTPUT_FILE}" PERMISSIONS
