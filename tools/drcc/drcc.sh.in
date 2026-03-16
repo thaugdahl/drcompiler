@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+#===----------------------------------------------------------------------===//
+# drcc — Polygeist + DataRecomputation compiler wrapper for SPEC2017
+#
+# Acts as a drop-in replacement for cc/c++.
+# Pipeline: cgeist → dr-opt → mlir-translate → clang (backend)
+#
+# Required tools (resolved at cmake configure time):
+#   CGEIST        — Polygeist C/C++ → MLIR frontend
+#   DR_OPT        — mlir-opt with DataRecomputation pass
+#   MLIR_TRANSLATE— mlir-translate (MLIR → LLVM IR)
+#   CLANG         — clang/clang++ for final codegen + linking
+#===----------------------------------------------------------------------===//
+set -euo pipefail
+
+# --- Tool paths (filled by cmake) ---
+CGEIST="${CGEIST:-@CGEIST_EXECUTABLE@}"
+DR_OPT="${DR_OPT:-@DROPT_EXECUTABLE@}"
+MLIR_OPT="${MLIR_OPT:-@MLIR_OPT_EXECUTABLE@}"
+MLIR_TRANSLATE="${MLIR_TRANSLATE:-@MLIR_TRANSLATE_EXECUTABLE@}"
+CLANG="${CLANG:-@CLANG_EXECUTABLE@}"
+
+# --- DR pass options (user-tunable via env) ---
+: "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(data-recomputation{dr-recompute=true})"}"
+
+# --- Parse arguments ---
+# We need to intercept:
+#   -c            compile only (no link)
+#   -S            emit assembly
+#   -E            preprocess only
+#   -o <file>     output file
+#   source files  (.c, .cpp, .cc, .cxx)
+#   everything else → forwarded to cgeist (compile) or clang (link)
+
+MODE="link"  # default: compile + link
+OUTPUT=""
+SOURCES=()
+COMPILE_FLAGS=()
+LINK_FLAGS=()
+LINK_OBJECTS=()
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c)
+      MODE="compile"
+      shift
+      ;;
+    -S)
+      MODE="asm"
+      shift
+      ;;
+    -E)
+      # Preprocessing only: just delegate to clang.
+      exec "$CLANG" "$@"
+      ;;
+    -o)
+      OUTPUT="$2"
+      shift 2
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    --dr-flags)
+      DR_PASS_FLAGS="$2"
+      shift 2
+      ;;
+    -l*|-L*|-Wl,*)
+      LINK_FLAGS+=("$1")
+      shift
+      ;;
+    *.c|*.cpp|*.cc|*.cxx|*.C)
+      SOURCES+=("$1")
+      shift
+      ;;
+    *.o|*.a|*.so)
+      LINK_OBJECTS+=("$1")
+      shift
+      ;;
+    *)
+      COMPILE_FLAGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+log() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "[drcc] $*" >&2
+  fi
+}
+
+die() {
+  echo "drcc: error: $*" >&2
+  exit 1
+}
+
+# --- Validate tools ---
+for tool_var in CGEIST DR_OPT MLIR_OPT MLIR_TRANSLATE CLANG; do
+  tool_path="${!tool_var}"
+  if [[ ! -x "$tool_path" ]]; then
+    die "$tool_var not found or not executable: $tool_path"
+  fi
+done
+
+# --- Compile a single source file through the DR pipeline ---
+compile_one() {
+  local src="$1"
+  local obj="$2"
+
+  local base
+  base="$(basename "$src" | sed 's/\.[^.]*$//')"
+  local tmpdir
+  tmpdir="$(mktemp -d "/tmp/drcc.${base}.XXXXXX")"
+  trap "rm -rf '$tmpdir'" EXIT
+
+  local mlir_file="${tmpdir}/${base}.mlir"
+  local opt_file="${tmpdir}/${base}.opt.mlir"
+  local ll_file="${tmpdir}/${base}.ll"
+
+  # Step 1: C/C++ → MLIR (via Polygeist cgeist)
+  log "cgeist: $src → $mlir_file"
+  "$CGEIST" "$src" \
+    -S \
+    --function='*' \
+    --raise-scf-to-affine \
+    --memref-fullrank \
+    "${COMPILE_FLAGS[@]}" \
+    -o "$mlir_file" \
+    2>&1 || die "cgeist failed on $src"
+
+  # Fixup: cgeist (LLVM 18) emits DLTI entries with vector<Nxi32> but
+  # LLVM 22+ expects vector<Nxi64>.  Patch in-place.
+  sed -i 's/vector<\([0-9]*\)xi32>/vector<\1xi64>/g' "$mlir_file"
+
+  # Step 2: Run DataRecomputation pass
+  log "dr-opt: $mlir_file → $opt_file"
+  "$DR_OPT" "$DR_PASS_FLAGS" "$mlir_file" -o "$opt_file" \
+    2>&1 || die "dr-opt failed on $mlir_file"
+
+  # Step 3: Lower to LLVM dialect, then MLIR → LLVM IR
+  local llvm_file="${tmpdir}/${base}.llvm.mlir"
+  log "mlir-opt (lowering): $opt_file → $llvm_file"
+  "$MLIR_OPT" \
+    --convert-scf-to-cf \
+    --convert-cf-to-llvm \
+    --convert-arith-to-llvm \
+    --convert-math-to-llvm \
+    --convert-func-to-llvm \
+    --convert-index-to-llvm \
+    --finalize-memref-to-llvm \
+    --reconcile-unrealized-casts \
+    "$opt_file" -o "$llvm_file" \
+    2>&1 || die "mlir-opt lowering failed on $opt_file"
+
+  log "mlir-translate: $llvm_file → $ll_file"
+  "$MLIR_TRANSLATE" --mlir-to-llvmir "$llvm_file" -o "$ll_file" \
+    2>&1 || die "mlir-translate failed on $llvm_file"
+
+  # Step 4: LLVM IR → object (or assembly)
+  if [[ "$MODE" == "asm" ]]; then
+    log "clang: $ll_file → $obj (asm)"
+    "$CLANG" -S "$ll_file" -o "$obj" "${COMPILE_FLAGS[@]}" 2>&1
+  else
+    log "clang: $ll_file → $obj"
+    "$CLANG" -c "$ll_file" -o "$obj" "${COMPILE_FLAGS[@]}" 2>&1
+  fi
+}
+
+# --- No sources: linking only ---
+if [[ ${#SOURCES[@]} -eq 0 ]]; then
+  if [[ ${#LINK_OBJECTS[@]} -gt 0 ]]; then
+    log "link-only: ${LINK_OBJECTS[*]}"
+    exec "$CLANG" "${LINK_OBJECTS[@]}" "${LINK_FLAGS[@]}" \
+      ${OUTPUT:+-o "$OUTPUT"}
+  else
+    die "no input files"
+  fi
+fi
+
+# --- Compile each source ---
+OBJECTS=()
+for src in "${SOURCES[@]}"; do
+  if [[ "$MODE" == "compile" || "$MODE" == "asm" ]]; then
+    if [[ -n "$OUTPUT" && ${#SOURCES[@]} -eq 1 ]]; then
+      obj="$OUTPUT"
+    else
+      obj="$(basename "$src" | sed 's/\.[^.]*$/.o/')"
+    fi
+  else
+    obj="$(mktemp "/tmp/drcc.XXXXXX.o")"
+  fi
+  compile_one "$src" "$obj"
+  OBJECTS+=("$obj")
+done
+
+# --- Link if needed ---
+if [[ "$MODE" == "link" ]]; then
+  log "link: ${OBJECTS[*]} ${LINK_OBJECTS[*]}"
+  "$CLANG" "${OBJECTS[@]}" "${LINK_OBJECTS[@]}" "${LINK_FLAGS[@]}" \
+    ${OUTPUT:+-o "$OUTPUT"} 2>&1
+  # Clean up temp objects
+  for obj in "${OBJECTS[@]}"; do
+    rm -f "$obj"
+  done
+fi
