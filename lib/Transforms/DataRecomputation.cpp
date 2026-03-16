@@ -120,7 +120,8 @@ static AllocationRoots collectAllocationRoots(DRPassContext &passCtx,
   rootOp->walk([&](mlir::Operation *op){
     if (mlir::hasEffect<mlir::MemoryEffects::Allocate>(op)) {
       for (mlir::Value res : op->getResults()) {
-        if (mlir::isa<mlir::MemRefType>(res.getType())) {
+        if (mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+              res.getType())) {
           allocRootFor.try_emplace(res, op);
         }
       }
@@ -182,8 +183,18 @@ void collectBaseMemrefs(
     // worklist.
     if (mlir::Operation *def = current.getDefiningOp()) {
       if (OpTypeHelper<ViewLike>::anyOf(def)) {
-        // TODO: Verify that view ops always have the base memref as first
-        // operand
+        worklist.push_back(def->getOperand(0));
+        continue;
+      }
+
+      // llvm.getelementptr: base pointer is operand 0
+      if (mlir::isa<mlir::LLVM::GEPOp>(def)) {
+        worklist.push_back(def->getOperand(0));
+        continue;
+      }
+
+      // polygeist.memref2pointer: source memref is operand 0
+      if (def->getName().getStringRef() == "polygeist.memref2pointer") {
         worklist.push_back(def->getOperand(0));
         continue;
       }
@@ -203,12 +214,12 @@ static StoreValueDeps computeStoreValueDeps(
     llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
   StoreValueDeps result;
 
-  rootOp->walk([&](mlir::memref::StoreOp storeOp) {
+  auto processStoreValue = [&](mlir::Operation *storeOp, mlir::Value storedVal) {
     llvm::SmallDenseSet<mlir::Operation *, 4> deps;
     llvm::SmallVector<mlir::Value, 8> worklist;
     llvm::SmallDenseSet<mlir::Value> visited;
 
-    worklist.push_back(storeOp.getValueToStore());
+    worklist.push_back(storedVal);
 
     while (!worklist.empty()) {
       mlir::Value current = worklist.pop_back_val();
@@ -245,10 +256,35 @@ static StoreValueDeps computeStoreValueDeps(
         continue;
       }
 
-      // CallOpInterface: conservatively depend on all memref-typed operands
+      // AffineLoadOp: record the load's memref root as a dependency
+      if (auto affLoad = mlir::dyn_cast<mlir::affine::AffineLoadOp>(defOp)) {
+        llvm::SmallVector<mlir::Value, 2> bases;
+        collectBaseMemrefs(affLoad.getMemRef(), allocRootFor, bases);
+        for (mlir::Value base : bases) {
+          auto it = allocRootFor.find(base);
+          if (it != allocRootFor.end())
+            deps.insert(it->second);
+        }
+        continue;
+      }
+
+      // LLVM::LoadOp: record the load's pointer root as a dependency
+      if (auto llvmLoad = mlir::dyn_cast<mlir::LLVM::LoadOp>(defOp)) {
+        llvm::SmallVector<mlir::Value, 2> bases;
+        collectBaseMemrefs(llvmLoad.getAddr(), allocRootFor, bases);
+        for (mlir::Value base : bases) {
+          auto it = allocRootFor.find(base);
+          if (it != allocRootFor.end())
+            deps.insert(it->second);
+        }
+        continue;
+      }
+
+      // CallOpInterface: conservatively depend on all memref/ptr-typed operands
       if (mlir::isa<mlir::CallOpInterface>(defOp)) {
         for (mlir::Value operand : defOp->getOperands()) {
-          if (!mlir::isa<mlir::MemRefType>(operand.getType()))
+          if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+                  operand.getType()))
             continue;
           llvm::SmallVector<mlir::Value, 2> bases;
           collectBaseMemrefs(operand, allocRootFor, bases);
@@ -271,7 +307,17 @@ static StoreValueDeps computeStoreValueDeps(
     }
 
     if (!deps.empty())
-      result[storeOp.getOperation()] = std::move(deps);
+      result[storeOp] = std::move(deps);
+  };
+
+  rootOp->walk([&](mlir::memref::StoreOp op) {
+    processStoreValue(op.getOperation(), op.getValueToStore());
+  });
+  rootOp->walk([&](mlir::affine::AffineStoreOp op) {
+    processStoreValue(op.getOperation(), op.getValueToStore());
+  });
+  rootOp->walk([&](mlir::LLVM::StoreOp op) {
+    processStoreValue(op.getOperation(), op.getValue());
   });
 
   return result;
@@ -375,6 +421,22 @@ void applyStore(
   }
 }
 
+/// Update state to reflect an llvm.store.
+/// Always uses nullopt coverage (flat pointer, no index information).
+void applyLLVMStore(
+    mlir::LLVM::StoreOp storeOp, StoreMap &state,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor,
+    const StoreValueDeps &storeValueDeps) {
+  llvm::SmallVector<mlir::Value, 2> bases;
+  collectBaseMemrefs(storeOp.getAddr(), allocRootFor, bases);
+  for (mlir::Value base : bases) {
+    auto it = allocRootFor.find(base);
+    if (it == allocRootFor.end()) continue;
+    killDependentStores(it->second, state, storeValueDeps);
+    state[it->second].push_back({storeOp.getOperation(), std::nullopt});
+  }
+}
+
 // ===== Phase 5: Call Site Analysis =====
 
 /// Analyze how a defined callee uses a specific memref argument.
@@ -399,7 +461,7 @@ static CalleeArgEffect analyzeCalleeArg(
   }
 
   mlir::BlockArgument arg = body->getArgument(argIdx);
-  if (!mlir::isa<mlir::MemRefType>(arg.getType()))
+  if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(arg.getType()))
     return effect;
 
   // Collect all values that are views/casts of this argument.
@@ -412,9 +474,11 @@ static CalleeArgEffect analyzeCalleeArg(
     mlir::Value current = worklist.pop_back_val();
     for (mlir::OpOperand &use : current.getUses()) {
       mlir::Operation *user = use.getOwner();
-      if (OpTypeHelper<ViewLike>::anyOf(user)) {
+      if (OpTypeHelper<ViewLike>::anyOf(user) ||
+          mlir::isa<mlir::LLVM::GEPOp>(user)) {
         for (mlir::Value result : user->getResults()) {
-          if (mlir::isa<mlir::MemRefType>(result.getType())) {
+          if (mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+                  result.getType())) {
             if (argValues.insert(result).second)
               worklist.push_back(result);
           }
@@ -431,6 +495,18 @@ static CalleeArgEffect analyzeCalleeArg(
         if (argValues.contains(storeOp.getMemRef())) {
           effect.mayWrite = true;
           effect.storeOps.push_back(storeOp.getOperation());
+        }
+      }
+      if (auto affStore = mlir::dyn_cast<mlir::affine::AffineStoreOp>(user)) {
+        if (argValues.contains(affStore.getMemRef())) {
+          effect.mayWrite = true;
+          effect.storeOps.push_back(affStore.getOperation());
+        }
+      }
+      if (auto llvmStore = mlir::dyn_cast<mlir::LLVM::StoreOp>(user)) {
+        if (argValues.contains(llvmStore.getAddr())) {
+          effect.mayWrite = true;
+          effect.storeOps.push_back(llvmStore.getOperation());
         }
       }
       if (mlir::isa<mlir::CallOpInterface>(user))
@@ -496,9 +572,11 @@ void applyCall(
   // Track which roots we've already clobbered to avoid redundant work.
   llvm::SmallDenseSet<mlir::Operation *, 8> clobbered;
 
-  // Handle explicit memref arguments.
+  // Handle explicit memref / llvm.ptr arguments.
   for (auto [i, operand] : llvm::enumerate(callOp->getOperands())) {
-    if (!mlir::isa<mlir::MemRefType>(operand.getType())) continue;
+    if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+            operand.getType()))
+      continue;
     llvm::SmallVector<mlir::Value, 2> bases;
     collectBaseMemrefs(operand, allocRootFor, bases);
     for (mlir::Value base : bases) {
@@ -631,9 +709,62 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
     return;
   }
 
-  // --- memref.store ---
+  // --- memref.store / affine.store ---
   if (auto storeOp = mlir::dyn_cast<mlir::memref::StoreOp>(op)) {
     applyStore(storeOp, state, allocRootFor, ctx.storeValueDeps);
+    return;
+  }
+  if (auto affStore = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op)) {
+    // Treat affine.store conservatively (nullopt coverage — affine maps
+    // make index extraction non-trivial).
+    llvm::SmallVector<mlir::Value, 2> bases;
+    collectBaseMemrefs(affStore.getMemRef(), allocRootFor, bases);
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end()) continue;
+      killDependentStores(it->second, state, ctx.storeValueDeps);
+      state[it->second].push_back({op, std::nullopt});
+    }
+    return;
+  }
+
+  // --- llvm.store: flat (no index coverage) ---
+  if (auto llvmStore = mlir::dyn_cast<mlir::LLVM::StoreOp>(op)) {
+    applyLLVMStore(llvmStore, state, allocRootFor, ctx.storeValueDeps);
+    return;
+  }
+
+  // --- llvm.load: record provenance (flat, all stores match) ---
+  if (auto llvmLoad = mlir::dyn_cast<mlir::LLVM::LoadOp>(op)) {
+    llvm::SmallVector<mlir::Value, 2> bases;
+    collectBaseMemrefs(llvmLoad.getAddr(), allocRootFor, bases);
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end()) continue;
+      auto rootIt = state.find(it->second);
+      if (rootIt == state.end()) continue;
+
+      auto &provSet = loadProv[op];
+      for (const auto &entry : rootIt->second)
+        provSet.insert(entry.storeOp);
+    }
+    return;
+  }
+
+  // --- affine.load: record provenance (flat / nullopt coverage) ---
+  if (auto affLoad = mlir::dyn_cast<mlir::affine::AffineLoadOp>(op)) {
+    llvm::SmallVector<mlir::Value, 2> bases;
+    collectBaseMemrefs(affLoad.getMemRef(), allocRootFor, bases);
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end()) continue;
+      auto rootIt = state.find(it->second);
+      if (rootIt == state.end()) continue;
+
+      auto &provSet = loadProv[op];
+      for (const auto &entry : rootIt->second)
+        provSet.insert(entry.storeOp);
+    }
     return;
   }
 
@@ -690,7 +821,8 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
     edge.argStores.resize(op->getNumOperands());
 
     for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
-      if (!mlir::isa<mlir::MemRefType>(operand.getType()))
+      if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+              operand.getType()))
         continue;
 
       llvm::SmallVector<mlir::Value, 2> bases;
@@ -1092,6 +1224,18 @@ void DataRecomputationPass::runOnOperation() {
               << (fromArg ? " (ARGUMENT)" : "") << "\n";
       DRDBG() << "  Operand tree:\n";
       printOperandTree(storeOp.getValueToStore(), 2);
+    } else if (auto affStore = mlir::dyn_cast<mlir::affine::AffineStoreOp>(s)) {
+      bool fromArg = dependsOnFuncArg(affStore.getValueToStore());
+      DRDBG() << "  Provenance store: " << *s
+              << (fromArg ? " (ARGUMENT)" : "") << "\n";
+      DRDBG() << "  Operand tree:\n";
+      printOperandTree(affStore.getValueToStore(), 2);
+    } else if (auto llvmStore = mlir::dyn_cast<mlir::LLVM::StoreOp>(s)) {
+      bool fromArg = dependsOnFuncArg(llvmStore.getValue());
+      DRDBG() << "  Provenance store: " << *s
+              << (fromArg ? " (ARGUMENT)" : "") << "\n";
+      DRDBG() << "  Operand tree:\n";
+      printOperandTree(llvmStore.getValue(), 2);
     } else {
       DRDBG() << "  Provenance store: " << *s << "\n";
     }

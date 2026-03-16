@@ -9,8 +9,8 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
   let summary = "Applies data recomputation where likely to be profitable";
 
   let description = [{
-    Load-store provenance analysis: for each memref.load, determines which
-    memref.store operations could have been the last writer.
+    Load-store provenance analysis: for each memref.load (and llvm.load),
+    determines which store operations could have been the last writer.
 
     Loads are classified into four categories:
       SINGLE  - exactly one known store (recomputation candidate)
@@ -18,8 +18,15 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
       LEAKED  - provenance includes an external/unknown write (nullptr)
       KILLED  - all reaching stores were killed (empty provenance set)
 
+    Both memref and LLVM dialect ops are supported:
+      memref.alloc / llvm.call @malloc  → allocation roots
+      memref.store / llvm.store         → tracked stores
+      memref.load  / llvm.load          → tracked loads
+    LLVM loads/stores are tracked with flat (no index) coverage, so they
+    are more likely to be classified as MULTI.
+
     When --dr-recompute is set, SINGLE loads are replaced by rematerializing
-    the stored value at the load site.
+    the stored value at the load site (memref loads only).
   }];
 
   let options = [
@@ -33,10 +40,47 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
 
   let dependentDialects = [
     "memref::MemRefDialect", "vector::VectorDialect",
-    "affine::AffineDialect", "ptr::PtrDialect"
+    "affine::AffineDialect", "ptr::PtrDialect",
+    "LLVM::LLVMDialect"
   ];
 
   let constructor = "mlir::createDataRecomputationPass()";
+}
+
+def RaiseMallocToMemRefPass
+    : Pass<"raise-malloc-to-memref", "mlir::ModuleOp">
+{
+  let summary = "Raise malloc/free + LLVM load/store/GEP to memref ops";
+
+  let description = [{
+    Converts patterns produced by Polygeist cgeist for malloc-based allocations
+    back to memref dialect operations.  This is a pre-pass for
+    DataRecomputation.
+
+    Canonical input pattern (per malloc site):
+      %raw = call @malloc(%bytes) : (i64) -> memref<?xi8>
+      %ptr = "polygeist.memref2pointer"(%raw) : (memref<?xi8>) -> !llvm.ptr
+      %gep = llvm.getelementptr %ptr[%idx] : (!llvm.ptr, ...) -> !llvm.ptr, T
+      llvm.store %val, %gep : T, !llvm.ptr
+      %v   = llvm.load %gep : !llvm.ptr -> T
+      call @free(%ptr)
+
+    Target output:
+      %alloc = memref.alloc(%count) : memref<?xT>
+      memref.store %val, %alloc[%idx] : memref<?xT>
+      %v = memref.load %alloc[%idx] : memref<?xT>
+      memref.dealloc %alloc : memref<?xT>
+
+    Malloc sites whose pointer escapes (passed to a call other than @free,
+    stored to memory, cast to integer) are left untouched.
+  }];
+
+  let dependentDialects = [
+    "memref::MemRefDialect", "arith::ArithDialect",
+    "LLVM::LLVMDialect"
+  ];
+
+  let constructor = "mlir::createRaiseMallocToMemRefPass()";
 }
 
 #endif

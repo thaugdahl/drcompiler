@@ -1,4 +1,4 @@
-// RUN: dr-opt --data-recomputation --dr-test-diagnostics %s 2>&1 | FileCheck %s
+// RUN: dr-opt %s --pass-pipeline='builtin.module(data-recomputation{dr-test-diagnostics})' -verify-diagnostics
 
 func.func @simple_store_load() {
   %alloc = memref.alloc() : memref<f32>

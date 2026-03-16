@@ -1,5 +1,6 @@
 add_mlir_library(DRCompTransforms
   DataRecomputation.cpp
+  RaiseMallocToMemRef.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/drcompiler/Transforms

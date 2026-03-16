@@ -83,6 +83,22 @@ add_subdirectory(lib/Transforms)
 add_subdirectory(tools)
 
 #===----------------------------------------------------------------------===//
+# Testing (LLVM lit)
+#===----------------------------------------------------------------------===//
+
+set(DRCOMPILER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(DRCOMPILER_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+set(DRCOMPILER_TOOLS_DIR  ${CMAKE_CURRENT_BINARY_DIR}/tools/dr-opt)
+
+# Prefer system 'lit' if llvm-lit is not in the LLVM install.
+if(NOT LLVM_EXTERNAL_LIT)
+  find_program(LLVM_EXTERNAL_LIT NAMES llvm-lit lit
+    HINTS "${LLVM_TOOLS_BINARY_DIR}")
+endif()
+
+add_subdirectory(test)
+
+#===----------------------------------------------------------------------===//
 # drcc wrapper script generation
 #===----------------------------------------------------------------------===//
 

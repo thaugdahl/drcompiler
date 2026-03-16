@@ -21,7 +21,7 @@ MLIR_TRANSLATE="${MLIR_TRANSLATE:-@MLIR_TRANSLATE_EXECUTABLE@}"
 CLANG="${CLANG:-@CLANG_EXECUTABLE@}"
 
 # --- DR pass options (user-tunable via env) ---
-: "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(data-recomputation{dr-recompute=true})"}"
+: "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true})"}"
 
 # --- Parse arguments ---
 # We need to intercept:
@@ -143,6 +143,7 @@ compile_one() {
   local llvm_file="${tmpdir}/${base}.llvm.mlir"
   log "mlir-opt (lowering): $opt_file → $llvm_file"
   "$MLIR_OPT" \
+    --lower-affine \
     --convert-scf-to-cf \
     --convert-cf-to-llvm \
     --convert-arith-to-llvm \

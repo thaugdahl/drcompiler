@@ -13,6 +13,7 @@
 #define DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_DOTEMITTER_H
 
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Operation.h"
@@ -249,9 +250,13 @@ inline void emitProvenanceDot(
     llvm::DenseSet<mlir::Operation *> processedTreeOps;
     llvm::DenseSet<mlir::Value> emittedBlockArgs;
     for (mlir::Operation *storeOp : allStoreOps) {
-      auto memStoreOp = mlir::dyn_cast<mlir::memref::StoreOp>(storeOp);
-      if (!memStoreOp) continue;
-      mlir::Value val = memStoreOp.getValueToStore();
+      mlir::Value val;
+      if (auto memStoreOp = mlir::dyn_cast<mlir::memref::StoreOp>(storeOp))
+        val = memStoreOp.getValueToStore();
+      else if (auto llvmStoreOp = mlir::dyn_cast<mlir::LLVM::StoreOp>(storeOp))
+        val = llvmStoreOp.getValue();
+      else
+        continue;
       std::string fromId;
       if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(val))
         fromId = dotBlockArgId(barg);
