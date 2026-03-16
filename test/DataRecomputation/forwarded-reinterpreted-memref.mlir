@@ -12,7 +12,8 @@ module {
         offset: [2], sizes: [32], strides: [0]
         : memref<32xi32> to memref<32xi32, strided<[0], offset: 2>>
 
-    // No remark expected: per-function analysis, block arg has no tracked provenance
+    // Interprocedural propagation: view chain from block arg, linked to caller's store.
+    // expected-remark @below {{load: SINGLE}}
     %loaded_val = memref.load %reinterpret_cast[%idxt] : memref<32xi32, strided<[0], offset: 2>>
 
     return %cst1 : i32

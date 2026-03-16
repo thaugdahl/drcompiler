@@ -32,6 +32,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -984,6 +985,149 @@ static mlir::Value getStoredValue(mlir::Operation *op) {
   return {};
 }
 
+// ===== Cost Model =====
+
+/// Cache hierarchy parameters for the cost model.
+struct CacheParams {
+  unsigned l1Size;    // bytes
+  unsigned l2Size;    // bytes
+  unsigned l1Latency; // cycles
+  unsigned l2Latency;
+  unsigned l3Latency;
+  unsigned memLatency;
+};
+
+/// Estimate the ALU cost of recomputing a value by walking its SSA operand
+/// tree.  Each operation is weighted by approximate cycle cost.  Loads and
+/// block arguments are free (they are inputs, not recomputed).
+static unsigned estimateComputeCost(mlir::Value val) {
+  llvm::SmallVector<mlir::Value, 8> worklist;
+  llvm::SmallDenseSet<mlir::Value> visited;
+  unsigned cost = 0;
+  worklist.push_back(val);
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (mlir::isa<mlir::BlockArgument>(current))
+      continue;
+    mlir::Operation *defOp = current.getDefiningOp();
+    if (!defOp)
+      continue;
+
+    // Loads are inputs — they represent values already in registers or memory.
+    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
+                  mlir::LLVM::LoadOp>(defOp))
+      continue;
+
+    // Weight by operation type.
+    if (mlir::isa<mlir::arith::ConstantOp>(defOp)) {
+      cost += 0; // free
+    } else if (mlir::isa<mlir::arith::AddIOp, mlir::arith::AddFOp,
+                         mlir::arith::SubIOp, mlir::arith::SubFOp,
+                         mlir::arith::XOrIOp, mlir::arith::AndIOp,
+                         mlir::arith::OrIOp, mlir::arith::ShRSIOp,
+                         mlir::arith::ShRUIOp, mlir::arith::ShLIOp,
+                         mlir::arith::SelectOp, mlir::arith::CmpIOp,
+                         mlir::arith::CmpFOp>(defOp)) {
+      cost += 1; // cheap ALU
+    } else if (mlir::isa<mlir::arith::MulIOp, mlir::arith::MulFOp>(defOp)) {
+      cost += 3; // multiply
+    } else if (mlir::isa<mlir::arith::DivSIOp, mlir::arith::DivUIOp,
+                         mlir::arith::DivFOp, mlir::arith::RemSIOp,
+                         mlir::arith::RemUIOp, mlir::arith::RemFOp>(defOp)) {
+      cost += 15; // division
+    } else if (mlir::isa<mlir::math::SqrtOp, mlir::math::ExpOp,
+                         mlir::math::LogOp, mlir::math::SinOp,
+                         mlir::math::CosOp, mlir::math::TanhOp,
+                         mlir::math::PowFOp>(defOp)) {
+      cost += 20; // transcendental
+    } else if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::FPToSIOp,
+                         mlir::arith::ExtSIOp, mlir::arith::ExtUIOp,
+                         mlir::arith::TruncIOp, mlir::arith::IndexCastOp,
+                         mlir::arith::BitcastOp>(defOp)) {
+      cost += 1; // conversion
+    } else {
+      cost += 5; // unknown op — moderate default
+    }
+
+    for (mlir::Value operand : defOp->getOperands())
+      worklist.push_back(operand);
+  }
+  return cost;
+}
+
+/// Estimate the size of an allocation in bytes.  Returns nullopt if the size
+/// cannot be determined statically (e.g. dynamic dimensions).
+static std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
+  mlir::MemRefType memrefTy;
+
+  if (auto alloc = mlir::dyn_cast<mlir::memref::AllocOp>(allocOp))
+    memrefTy = alloc.getType();
+  else if (auto alloca = mlir::dyn_cast<mlir::memref::AllocaOp>(allocOp))
+    memrefTy = alloca.getType();
+  else
+    return std::nullopt;
+
+  if (!memrefTy.hasStaticShape())
+    return std::nullopt;
+
+  int64_t numElements = 1;
+  for (int64_t dim : memrefTy.getShape())
+    numElements *= dim;
+
+  unsigned elementBits = memrefTy.getElementTypeBitWidth();
+  if (elementBits == 0)
+    return std::nullopt;
+
+  return numElements * (elementBits / 8);
+}
+
+/// Estimate the cost of one load from a buffer, given its size and the cache
+/// hierarchy.  Uses a simple model: if the buffer fits in Lk, assume Lk
+/// latency.
+static unsigned estimateLoadLatency(int64_t bufferSizeBytes,
+                                    const CacheParams &cache) {
+  if (bufferSizeBytes <= (int64_t)cache.l1Size)
+    return cache.l1Latency;
+  if (bufferSizeBytes <= (int64_t)cache.l2Size)
+    return cache.l2Latency;
+  return cache.l3Latency;
+}
+
+/// Per-buffer materialization decision.
+struct MaterializationDecision {
+  bool recompute;         // true = eliminate buffer, false = keep it
+  unsigned computeCost;   // ALU cost to recompute one element
+  unsigned loadLatency;   // estimated load latency (from cache model)
+  unsigned numConsumers;  // number of SINGLE loads from this buffer
+  int64_t bufferSizeBytes;
+};
+
+/// Decide whether to recompute or keep a buffer.
+///
+/// Cost of keeping:   store_cost + numConsumers × loadLatency
+/// Cost of recomputing: numConsumers × computeCost
+///
+/// We recompute when recomputing is cheaper.  The store cost is approximated
+/// as equal to computeCost (you computed the value to store it).
+static MaterializationDecision
+decideBufferStrategy(unsigned computeCost, unsigned loadLatency,
+                     unsigned numConsumers, int64_t bufferSizeBytes) {
+  // Cost of keeping the buffer: we already computed the value (computeCost)
+  // plus stored it (~1 cycle write to L1), plus each consumer pays loadLatency.
+  unsigned keepCost = computeCost + 1 + numConsumers * loadLatency;
+
+  // Cost of recomputing: each consumer recomputes from scratch.
+  unsigned recomputeCost = numConsumers * computeCost;
+
+  bool recompute = recomputeCost <= keepCost;
+
+  return MaterializationDecision{recompute, computeCost, loadLatency,
+                                 numConsumers, bufferSizeBytes};
+}
+
 /// Maximum number of load→store chains to follow during rematerialization.
 constexpr unsigned kMaxChainDepth = 8;
 
@@ -1187,6 +1331,64 @@ void DataRecomputationPass::runOnOperation() {
     analyzeBlock(body->front(), state, ctx);
   });
 
+  // ===== Interprocedural Load Propagation =====
+  //
+  // The per-function analysis tracks loads within each function independently.
+  // Loads inside a callee from block-argument memrefs won't have provenance
+  // because the callee's arguments aren't in allocRootFor.
+  //
+  // This phase uses the enriched call graph: for each call site where we know
+  // (a) which allocation root maps to which callee argument, and
+  // (b) which stores reached that argument at the call site,
+  // we walk the callee body, find loads from that argument, and record
+  // their provenance using the caller's reaching stores.
+
+  for (auto &[calleeOp, edges] : callGraph) {
+    if (!calleeOp) continue;
+    auto callee = mlir::dyn_cast<mlir::FunctionOpInterface>(calleeOp);
+    if (!callee) continue;
+    mlir::Region *body = callee.getCallableRegion();
+    if (!body || body->empty()) continue;
+
+    for (auto &edge : edges) {
+      // For each memref argument position, find loads inside the callee
+      // from that argument and propagate provenance.
+      for (auto [argIdx, argStores] : llvm::enumerate(edge.argStores)) {
+        if (argStores.empty()) continue;
+        if (argIdx >= body->getNumArguments()) continue;
+
+        mlir::Value calleeArg = body->getArgument(argIdx);
+        if (!mlir::isa<mlir::MemRefType>(calleeArg.getType()))
+          continue;
+
+        // Walk all uses of this argument inside the callee to find loads.
+        llvm::SmallVector<mlir::Value, 8> worklist{calleeArg};
+        llvm::SmallDenseSet<mlir::Value> visited;
+        while (!worklist.empty()) {
+          mlir::Value current = worklist.pop_back_val();
+          if (!visited.insert(current).second) continue;
+
+          for (mlir::Operation *user : current.getUsers()) {
+            // Track through view-like ops and casts.
+            if (OpTypeHelper<ViewLike>::anyOf(user)) {
+              for (mlir::Value result : user->getResults())
+                worklist.push_back(result);
+              continue;
+            }
+
+            // Found a load from the argument — propagate provenance.
+            if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(
+                    user)) {
+              auto &prov = loadProv[user];
+              for (mlir::Operation *store : argStores)
+                prov.insert(store);
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Classify loads into SINGLE, MULTI, LEAKED, and KILLED categories.
   // LEAKED  = provenance contains nullptr (external/unknown write).
   // KILLED  = all reaching stores were killed (empty provenance set).
@@ -1306,6 +1508,9 @@ void DataRecomputationPass::runOnOperation() {
   if (drRecompute) {
     mlir::DominanceInfo domInfo(moduleOp);
 
+    CacheParams cache{drL1Size, drL2Size, drL1Latency,
+                      drL2Latency, drL3Latency, drMemLatency};
+
     // Collect load/store pairs to process (avoid iterator invalidation).
     // Handles memref.load/store and affine.load/store uniformly.
     struct SingleLoadEntry {
@@ -1322,10 +1527,136 @@ void DataRecomputationPass::runOnOperation() {
       toProcess.push_back({loadOp, onlyStore});
     }
 
+    // Helper: resolve a load op's memref to an allocation root, tracing
+    // through casts and interprocedurally through call arguments.
+    auto findAllocRoot =
+        [&](mlir::Operation *loadOp) -> mlir::Operation * {
+      mlir::Value loadMemref;
+      if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(loadOp))
+        loadMemref = l.getMemRef();
+      else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(loadOp))
+        loadMemref = l.getMemRef();
+      if (!loadMemref) return nullptr;
+
+      // Direct lookup.
+      auto rootIt = allocRootFor.find(loadMemref);
+      if (rootIt != allocRootFor.end()) return rootIt->second;
+
+      // Trace through casts/views.
+      llvm::SmallVector<mlir::Value, 4> bases;
+      collectBaseMemrefs(loadMemref, allocRootFor, bases);
+      for (mlir::Value base : bases) {
+        auto it = allocRootFor.find(base);
+        if (it != allocRootFor.end()) return it->second;
+      }
+
+      // Interprocedural: the memref traces to a block argument.
+      // Walk the bases to find a block argument, then use the call graph
+      // to find the corresponding caller operand.
+      for (mlir::Value base : bases) {
+        auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(base);
+        if (!blockArg) continue;
+
+        auto *parentOp = blockArg.getOwner()->getParentOp();
+        auto parentFunc =
+            mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parentOp);
+        if (!parentFunc) continue;
+
+        unsigned argIdx = blockArg.getArgNumber();
+
+        // Search the call graph for call sites to this function.
+        auto cgIt = callGraph.find(parentFunc.getOperation());
+        if (cgIt == callGraph.end()) continue;
+
+        for (auto &edge : cgIt->second) {
+          if (argIdx >= edge.callSiteOp->getNumOperands()) continue;
+          mlir::Value callerOperand = edge.callSiteOp->getOperand(argIdx);
+
+          auto it2 = allocRootFor.find(callerOperand);
+          if (it2 != allocRootFor.end()) return it2->second;
+
+          llvm::SmallVector<mlir::Value, 4> callerBases;
+          collectBaseMemrefs(callerOperand, allocRootFor, callerBases);
+          for (mlir::Value cb : callerBases) {
+            auto it3 = allocRootFor.find(cb);
+            if (it3 != allocRootFor.end()) return it3->second;
+          }
+        }
+      }
+      return nullptr;
+    };
+
+    // When the cost model is enabled, compute per-buffer decisions.
+    // Group SINGLE loads by allocation root and decide per-buffer.
+    llvm::DenseSet<mlir::Operation *> skipBuffers; // buffers to keep
+    if (drCostModel) {
+      // Group loads by allocation root.
+      llvm::DenseMap<mlir::Operation *, unsigned> bufferConsumerCount;
+      llvm::DenseMap<mlir::Operation *, unsigned> bufferComputeCost;
+
+      for (auto &entry : toProcess) {
+        mlir::Value storedVal = getStoredValue(entry.storeOp);
+        if (!storedVal)
+          continue;
+
+        mlir::Operation *allocRoot = findAllocRoot(entry.loadOp);
+        if (!allocRoot)
+          continue;
+
+        bufferConsumerCount[allocRoot]++;
+
+        // Track the max compute cost across stores to this buffer.
+        unsigned cost = estimateComputeCost(storedVal);
+        auto &existing = bufferComputeCost[allocRoot];
+        existing = std::max(existing, cost);
+      }
+
+      // Now decide per-buffer.
+      for (auto &[allocRoot, numConsumers] : bufferConsumerCount) {
+        unsigned computeCost = bufferComputeCost.lookup(allocRoot);
+        auto bufSize = estimateBufferSizeBytes(allocRoot);
+        int64_t sizeBytes = bufSize.value_or((int64_t)cache.l2Size + 1);
+
+        unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+        auto decision =
+            decideBufferStrategy(computeCost, loadLat, numConsumers, sizeBytes);
+
+        DRDBG() << "=== Cost model for " << *allocRoot << " ===\n";
+        DRDBG() << "  buffer size: "
+                << (bufSize ? std::to_string(*bufSize) + " bytes" : "dynamic")
+                << "\n";
+        DRDBG() << "  compute cost: " << computeCost << " cycles\n";
+        DRDBG() << "  load latency: " << loadLat << " cycles\n";
+        DRDBG() << "  consumers: " << numConsumers << "\n";
+        DRDBG() << "  decision: "
+                << (decision.recompute ? "RECOMPUTE" : "KEEP BUFFER") << "\n";
+
+        if (drTestDiagnostics)
+          allocRoot->emitRemark()
+              << "cost-model: "
+              << (decision.recompute ? "RECOMPUTE" : "KEEP")
+              << " (compute=" << computeCost
+              << ", load=" << loadLat
+              << ", consumers=" << numConsumers
+              << ", size=" << (bufSize ? std::to_string(*bufSize) : "dynamic")
+              << ")";
+
+        if (!decision.recompute)
+          skipBuffers.insert(allocRoot);
+      }
+    }
+
     for (auto &entry : toProcess) {
       mlir::Operation *loadOp = entry.loadOp;
       mlir::Operation *storeOp = entry.storeOp;
       mlir::Value storedVal = getStoredValue(storeOp);
+
+      // If cost model says keep this buffer, skip rematerialization.
+      if (drCostModel && !skipBuffers.empty()) {
+        mlir::Operation *root = findAllocRoot(loadOp);
+        if (root && skipBuffers.contains(root))
+          continue; // cost model says keep — skip this load
+      }
 
       auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
       auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();

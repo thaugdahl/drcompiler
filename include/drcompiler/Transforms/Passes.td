@@ -35,7 +35,21 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
     Option<"drDotFile", "dr-dot-file", "std::string", /*default=*/"",
            "Output file path for load-provenance DOT graph">,
     Option<"drRecompute", "dr-recompute", "bool", "false",
-           "Replace SINGLE loads with the reaching store's value">
+           "Replace SINGLE loads with the reaching store's value">,
+    Option<"drCostModel", "dr-cost-model", "bool", "false",
+           "Gate recomputation on a cache-aware cost model">,
+    Option<"drL1Size", "dr-l1-size", "unsigned", "32768",
+           "L1 data cache size in bytes">,
+    Option<"drL2Size", "dr-l2-size", "unsigned", "262144",
+           "L2 cache size in bytes">,
+    Option<"drL1Latency", "dr-l1-latency", "unsigned", "4",
+           "L1 cache hit latency in cycles">,
+    Option<"drL2Latency", "dr-l2-latency", "unsigned", "12",
+           "L2 cache hit latency in cycles">,
+    Option<"drL3Latency", "dr-l3-latency", "unsigned", "40",
+           "L3 cache hit latency in cycles">,
+    Option<"drMemLatency", "dr-mem-latency", "unsigned", "200",
+           "DRAM access latency in cycles">
   ];
 
   let dependentDialects = [

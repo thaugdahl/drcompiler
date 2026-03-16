@@ -9,7 +9,8 @@ module {
 
   func.func @callee(%memref: memref<32xi32>) -> i32 {
     %idx = arith.constant 0 : index
-    // No remark expected: per-function analysis, block arg has no tracked provenance
+    // Interprocedural propagation links this load to the caller's store.
+    // expected-remark @below {{load: SINGLE}}
     %val = memref.load %memref[%idx] : memref<32xi32>
     return %val : i32
   }

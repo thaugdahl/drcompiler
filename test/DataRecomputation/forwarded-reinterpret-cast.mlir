@@ -10,7 +10,8 @@ module {
     %idx = arith.constant 0 : index
     %rc = memref.reinterpret_cast %memref to offset: [0], sizes: [32], strides: [1]
         : memref<32xi32> to memref<32xi32, strided<[1], offset: 0>>
-    // No remark expected: view chain traces to block arg, no tracked provenance
+    // Interprocedural propagation: view chain from block arg, linked to caller's store.
+    // expected-remark @below {{load: SINGLE}}
     %val = memref.load %rc[%idx] : memref<32xi32, strided<[1], offset: 0>>
     return %val : i32
   }
