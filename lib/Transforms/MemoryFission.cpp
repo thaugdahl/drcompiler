@@ -154,15 +154,17 @@ extractChains(affine::AffineForOp forOp) {
   for (Operation *expOp : expensiveOps) {
     if (expOp->getNumResults() == 0) continue;
 
-    // Walk forward from the expensive op: if its sole user is another
-    // expensive pure op (e.g., sqrt→divf), extend the tip to cover both.
+    // Walk forward from the expensive op: if it has a single user that is
+    // another expensive pure op (e.g., sqrt→divf), extend the tip to cover
+    // both.  Only extend when there is a sole user — if the tip has multiple
+    // users it is a branch point and each branch should get its own chain.
     Value tip = expOp->getResult(0);
-    for (Operation *user : tip.getUsers()) {
+    if (tip.hasOneUse()) {
+      Operation *user = *tip.getUsers().begin();
       if (user->getNumResults() == 1 && isMemoryEffectFree(user) &&
           opCost(user) >= 10 &&
           !isa<affine::AffineYieldOp>(user)) {
         tip = user->getResult(0);
-        break; // extend once
       }
     }
 
