@@ -186,9 +186,6 @@ extractChains(affine::AffineForOp forOp) {
       if (!def) return;
       if (auto loadOp = dyn_cast<affine::AffineLoadOp>(def)) {
         Value memref = loadOp.getMemRef();
-        if (memref.getDefiningOp() &&
-            isa<memref::AllocOp, memref::AllocaOp>(memref.getDefiningOp()))
-          return;
         if (!sourceMemref)
           sourceMemref = memref;
         return;
@@ -348,6 +345,23 @@ void MemoryFissionPass::runOnOperation() {
 
       if (!shouldFission)
         continue;
+
+      // Safety: skip if any candidate loop stores to the source memref.
+      // The source must be read-only across all consumers for fission to
+      // be correct (otherwise loop order matters and the shared buffer
+      // would capture stale values).
+      bool sourceWritten = false;
+      for (auto &[loop, chain] : cand.loops) {
+        loop.getBody()->walk([&](affine::AffineStoreOp storeOp) {
+          if (storeOp.getMemRef() == cand.sourceMemref)
+            sourceWritten = true;
+        });
+        if (sourceWritten) break;
+      }
+      if (sourceWritten) {
+        DRDBG() << "  Skipping: source memref is written by a consumer\n";
+        continue;
+      }
 
       // Safety: skip if any loop has a complex body (nested affine.for).
       auto &[firstLoop, firstChain] = cand.loops[0];
