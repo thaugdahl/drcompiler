@@ -1,4 +1,5 @@
 add_mlir_library(DRCompTransforms
+  CpuCostModel.cpp
   DataRecomputation.cpp
   MemoryFission.cpp
   RaiseMallocToMemRef.cpp

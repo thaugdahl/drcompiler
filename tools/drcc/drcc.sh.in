@@ -22,6 +22,7 @@ CLANG="${CLANG:-@CLANG_EXECUTABLE@}"
 
 # --- DR pass options (user-tunable via env) ---
 : "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true})"}"
+: "${CPU_COST_MODEL_FILE:=}"
 
 # --- Parse arguments ---
 # We need to intercept:
@@ -64,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dr-flags)
       DR_PASS_FLAGS="$2"
+      shift 2
+      ;;
+    --cpu-cost-model-file)
+      CPU_COST_MODEL_FILE="$2"
       shift 2
       ;;
     -l*|-L*|-Wl,*)
@@ -135,8 +140,17 @@ compile_one() {
   sed -i 's/vector<\([0-9]*\)xi32>/vector<\1xi64>/g' "$mlir_file"
 
   # Step 2: Run DataRecomputation pass
+  # If a CPU cost model file is specified, inject the option into each pass
+  # in the pipeline that supports it.
+  local dr_flags="$DR_PASS_FLAGS"
+  if [[ -n "$CPU_COST_MODEL_FILE" ]]; then
+    # Inject cpu-cost-model-file= into pass option blocks {…}.
+    # MLIR pipeline options are space-separated inside {…}.
+    # Passes that don't recognise the option will ignore it.
+    dr_flags="${dr_flags//\}/ cpu-cost-model-file=$CPU_COST_MODEL_FILE\}}"
+  fi
   log "dr-opt: $mlir_file → $opt_file"
-  "$DR_OPT" "$DR_PASS_FLAGS" "$mlir_file" -o "$opt_file" \
+  "$DR_OPT" "$dr_flags" "$mlir_file" -o "$opt_file" \
     2>&1 || die "dr-opt failed on $mlir_file"
 
   # Step 3: Lower to LLVM dialect, then MLIR → LLVM IR

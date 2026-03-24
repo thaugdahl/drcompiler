@@ -25,6 +25,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/DataRecomputation.h"
+#include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/DotEmitter.h"
 #include "drcompiler/Transforms/DataRecomputationIndexing.h"
@@ -998,9 +999,10 @@ struct CacheParams {
 };
 
 /// Estimate the ALU cost of recomputing a value by walking its SSA operand
-/// tree.  Each operation is weighted by approximate cycle cost.  Loads and
+/// tree.  Each operation is weighted via the CpuCostModel.  Loads and
 /// block arguments are free (they are inputs, not recomputed).
-static unsigned estimateComputeCost(mlir::Value val) {
+static unsigned estimateComputeCost(mlir::Value val,
+                                    const drcompiler::CpuCostModel &costModel) {
   llvm::SmallVector<mlir::Value, 8> worklist;
   llvm::SmallDenseSet<mlir::Value> visited;
   unsigned cost = 0;
@@ -1021,36 +1023,7 @@ static unsigned estimateComputeCost(mlir::Value val) {
                   mlir::LLVM::LoadOp>(defOp))
       continue;
 
-    // Weight by operation type.
-    if (mlir::isa<mlir::arith::ConstantOp>(defOp)) {
-      cost += 0; // free
-    } else if (mlir::isa<mlir::arith::AddIOp, mlir::arith::AddFOp,
-                         mlir::arith::SubIOp, mlir::arith::SubFOp,
-                         mlir::arith::XOrIOp, mlir::arith::AndIOp,
-                         mlir::arith::OrIOp, mlir::arith::ShRSIOp,
-                         mlir::arith::ShRUIOp, mlir::arith::ShLIOp,
-                         mlir::arith::SelectOp, mlir::arith::CmpIOp,
-                         mlir::arith::CmpFOp>(defOp)) {
-      cost += 1; // cheap ALU
-    } else if (mlir::isa<mlir::arith::MulIOp, mlir::arith::MulFOp>(defOp)) {
-      cost += 3; // multiply
-    } else if (mlir::isa<mlir::arith::DivSIOp, mlir::arith::DivUIOp,
-                         mlir::arith::DivFOp, mlir::arith::RemSIOp,
-                         mlir::arith::RemUIOp, mlir::arith::RemFOp>(defOp)) {
-      cost += 15; // division
-    } else if (mlir::isa<mlir::math::SqrtOp, mlir::math::ExpOp,
-                         mlir::math::LogOp, mlir::math::SinOp,
-                         mlir::math::CosOp, mlir::math::TanhOp,
-                         mlir::math::PowFOp>(defOp)) {
-      cost += 20; // transcendental
-    } else if (mlir::isa<mlir::arith::SIToFPOp, mlir::arith::FPToSIOp,
-                         mlir::arith::ExtSIOp, mlir::arith::ExtUIOp,
-                         mlir::arith::TruncIOp, mlir::arith::IndexCastOp,
-                         mlir::arith::BitcastOp>(defOp)) {
-      cost += 1; // conversion
-    } else {
-      cost += 5; // unknown op — moderate default
-    }
+    cost += costModel.opCost(defOp);
 
     for (mlir::Value operand : defOp->getOperands())
       worklist.push_back(operand);
@@ -1300,6 +1273,13 @@ private:
 
 void DataRecomputationPass::runOnOperation() {
   moduleOp = this->getOperation();
+
+  // Load CPU cost model (from file or built-in defaults).
+  drcompiler::CpuCostModel costModel =
+      cpuCostModelFile.empty()
+          ? drcompiler::CpuCostModel::getDefault()
+          : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
+
   mlir::MLIRContext *context = &getContext();
   mlir::SymbolTableCollection symTabCollection{};
 
@@ -1606,7 +1586,7 @@ void DataRecomputationPass::runOnOperation() {
         bufferConsumerCount[allocRoot]++;
 
         // Track the max compute cost across stores to this buffer.
-        unsigned cost = estimateComputeCost(storedVal);
+        unsigned cost = estimateComputeCost(storedVal, costModel);
         auto &existing = bufferComputeCost[allocRoot];
         existing = std::max(existing, cost);
       }

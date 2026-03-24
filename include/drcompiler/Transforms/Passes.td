@@ -49,7 +49,9 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
     Option<"drL3Latency", "dr-l3-latency", "unsigned", "40",
            "L3 cache hit latency in cycles">,
     Option<"drMemLatency", "dr-mem-latency", "unsigned", "200",
-           "DRAM access latency in cycles">
+           "DRAM access latency in cycles">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
+           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">
   ];
 
   let dependentDialects = [
@@ -128,7 +130,9 @@ def MemoryFissionPass
     Option<"l3Latency", "l3-latency", "unsigned", "40",
            "L3 cache hit latency in cycles">,
     Option<"testDiagnostics", "test-diagnostics", "bool", "false",
-           "Emit remarks for test diagnostics">
+           "Emit remarks for test diagnostics">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
+           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">
   ];
 
   let dependentDialects = [

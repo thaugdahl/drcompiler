@@ -71,6 +71,7 @@ ARG LLVM_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake ninja-build g++ python3 \
       libc6-dev libstdc++6 zlib1g libzstd1 \
+      lmbench \
     && rm -rf /var/lib/apt/lists/*
 
 # Full LLVM 22 install (needed to compile dr-opt)

@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/MemoryFission.h"
+#include "drcompiler/Transforms/CpuCostModel.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -39,29 +40,7 @@ using namespace mlir;
 
 namespace {
 
-// ===== Cost Model (shared constants with DataRecomputation) =====
-
-static unsigned opCost(Operation *op) {
-  if (isa<arith::ConstantOp>(op))
-    return 0;
-  if (isa<arith::AddIOp, arith::AddFOp, arith::SubIOp, arith::SubFOp,
-          arith::XOrIOp, arith::AndIOp, arith::OrIOp, arith::ShRSIOp,
-          arith::ShRUIOp, arith::ShLIOp, arith::SelectOp, arith::CmpIOp,
-          arith::CmpFOp>(op))
-    return 1;
-  if (isa<arith::MulIOp, arith::MulFOp>(op))
-    return 3;
-  if (isa<arith::DivSIOp, arith::DivUIOp, arith::DivFOp, arith::RemSIOp,
-          arith::RemUIOp, arith::RemFOp>(op))
-    return 15;
-  if (isa<math::SqrtOp, math::ExpOp, math::LogOp, math::SinOp, math::CosOp,
-          math::TanhOp, math::PowFOp>(op))
-    return 20;
-  if (isa<arith::SIToFPOp, arith::FPToSIOp, arith::ExtSIOp, arith::ExtUIOp,
-          arith::TruncIOp, arith::IndexCastOp, arith::BitcastOp>(op))
-    return 1;
-  return 5;
-}
+// ===== Cost Model (loaded from JSON or built-in defaults) =====
 
 // ===== Computation Chain Fingerprinting =====
 
@@ -140,14 +119,15 @@ static void buildFingerprint(Value val, Value sourceMemref,
 /// each, and fingerprint it.  This captures the shared expensive computation
 /// regardless of what consumer-specific ops use its result.
 static SmallVector<CompChain>
-extractChains(affine::AffineForOp forOp) {
+extractChains(affine::AffineForOp forOp,
+              const drcompiler::CpuCostModel &costModel) {
   SmallVector<CompChain> chains;
   DenseSet<Operation *> alreadyTipped;
 
   // Find expensive ops in the loop body.
   SmallVector<Operation *> expensiveOps;
   for (Operation &op : *forOp.getBody()) {
-    if (opCost(&op) >= 15)
+    if (costModel.opCost(&op) >= 15)
       expensiveOps.push_back(&op);
   }
 
@@ -162,7 +142,7 @@ extractChains(affine::AffineForOp forOp) {
     if (tip.hasOneUse()) {
       Operation *user = *tip.getUsers().begin();
       if (user->getNumResults() == 1 && isMemoryEffectFree(user) &&
-          opCost(user) >= 10 &&
+          costModel.opCost(user) >= 10 &&
           !isa<affine::AffineYieldOp>(user)) {
         tip = user->getResult(0);
       }
@@ -191,7 +171,7 @@ extractChains(affine::AffineForOp forOp) {
         return;
       }
       if (!isMemoryEffectFree(def)) return;
-      cost += opCost(def);
+      cost += costModel.opCost(def);
       subtreeOps.push_back(def);
       for (Value operand : def->getOperands())
         traceBack(operand);
@@ -249,6 +229,12 @@ public:
 void MemoryFissionPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
 
+  // Load CPU cost model (from file or built-in defaults).
+  drcompiler::CpuCostModel costModel =
+      cpuCostModelFile.empty()
+          ? drcompiler::CpuCostModel::getDefault()
+          : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
+
   moduleOp.walk([&](mlir::FunctionOpInterface funcOp) {
     Region *body = funcOp.getCallableRegion();
     if (!body || body->empty())
@@ -259,7 +245,7 @@ void MemoryFissionPass::runOnOperation() {
         memrefGroups;
 
     funcOp->walk([&](affine::AffineForOp forOp) {
-      auto chains = extractChains(forOp);
+      auto chains = extractChains(forOp, costModel);
       DRDBG() << "Loop " << forOp.getLoc() << ": " << chains.size()
               << " chains\n";
       for (auto &chain : chains) {

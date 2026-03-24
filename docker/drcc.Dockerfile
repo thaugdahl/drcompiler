@@ -13,6 +13,10 @@
 
 FROM drcc-base
 
+# lmbench for cache latency probing (baked into drcc-base on next full rebuild).
+RUN apt-get update && apt-get install -y --no-install-recommends lmbench \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . /src/drcompiler
 
 RUN cmake -G Ninja -S /src/drcompiler -B /build/drcompiler \
@@ -26,12 +30,17 @@ RUN cmake -G Ninja -S /src/drcompiler -B /build/drcompiler \
 COPY tools/drcc/drcc.sh.in /tmp/drcc.sh.in
 RUN sed \
       -e 's|@CGEIST_EXECUTABLE@|/usr/local/bin/cgeist|g' \
-      -e 's|@DROPT_EXECUTABLE@|/usr/local/bin/dr-opt|g' \
+      -e 's|%%DROPT_EXECUTABLE%%|/usr/local/bin/dr-opt|g' \
       -e 's|@MLIR_TRANSLATE_EXECUTABLE@|/opt/llvm/bin/mlir-translate|g' \
       -e 's|@CLANG_EXECUTABLE@|/opt/llvm/bin/clang|g' \
       -e 's|@MLIR_OPT_EXECUTABLE@|/opt/llvm/bin/mlir-opt|g' \
       /tmp/drcc.sh.in > /usr/local/bin/drcc \
     && chmod +x /usr/local/bin/drcc \
     && rm /tmp/drcc.sh.in
+
+# Probing scripts for generating hardware-specific cost models.
+COPY scripts/gen_cpu_cost_model.py scripts/cache_latency_bench.c \
+     scripts/probe-cost-model.sh \
+     /usr/local/share/drcompiler/scripts/
 
 ENTRYPOINT ["drcc"]
