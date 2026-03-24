@@ -23,6 +23,17 @@ CLANG="${CLANG:-@CLANG_EXECUTABLE@}"
 # --- DR pass options (user-tunable via env) ---
 : "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true})"}"
 : "${CPU_COST_MODEL_FILE:=}"
+: "${DR_STATS_DIR:=}"
+: "${DRCC_CGEIST_TIMEOUT:=120}"   # seconds; 0 = no timeout
+
+# cgeist resource directory (compiler built-in headers like stddef.h).
+# Auto-detect from the cgeist binary location if not set.
+if [[ -z "${CGEIST_RESOURCE_DIR:-}" ]]; then
+  CGEIST_RESOURCE_DIR="$(dirname "$CGEIST")/../lib/clang/18"
+  if [[ ! -d "$CGEIST_RESOURCE_DIR" ]]; then
+    CGEIST_RESOURCE_DIR=""
+  fi
+fi
 
 # --- Parse arguments ---
 # We need to intercept:
@@ -54,6 +65,11 @@ while [[ $# -gt 0 ]]; do
     -E)
       # Preprocessing only: just delegate to clang.
       exec "$CLANG" "$@"
+      ;;
+    --version)
+      echo "drcc (DataRecomputation Compiler) — LLVM + Polygeist + dr-opt"
+      "$CLANG" --version 2>/dev/null | head -1 || true
+      exit 0
       ;;
     -o)
       OUTPUT="$2"
@@ -109,6 +125,19 @@ for tool_var in CGEIST DR_OPT MLIR_OPT MLIR_TRANSLATE CLANG; do
   fi
 done
 
+# --- Compile with plain clang (fallback when DR pipeline fails) ---
+compile_clang_fallback() {
+  local src="$1"
+  local obj="$2"
+  log "FALLBACK: compiling $src with clang (DR pipeline unavailable)"
+  echo "[drcc] fallback: $src → clang -O2" >&2
+  if [[ "$MODE" == "asm" ]]; then
+    "$CLANG" -S "$src" -o "$obj" "${COMPILE_FLAGS[@]}" 2>&1
+  else
+    "$CLANG" -c "$src" -o "$obj" "${COMPILE_FLAGS[@]}" 2>&1
+  fi
+}
+
 # --- Compile a single source file through the DR pipeline ---
 compile_one() {
   local src="$1"
@@ -125,38 +154,87 @@ compile_one() {
   local ll_file="${tmpdir}/${base}.ll"
 
   # Step 1: C/C++ → MLIR (via Polygeist cgeist)
+  # Filter out flags that cgeist doesn't understand (backend-only codegen flags).
+  # cgeist uses a custom LLVM option parser and rejects many standard clang flags.
+  local cgeist_flags=()
+  for flag in "${COMPILE_FLAGS[@]}"; do
+    case "$flag" in
+      -m32|-m64)            ;;  # architecture flags
+      -f*|-fno-*)           ;;  # codegen flags (-fno-strict-aliasing, etc.)
+      *)                    cgeist_flags+=("$flag") ;;
+    esac
+  done
+
   log "cgeist: $src → $mlir_file"
-  "$CGEIST" "$src" \
+  local timeout_cmd=()
+  if [[ "$DRCC_CGEIST_TIMEOUT" -gt 0 ]] 2>/dev/null; then
+    timeout_cmd=(timeout "$DRCC_CGEIST_TIMEOUT")
+  fi
+  if ! "${timeout_cmd[@]}" "$CGEIST" "$src" \
     -S \
     --function='*' \
     --raise-scf-to-affine \
-    --memref-fullrank \
-    "${COMPILE_FLAGS[@]}" \
+    ${CGEIST_RESOURCE_DIR:+-resource-dir "$CGEIST_RESOURCE_DIR"} \
+    "${cgeist_flags[@]}" \
     -o "$mlir_file" \
-    2>&1 || die "cgeist failed on $src"
+    2>&1; then
+    compile_clang_fallback "$src" "$obj"
+    return
+  fi
 
   # Fixup: cgeist (LLVM 18) emits DLTI entries with vector<Nxi32> but
   # LLVM 22+ expects vector<Nxi64>.  Patch in-place.
   sed -i 's/vector<\([0-9]*\)xi32>/vector<\1xi64>/g' "$mlir_file"
 
+  # Fixup: cgeist represents C struct pointers as memref<?x!llvm.struct<...>>
+  # which LLVM 22 MLIR rejects.  Since these are always immediately cast to
+  # !llvm.ptr via memref2pointer, rewriting the type is semantically safe.
+  local rewriter
+  rewriter="$(dirname "$0")/rewrite-struct-memrefs.py"
+  if [[ -f "$rewriter" ]]; then
+    python3 "$rewriter" "$mlir_file"
+  fi
+
   # Step 2: Run DataRecomputation pass
+  local dr_flags="$DR_PASS_FLAGS"
+
+  # When stats collection is enabled, inject dr-test-diagnostics so dr-opt
+  # emits per-load classification remarks (SINGLE/MULTI/LEAKED/KILLED) and
+  # per-buffer cost-model decisions (RECOMPUTE/KEEP) on stderr.
+  if [[ -n "$DR_STATS_DIR" ]]; then
+    if [[ "$dr_flags" == *"data-recomputation{"* ]]; then
+      dr_flags="${dr_flags/data-recomputation\{/data-recomputation\{dr-test-diagnostics }"
+    elif [[ "$dr_flags" == *"data-recomputation"* ]]; then
+      dr_flags="${dr_flags/data-recomputation/data-recomputation\{dr-test-diagnostics\}}"
+    fi
+  fi
+
   # If a CPU cost model file is specified, inject the option into each pass
   # in the pipeline that supports it.
-  local dr_flags="$DR_PASS_FLAGS"
   if [[ -n "$CPU_COST_MODEL_FILE" ]]; then
-    # Inject cpu-cost-model-file= into pass option blocks {…}.
-    # MLIR pipeline options are space-separated inside {…}.
-    # Passes that don't recognise the option will ignore it.
     dr_flags="${dr_flags//\}/ cpu-cost-model-file=$CPU_COST_MODEL_FILE\}}"
   fi
+
   log "dr-opt: $mlir_file → $opt_file"
-  "$DR_OPT" "$dr_flags" "$mlir_file" -o "$opt_file" \
-    2>&1 || die "dr-opt failed on $mlir_file"
+  if [[ -n "$DR_STATS_DIR" ]]; then
+    mkdir -p "$DR_STATS_DIR"
+    local stats_file="${DR_STATS_DIR}/${base}.dr-stats"
+    if ! "$DR_OPT" --allow-unregistered-dialect "$dr_flags" "$mlir_file" -o "$opt_file" 2>"$stats_file"; then
+      cat "$stats_file" >&2
+      compile_clang_fallback "$src" "$obj"
+      return
+    fi
+  else
+    if ! "$DR_OPT" --allow-unregistered-dialect "$dr_flags" "$mlir_file" -o "$opt_file" 2>&1; then
+      compile_clang_fallback "$src" "$obj"
+      return
+    fi
+  fi
 
   # Step 3: Lower to LLVM dialect, then MLIR → LLVM IR
   local llvm_file="${tmpdir}/${base}.llvm.mlir"
   log "mlir-opt (lowering): $opt_file → $llvm_file"
-  "$MLIR_OPT" \
+  if ! "$MLIR_OPT" \
     --lower-affine \
     --convert-scf-to-cf \
     --convert-cf-to-llvm \
@@ -167,11 +245,16 @@ compile_one() {
     --finalize-memref-to-llvm \
     --reconcile-unrealized-casts \
     "$opt_file" -o "$llvm_file" \
-    2>&1 || die "mlir-opt lowering failed on $opt_file"
+    2>&1; then
+    compile_clang_fallback "$src" "$obj"
+    return
+  fi
 
   log "mlir-translate: $llvm_file → $ll_file"
-  "$MLIR_TRANSLATE" --mlir-to-llvmir "$llvm_file" -o "$ll_file" \
-    2>&1 || die "mlir-translate failed on $llvm_file"
+  if ! "$MLIR_TRANSLATE" --mlir-to-llvmir "$llvm_file" -o "$ll_file" 2>&1; then
+    compile_clang_fallback "$src" "$obj"
+    return
+  fi
 
   # Step 4: LLVM IR → object (or assembly)
   if [[ "$MODE" == "asm" ]]; then
@@ -180,6 +263,28 @@ compile_one() {
   else
     log "clang: $ll_file → $obj"
     "$CLANG" -c "$ll_file" -o "$obj" "${COMPILE_FLAGS[@]}" 2>&1
+  fi
+
+  # Sanity check: the MLIR roundtrip can silently drop globals (e.g. const
+  # lookup tables, extern variables) that have no in-TU function references.
+  # Compare defined global symbols against a clang reference build; if any
+  # are missing, recompile with clang to preserve correct linkage.
+  if [[ "$MODE" != "asm" && -f "$obj" ]]; then
+    local clang_ref="${tmpdir}/${base}.ref.o"
+    "$CLANG" -c "$src" -o "$clang_ref" "${COMPILE_FLAGS[@]}" 2>/dev/null
+    if [[ -f "$clang_ref" ]]; then
+      local dr_syms clang_syms
+      dr_syms="$(nm -g --defined-only "$obj" 2>/dev/null | awk '{print $3}' | sort -u)"
+      clang_syms="$(nm -g --defined-only "$clang_ref" 2>/dev/null | awk '{print $3}' | sort -u)"
+      # If clang defines symbols that the DR pipeline dropped, fall back.
+      local missing
+      missing="$(comm -23 <(echo "$clang_syms") <(echo "$dr_syms"))"
+      if [[ -n "$missing" ]]; then
+        log "DR pipeline dropped symbols: $missing"
+        echo "[drcc] fallback: $src — DR pipeline dropped symbols" >&2
+        cp "$clang_ref" "$obj"
+      fi
+    fi
   fi
 }
 

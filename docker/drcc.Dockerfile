@@ -38,6 +38,9 @@ RUN sed \
     && chmod +x /usr/local/bin/drcc \
     && rm /tmp/drcc.sh.in
 
+# Struct-memref text preprocessor (called by drcc before dr-opt)
+COPY tools/drcc/rewrite-struct-memrefs.py /usr/local/bin/rewrite-struct-memrefs.py
+
 # Probing scripts for generating hardware-specific cost models.
 COPY scripts/gen_cpu_cost_model.py scripts/cache_latency_bench.c \
      scripts/probe-cost-model.sh \

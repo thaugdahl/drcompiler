@@ -125,3 +125,10 @@ add_custom_command(
   COMMENT "Generating drcc wrapper script"
 )
 add_custom_target(drcc-wrapper ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/drcc)
+
+# Copy the struct-memref rewriter script next to drcc so it can find it.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/drcc/rewrite-struct-memrefs.py
+  ${CMAKE_CURRENT_BINARY_DIR}/rewrite-struct-memrefs.py
+  COPYONLY
+)

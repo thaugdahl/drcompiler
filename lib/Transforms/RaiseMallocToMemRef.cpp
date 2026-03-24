@@ -280,9 +280,6 @@ public:
         groups.push_back(std::move(group));
     });
 
-    if (groups.empty())
-      return;
-
     // Phase 2 & 3: Rewrite each group.
     for (MallocGroup &group : groups) {
       OpBuilder builder(group.mallocCall);
@@ -381,6 +378,46 @@ public:
       // Erase memref2pointer and malloc (now dead)
       group.memref2ptrOp->erase();
       group.mallocCall->erase();
+    }
+
+    // Phase 4: Lower any remaining polygeist.memref2pointer ops that were NOT
+    // part of a malloc group.  These arise from non-malloc memrefs (e.g.,
+    // function arguments, allocas) being cast to raw pointers for I/O or
+    // pointer arithmetic.
+    //
+    // Lowering:
+    //   %ptr = "polygeist.memref2pointer"(%m) : (memref<...xT>) -> !llvm.ptr
+    // becomes:
+    //   %idx = memref.extract_aligned_pointer_as_index %m : memref<...xT> -> index
+    //   %int = arith.index_cast %idx : index to i64
+    //   %ptr = llvm.inttoptr %int : i64 to !llvm.ptr
+    SmallVector<Operation *> residualM2P;
+    moduleOp.walk([&](Operation *op) {
+      if (isMemref2Pointer(op))
+        residualM2P.push_back(op);
+    });
+
+    for (Operation *op : residualM2P) {
+      OpBuilder builder(op);
+      Location loc = op->getLoc();
+      Value memrefVal = op->getOperand(0);
+
+      Value ptr;
+      if (isa<LLVM::LLVMPointerType>(memrefVal.getType())) {
+        // Input is already !llvm.ptr (e.g., after struct memref → !llvm.ptr
+        // preprocessing).  The memref2pointer is an identity cast.
+        ptr = memrefVal;
+      } else {
+        Value idx = builder.create<memref::ExtractAlignedPointerAsIndexOp>(
+            loc, memrefVal);
+        Value i64Val = builder.create<arith::IndexCastOp>(
+            loc, builder.getI64Type(), idx);
+        ptr = builder.create<LLVM::IntToPtrOp>(
+            loc, LLVM::LLVMPointerType::get(op->getContext()), i64Val);
+      }
+
+      op->getResult(0).replaceAllUsesWith(ptr);
+      op->erase();
     }
   }
 };

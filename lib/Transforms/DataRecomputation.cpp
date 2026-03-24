@@ -951,7 +951,8 @@ static bool dependsOnFuncArg(mlir::Value val) {
 }
 
 /// Recursively print the SSA operand tree of a value for debugging.
-static void printOperandTree(mlir::Value val, unsigned indent = 0) {
+static void printOperandTree(mlir::Value val, unsigned indent = 0,
+                             unsigned maxDepth = 8) {
   std::string prefix(indent * 2, ' ');
   if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(val)) {
     DRDBG() << prefix << "block-arg #" << blockArg.getArgNumber()
@@ -964,8 +965,12 @@ static void printOperandTree(mlir::Value val, unsigned indent = 0) {
     return;
   }
   DRDBG() << prefix << *defOp << "\n";
+  if (indent >= maxDepth) {
+    DRDBG() << prefix << "  ...\n";
+    return;
+  }
   for (mlir::Value operand : defOp->getOperands())
-    printOperandTree(operand, indent + 1);
+    printOperandTree(operand, indent + 1, maxDepth);
 }
 
 // ===== Recomputation Helpers =====
@@ -1104,6 +1109,10 @@ decideBufferStrategy(unsigned computeCost, unsigned loadLatency,
 /// Maximum number of load→store chains to follow during rematerialization.
 constexpr unsigned kMaxChainDepth = 8;
 
+/// Maximum number of ops that may be cloned for a single rematerialization.
+/// Prevents blowup on deeply chained arithmetic (e.g. SHA-256 rounds).
+constexpr unsigned kMaxRematOps = 64;
+
 /// Checks whether the SSA operand tree rooted at rootVal can be cloned
 /// (rematerialized) just before insertionPoint.
 ///
@@ -1203,8 +1212,11 @@ static bool isRematerializable(
     }
 
     // Interior op: add and recurse into operands.
-    if (added.insert(defOp).second)
+    if (added.insert(defOp).second) {
       opsToClone.push_back(defOp);
+      if (opsToClone.size() > kMaxRematOps)
+        return false;
+    }
     for (mlir::Value operand : defOp->getOperands())
       worklist.push_back(operand);
   }
@@ -1646,6 +1658,8 @@ void DataRecomputationPass::runOnOperation() {
 
         // Strategy 1: Direct value forwarding (store dominates load).
         if (isSafeToForward(storeOp, loadOp, domInfo)) {
+          if (storedVal.getType() != loadOp->getResult(0).getType())
+            continue; // type mismatch (e.g. i32 store → i8 load via reinterpret)
           loadOp->getResult(0).replaceAllUsesWith(storedVal);
           loadOp->erase();
           continue;
@@ -1660,6 +1674,8 @@ void DataRecomputationPass::runOnOperation() {
           mlir::Value clonedVal = rematerializeAt(
               storedVal, loadOp, opsToClone,
               /*argMapping=*/nullptr, loadSubs);
+          if (clonedVal.getType() != loadOp->getResult(0).getType())
+            continue; // type mismatch after rematerialization
           loadOp->getResult(0).replaceAllUsesWith(clonedVal);
           loadOp->erase();
           continue;
@@ -1694,6 +1710,8 @@ void DataRecomputationPass::runOnOperation() {
             mlir::Value clonedVal = rematerializeAt(
                 storedVal, loadOp, opsToClone, &argMapping,
                 loadSubs);
+            if (clonedVal.getType() != loadOp->getResult(0).getType())
+              continue; // type mismatch after interprocedural rematerialization
             loadOp->getResult(0).replaceAllUsesWith(clonedVal);
             loadOp->erase();
             replaced = true;

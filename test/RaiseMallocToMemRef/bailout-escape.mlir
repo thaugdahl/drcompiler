@@ -17,8 +17,12 @@ module {
   }
 }
 
+// Malloc group is not rewritten (pointer escapes), but the residual
+// memref2pointer is lowered to extract_aligned_pointer_as_index.
 // CHECK-LABEL: func.func @test
 // CHECK:         call @malloc
-// CHECK:         "polygeist.memref2pointer"
+// CHECK:         memref.extract_aligned_pointer_as_index
+// CHECK:         arith.index_cast
+// CHECK:         llvm.inttoptr
 // CHECK:         llvm.call @sink
 // CHECK:         call @free
