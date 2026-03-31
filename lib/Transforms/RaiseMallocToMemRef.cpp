@@ -14,12 +14,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/RaiseMallocToMemRef.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 
 #define DEBUG_TYPE "raise-malloc-to-memref"
@@ -54,6 +54,16 @@ struct MallocGroup {
 /// Check if an operation is "polygeist.memref2pointer" (unregistered dialect).
 static bool isMemref2Pointer(Operation *op) {
   return op->getName().getStringRef() == "polygeist.memref2pointer";
+}
+
+/// Check if an operation is "polygeist.pointer2memref" (unregistered dialect).
+static bool isPointer2Memref(Operation *op) {
+  return op->getName().getStringRef() == "polygeist.pointer2memref";
+}
+
+/// Check if an operation is "polygeist.subindex" (unregistered dialect).
+static bool isSubIndex(Operation *op) {
+  return op->getName().getStringRef() == "polygeist.subindex";
 }
 
 /// Try to decompose a malloc byte-size argument into (elementCount, sizeof).
@@ -229,6 +239,22 @@ static Value toIndexType(Value val, OpBuilder &builder, Location loc) {
   }
 
   return builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), val);
+}
+
+/// Convert an index-typed value to i64 for use with LLVM GEP ops.
+/// If the value is already i64, return it directly; if it came from
+/// arith.index_cast(i64 -> index), unwrap.
+static Value toI64Type(Value val, OpBuilder &builder, Location loc) {
+  if (val.getType().isInteger(64))
+    return val;
+
+  // Unwrap: arith.index_cast(i64 -> index) → get the i64
+  if (auto castOp = val.getDefiningOp<arith::IndexCastOp>()) {
+    if (castOp.getIn().getType().isInteger(64))
+      return castOp.getIn();
+  }
+
+  return builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), val);
 }
 
 // ===== Pass =====
@@ -418,6 +444,304 @@ public:
 
       op->getResult(0).replaceAllUsesWith(ptr);
       op->erase();
+    }
+
+    // Phase 5: Lower remaining polygeist.pointer2memref ops.
+    //
+    // These arise when cgeist converts C pointer arguments or globals to
+    // memref types:
+    //   %m = "polygeist.pointer2memref"(%ptr) : (!llvm.ptr) -> memref<?xT>
+    //
+    // Use patterns handled:
+    //   (a) ptr → memref → memref2pointer: identity chain, fold away
+    //   (b) ptr → memref → memref.load/store: lower to llvm.getelementptr
+    //       + llvm.load/store, bypassing the memref layer entirely
+    //   (c) ptr → memref → affine.load/store: same as (b) for rank-1
+    //       identity-map cases
+    //   (d) ptr → memref → passed to function: need memref descriptor —
+    //       leave the op (file falls back to clang)
+    SmallVector<Operation *> residualP2M;
+    moduleOp.walk([&](Operation *op) {
+      if (isPointer2Memref(op))
+        residualP2M.push_back(op);
+    });
+
+    for (Operation *op : residualP2M) {
+      Value ptrVal = op->getOperand(0);
+      Value memrefResult = op->getResult(0);
+
+      // Identity cast: !llvm.ptr → !llvm.ptr
+      if (memrefResult.getType() == ptrVal.getType()) {
+        memrefResult.replaceAllUsesWith(ptrVal);
+        op->erase();
+        continue;
+      }
+
+      auto memrefTy = dyn_cast<MemRefType>(memrefResult.getType());
+      if (!memrefTy) continue;
+
+      // Determine the element type for GEP addressing.
+      Type elemTy = memrefTy.getElementType();
+      auto llvmPtrTy = LLVM::LLVMPointerType::get(op->getContext());
+
+      // Try to lower every use.  If any use cannot be handled, we must
+      // leave the pointer2memref in place (file falls back to clang).
+      bool allHandled = true;
+
+      for (OpOperand &use :
+           llvm::make_early_inc_range(memrefResult.getUses())) {
+        Operation *user = use.getOwner();
+
+        // (a) memref2pointer: fold the chain.
+        if (isMemref2Pointer(user)) {
+          user->getResult(0).replaceAllUsesWith(ptrVal);
+          user->erase();
+          continue;
+        }
+
+        // (b) memref.load: lower to llvm.getelementptr + llvm.load.
+        if (auto loadOp = dyn_cast<memref::LoadOp>(user)) {
+          if (loadOp.getMemRef() != memrefResult) {
+            allHandled = false;
+            continue;
+          }
+          auto indices = loadOp.getIndices();
+          OpBuilder builder(loadOp);
+          Location loc = loadOp.getLoc();
+
+          Value addr = ptrVal;
+          if (!indices.empty()) {
+            // Linearize: for rank-1 (the common case from C pointers),
+            // the single index is the GEP offset.  For higher ranks we
+            // would need stride computation — bail out for now.
+            if (indices.size() != 1) {
+              allHandled = false;
+              continue;
+            }
+            Value idx = toI64Type(indices[0], builder, loc);
+            addr = builder.create<LLVM::GEPOp>(
+                loc, llvmPtrTy, elemTy, ptrVal, ValueRange{idx});
+          }
+          auto newLoad = builder.create<LLVM::LoadOp>(
+              loc, loadOp.getResult().getType(), addr);
+          loadOp.getResult().replaceAllUsesWith(newLoad.getResult());
+          loadOp->erase();
+          continue;
+        }
+
+        // (b) memref.store: lower to llvm.getelementptr + llvm.store.
+        if (auto storeOp = dyn_cast<memref::StoreOp>(user)) {
+          if (storeOp.getMemRef() != memrefResult) {
+            allHandled = false;
+            continue;
+          }
+          auto indices = storeOp.getIndices();
+          OpBuilder builder(storeOp);
+          Location loc = storeOp.getLoc();
+
+          Value addr = ptrVal;
+          if (!indices.empty()) {
+            if (indices.size() != 1) {
+              allHandled = false;
+              continue;
+            }
+            Value idx = toI64Type(indices[0], builder, loc);
+            addr = builder.create<LLVM::GEPOp>(
+                loc, llvmPtrTy, elemTy, ptrVal, ValueRange{idx});
+          }
+          builder.create<LLVM::StoreOp>(loc, storeOp.getValue(), addr);
+          storeOp->erase();
+          continue;
+        }
+
+        // (c) affine.load: lower for rank-1 identity-map cases.
+        if (auto affLoad = dyn_cast<affine::AffineLoadOp>(user)) {
+          if (affLoad.getMemRef() != memrefResult) {
+            allHandled = false;
+            continue;
+          }
+          AffineMap map = affLoad.getAffineMap();
+          auto mapOperands = affLoad.getMapOperands();
+          // Only handle rank-1 with identity or single-result maps.
+          if (map.getNumResults() != 1) {
+            allHandled = false;
+            continue;
+          }
+          OpBuilder builder(affLoad);
+          Location loc = affLoad.getLoc();
+
+          // Materialize the affine expression as arith ops to get an
+          // index-typed offset, then cast to i64 for GEP.
+          Value offset = builder.create<affine::AffineApplyOp>(
+              loc, map, mapOperands);
+          Value offsetI64 = toI64Type(offset, builder, loc);
+          Value addr = builder.create<LLVM::GEPOp>(
+              loc, llvmPtrTy, elemTy, ptrVal, ValueRange{offsetI64});
+          auto newLoad = builder.create<LLVM::LoadOp>(
+              loc, affLoad.getResult().getType(), addr);
+          affLoad.getResult().replaceAllUsesWith(newLoad.getResult());
+          affLoad->erase();
+          continue;
+        }
+
+        // (c) affine.store: lower for rank-1 identity-map cases.
+        if (auto affStore = dyn_cast<affine::AffineStoreOp>(user)) {
+          if (affStore.getMemRef() != memrefResult) {
+            allHandled = false;
+            continue;
+          }
+          AffineMap map = affStore.getAffineMap();
+          auto mapOperands = affStore.getMapOperands();
+          if (map.getNumResults() != 1) {
+            allHandled = false;
+            continue;
+          }
+          OpBuilder builder(affStore);
+          Location loc = affStore.getLoc();
+
+          Value offset = builder.create<affine::AffineApplyOp>(
+              loc, map, mapOperands);
+          Value offsetI64 = toI64Type(offset, builder, loc);
+          Value addr = builder.create<LLVM::GEPOp>(
+              loc, llvmPtrTy, elemTy, ptrVal, ValueRange{offsetI64});
+          builder.create<LLVM::StoreOp>(loc, affStore.getValue(), addr);
+          affStore->erase();
+          continue;
+        }
+
+        // (e) memref.extract_aligned_pointer_as_index: this arises when
+        // Phase 4 lowered a memref2pointer that consumed the pointer2memref
+        // result.  The semantics is "get the aligned pointer from the
+        // memref descriptor as an index".  For a pointer2memref-created
+        // memref, the pointer IS the aligned pointer, so we can replace
+        // with llvm.ptrtoint of the original pointer.
+        if (auto extractOp =
+                dyn_cast<memref::ExtractAlignedPointerAsIndexOp>(user)) {
+          OpBuilder builder(extractOp);
+          Location loc = extractOp.getLoc();
+          Value i64Val = builder.create<LLVM::PtrToIntOp>(
+              loc, builder.getI64Type(), ptrVal);
+          Value idxVal = builder.create<arith::IndexCastOp>(
+              loc, builder.getIndexType(), i64Val);
+          extractOp.getResult().replaceAllUsesWith(idxVal);
+          extractOp->erase();
+          continue;
+        }
+
+        // Unhandled use — cannot lower this pointer2memref.
+        allHandled = false;
+      }
+
+      if (allHandled && memrefResult.use_empty())
+        op->erase();
+    }
+
+    // Phase 6: Lower polygeist.subindex ops.
+    //
+    // subindex(%memref, %idx) : (memref<?xT>, index) -> memref<?xT>
+    //
+    // This is pointer arithmetic: result points to memref + idx * sizeof(T).
+    //
+    // Two lowering strategies depending on the use pattern:
+    //
+    //   (a) memref2pointer uses: extract aligned pointer, GEP by offset,
+    //       fold downstream memref2pointer ops to the GEP'd pointer.
+    //
+    //   (b) Non-pointer uses (func.call args, scf.yield, etc.): for the
+    //       common rank-1 i8 case, lower to memref.view which creates a
+    //       new memref with identity layout starting at byte offset %idx.
+    //       This is a standard MLIR op that finalize-memref-to-llvm can
+    //       lower, and it preserves the memref<?xi8> type that callers
+    //       expect.
+    SmallVector<Operation *> residualSI;
+    moduleOp.walk([&](Operation *op) {
+      if (isSubIndex(op))
+        residualSI.push_back(op);
+    });
+
+    for (Operation *op : residualSI) {
+      OpBuilder builder(op);
+      Location loc = op->getLoc();
+      Value memrefVal = op->getOperand(0);
+      Value idxVal = op->getOperand(1);
+      Value siResult = op->getResult(0);
+
+      auto srcType = dyn_cast<MemRefType>(memrefVal.getType());
+      auto dstType = dyn_cast<MemRefType>(siResult.getType());
+      if (!srcType || !dstType)
+        continue;
+
+      // --- Strategy (a): handle memref2pointer uses via pointer GEP ---
+      //
+      // Check if there are any memref2pointer uses before creating the
+      // GEP chain (avoid emitting dead code if there are none).
+      bool hasM2PUses = false;
+      for (OpOperand &use : siResult.getUses()) {
+        if (isMemref2Pointer(use.getOwner())) {
+          hasM2PUses = true;
+          break;
+        }
+      }
+
+      if (hasM2PUses) {
+        Value baseIdx =
+            builder.create<memref::ExtractAlignedPointerAsIndexOp>(
+                loc, memrefVal);
+        Value i64Base = builder.create<arith::IndexCastOp>(
+            loc, builder.getI64Type(), baseIdx);
+        Value basePtr = builder.create<LLVM::IntToPtrOp>(
+            loc, LLVM::LLVMPointerType::get(op->getContext()), i64Base);
+
+        // GEP: base + idx * sizeof(element)
+        Value gepPtr = builder.create<LLVM::GEPOp>(
+            loc, LLVM::LLVMPointerType::get(op->getContext()),
+            dstType.getElementType(), basePtr, ValueRange{idxVal});
+
+        // Fold memref2pointer uses to the GEP'd pointer.
+        for (OpOperand &use :
+             llvm::make_early_inc_range(siResult.getUses())) {
+          Operation *user = use.getOwner();
+          if (isMemref2Pointer(user)) {
+            user->getResult(0).replaceAllUsesWith(gepPtr);
+            user->erase();
+          }
+        }
+      }
+
+      // --- Strategy (b): handle remaining non-pointer uses ---
+      //
+      // For rank-1 memref<?xi8> with identity layout, use memref.view to
+      // create a new memref starting at byte offset %idx.  memref.view
+      // shifts the aligned pointer in the descriptor and produces identity
+      // layout (offset 0) — exactly the memref<?xi8> type that downstream
+      // func.call, scf.yield, etc. expect.
+      //
+      // For i8 elements, element offset == byte offset, so %idx can be
+      // used directly as the byte_shift operand of memref.view.
+      if (!siResult.use_empty() &&
+          srcType.getRank() == 1 && dstType.getRank() == 1 &&
+          srcType.getElementType().isInteger(8) &&
+          dstType.getElementType().isInteger(8) &&
+          srcType.getLayout().isIdentity() &&
+          dstType.getLayout().isIdentity()) {
+
+        // Compute remaining size: dim(%memref, 0) - %idx
+        Value c0dim = builder.create<arith::ConstantIndexOp>(loc, 0);
+        Value dim = builder.create<memref::DimOp>(loc, memrefVal, c0dim);
+        Value remaining = builder.create<arith::SubIOp>(loc, dim, idxVal);
+
+        // memref.view %src[%byte_shift][%remaining_size]
+        //   : memref<?xi8> to memref<?xi8>
+        auto viewOp = builder.create<memref::ViewOp>(
+            loc, dstType, memrefVal, idxVal, ValueRange{remaining});
+
+        siResult.replaceAllUsesWith(viewOp.getResult());
+      }
+
+      // Erase the subindex only if all uses have been handled.
+      if (siResult.use_empty())
+        op->erase();
+      // else: leave the op — file will fall back to clang at mlir-opt.
     }
   }
 };

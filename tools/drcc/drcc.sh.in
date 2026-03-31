@@ -24,7 +24,7 @@ CLANG="${CLANG:-@CLANG_EXECUTABLE@}"
 : "${DR_PASS_FLAGS:="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true})"}"
 : "${CPU_COST_MODEL_FILE:=}"
 : "${DR_STATS_DIR:=}"
-: "${DRCC_CGEIST_TIMEOUT:=120}"   # seconds; 0 = no timeout
+: "${DRCC_CGEIST_TIMEOUT:=60}"    # seconds; 0 = no timeout
 
 # cgeist resource directory (compiler built-in headers like stddef.h).
 # Auto-detect from the cgeist binary location if not set.
@@ -178,19 +178,35 @@ compile_one() {
     "${cgeist_flags[@]}" \
     -o "$mlir_file" \
     2>&1; then
-    compile_clang_fallback "$src" "$obj"
-    return
+    # Retry with -O0: some files (e.g. sha512.c) cause exponential blowup
+    # in cgeist's optimization passes but convert fine without optimization.
+    log "cgeist: retrying $src with -O0"
+    if ! "${timeout_cmd[@]}" "$CGEIST" "$src" \
+      -S \
+      --function='*' \
+      --raise-scf-to-affine \
+      -O0 \
+      ${CGEIST_RESOURCE_DIR:+-resource-dir "$CGEIST_RESOURCE_DIR"} \
+      "${cgeist_flags[@]}" \
+      -o "$mlir_file" \
+      2>&1; then
+      compile_clang_fallback "$src" "$obj"
+      return
+    fi
   fi
 
   # Fixup: cgeist (LLVM 18) emits DLTI entries with vector<Nxi32> but
   # LLVM 22+ expects vector<Nxi64>.  Patch in-place.
   sed -i 's/vector<\([0-9]*\)xi32>/vector<\1xi64>/g' "$mlir_file"
 
-  # Fixup: cgeist represents C struct pointers as memref<?x!llvm.struct<...>>
-  # which LLVM 22 MLIR rejects.  Since these are always immediately cast to
-  # !llvm.ptr via memref2pointer, rewriting the type is semantically safe.
-  local rewriter
-  rewriter="$(dirname "$0")/rewrite-struct-memrefs.py"
+  # Fixup: cgeist represents C struct pointers as memref<...x!llvm.struct<...>>
+  # which LLVM 22 MLIR rejects.  Dynamic-dimension variants are rewritten to
+  # !llvm.ptr; static-dimension memref.alloca are converted to llvm.alloca.
+  # Since struct-typed memrefs are always immediately cast to !llvm.ptr via
+  # memref2pointer before any access, both rewrites are semantically safe.
+  local rewriter self_dir
+  self_dir="$(dirname "$(readlink -f "$0")")"
+  rewriter="${self_dir}/rewrite-struct-memrefs.py"
   if [[ -f "$rewriter" ]]; then
     python3 "$rewriter" "$mlir_file"
   fi
@@ -240,7 +256,7 @@ compile_one() {
     --convert-cf-to-llvm \
     --convert-arith-to-llvm \
     --convert-math-to-llvm \
-    --convert-func-to-llvm \
+    --convert-func-to-llvm='use-bare-ptr-memref-call-conv=1' \
     --convert-index-to-llvm \
     --finalize-memref-to-llvm \
     --reconcile-unrealized-casts \

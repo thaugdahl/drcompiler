@@ -29,7 +29,10 @@ SHELL_MODE=0
 REBUILD=0
 REBUILD_BASE=0
 RESET_SPEC=0
+DR_FLAGS=""
+DRCC_LABEL=""
 CONTAINER_ARGS=()
+CONTAINER_ENV=()
 
 # ---- Detect container runtime ----
 if ! command -v "$RUNTIME" &>/dev/null; then
@@ -59,6 +62,8 @@ Options:
   --rebuild            Force rebuild drcc + drcc-spec images
   --rebuild-all        Force rebuild everything including drcc-base (slow — rebuilds LLVM)
   --reset-spec         Delete and re-install SPEC into Docker volume (re-runs install.sh)
+  --dr-flags FLAGS     Override DR_PASS_FLAGS in the container (pipeline configuration)
+  --env KEY=VALUE      Pass additional environment variable to the container
 
   All other options are forwarded to run-spec.sh inside the container:
   --tier TIER          1, 2, 3, or all            (default: 1)
@@ -99,6 +104,9 @@ while [[ $# -gt 0 ]]; do
         --rebuild)      REBUILD=1;          shift ;;
         --rebuild-all)  REBUILD=1; REBUILD_BASE=1; shift ;;
         --reset-spec)   RESET_SPEC=1;             shift ;;
+        --dr-flags)     DR_FLAGS="$2";            shift 2 ;;
+        --label)        DRCC_LABEL="$2";          shift 2 ;;
+        --env)          CONTAINER_ENV+=("$1" "$2"); shift 2 ;;
         -h|--help)      usage ;;
         *)              CONTAINER_ARGS+=("$1"); shift ;;
     esac
@@ -175,6 +183,18 @@ RUN_ARGS=(
     -v "$SPEC_VOL":/spec2017
     -v "$RESULTS_DIR":/results
 )
+
+if [[ -n "$DR_FLAGS" ]]; then
+    RUN_ARGS+=(-e "DR_PASS_FLAGS=$DR_FLAGS")
+fi
+
+if [[ -n "$DRCC_LABEL" ]]; then
+    RUN_ARGS+=(-e "DRCC_LABEL=$DRCC_LABEL")
+fi
+
+for ((i=0; i<${#CONTAINER_ENV[@]}; i+=2)); do
+    RUN_ARGS+=(-e "${CONTAINER_ENV[i+1]}")
+done
 
 if [[ $PRIVILEGED -eq 1 ]]; then
     RUN_ARGS+=(--privileged)
