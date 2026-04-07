@@ -991,6 +991,117 @@ static mlir::Value getStoredValue(mlir::Operation *op) {
   return {};
 }
 
+// ===== Footprint Analysis =====
+
+/// Default trip count when bounds cannot be statically determined.
+constexpr int64_t kDefaultTripCount = 128;
+
+/// Trace a value to a compile-time constant integer, walking through
+/// index_cast ops and (one level of) call-site argument forwarding.
+static std::optional<int64_t> traceToConstant(
+    mlir::Value val, const EnrichedCallGraph &callGraph) {
+  // Direct arith.constant / arith.constant index.
+  if (mlir::Operation *defOp = val.getDefiningOp()) {
+    if (auto cIdx = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(defOp))
+      return cIdx.value();
+    if (auto cInt = mlir::dyn_cast<mlir::arith::ConstantIntOp>(defOp))
+      return cInt.value();
+    // Walk through index_cast.
+    if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(defOp))
+      return traceToConstant(cast.getIn(), callGraph);
+    return std::nullopt;
+  }
+
+  // Block argument: check call graph for constant forwarding.
+  auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(val);
+  if (!blockArg)
+    return std::nullopt;
+
+  auto *parentOp = blockArg.getOwner()->getParentOp();
+  auto funcOp = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parentOp);
+  if (!funcOp)
+    return std::nullopt;
+
+  unsigned argIdx = blockArg.getArgNumber();
+  auto cgIt = callGraph.find(funcOp.getOperation());
+  if (cgIt == callGraph.end() || cgIt->second.empty())
+    return std::nullopt;
+
+  std::optional<int64_t> commonVal;
+  for (const auto &edge : cgIt->second) {
+    if (argIdx >= edge.callSiteOp->getNumOperands())
+      return std::nullopt;
+    mlir::Value callerOperand = edge.callSiteOp->getOperand(argIdx);
+    // One-level trace: resolve the caller operand to a constant directly.
+    mlir::Operation *callerDef = callerOperand.getDefiningOp();
+    std::optional<int64_t> traced;
+    if (callerDef) {
+      if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(callerDef))
+        traced = c.value();
+      else if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(callerDef))
+        traced = c.value();
+      else if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(callerDef))
+        if (auto *inner = cast.getIn().getDefiningOp()) {
+          if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(inner))
+            traced = c.value();
+          else if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(inner))
+            traced = c.value();
+        }
+    }
+    if (!traced)
+      return std::nullopt;
+    if (commonVal && *commonVal != *traced)
+      return std::nullopt;
+    commonVal = traced;
+  }
+  return commonVal;
+}
+
+/// Estimate the trip count of a loop op (affine.for or scf.for).
+/// Returns nullopt if the trip count cannot be determined.
+static std::optional<int64_t> estimateTripCount(
+    mlir::Operation *loopOp, const EnrichedCallGraph &callGraph) {
+  // affine.for
+  if (auto affFor = mlir::dyn_cast<mlir::affine::AffineForOp>(loopOp)) {
+    int64_t step = affFor.getStepAsInt();
+    if (step <= 0) return std::nullopt;
+    // Both bounds constant.
+    if (affFor.hasConstantLowerBound() && affFor.hasConstantUpperBound()) {
+      int64_t lb = affFor.getConstantLowerBound();
+      int64_t ub = affFor.getConstantUpperBound();
+      if (ub <= lb) return 0;
+      return (ub - lb + step - 1) / step;
+    }
+    // Constant lower bound, try to trace dynamic upper bound.
+    if (affFor.hasConstantLowerBound()) {
+      auto ubOperands = affFor.getUpperBoundOperands();
+      if (ubOperands.size() == 1) {
+        auto ubVal = traceToConstant(ubOperands[0], callGraph);
+        if (ubVal) {
+          int64_t lb = affFor.getConstantLowerBound();
+          if (*ubVal <= lb) return 0;
+          return (*ubVal - lb + step - 1) / step;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  // scf.for
+  if (auto scfFor = mlir::dyn_cast<mlir::scf::ForOp>(loopOp)) {
+    auto lbVal = traceToConstant(scfFor.getLowerBound(), callGraph);
+    auto ubVal = traceToConstant(scfFor.getUpperBound(), callGraph);
+    auto stepVal = traceToConstant(scfFor.getStep(), callGraph);
+    if (lbVal && ubVal && stepVal && *stepVal > 0) {
+      if (*ubVal <= *lbVal) return 0;
+      return (*ubVal - *lbVal + *stepVal - 1) / *stepVal;
+    }
+    return std::nullopt;
+  }
+
+  return std::nullopt;
+}
+
 // ===== Cost Model =====
 
 /// Cache hierarchy parameters for the cost model.
@@ -1074,36 +1185,530 @@ static unsigned estimateLoadLatency(int64_t bufferSizeBytes,
   return cache.l3Latency;
 }
 
+// ===== Per-Op and Block Footprint Estimation =====
+
+/// Estimate the memory footprint (bytes) of a single execution of an op.
+static int64_t estimateOpFootprintBytes(mlir::Operation *op,
+                                        const CacheParams &cache) {
+  // memref.store / memref.load
+  if (auto s = mlir::dyn_cast<mlir::memref::StoreOp>(op))
+    return s.getMemRefType().getElementTypeBitWidth() / 8;
+  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(op))
+    return l.getMemRefType().getElementTypeBitWidth() / 8;
+
+  // affine.store / affine.load
+  if (auto s = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
+    return s.getMemRefType().getElementTypeBitWidth() / 8;
+  if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(op))
+    return l.getMemRefType().getElementTypeBitWidth() / 8;
+
+  // llvm.store / llvm.load
+  if (auto s = mlir::dyn_cast<mlir::LLVM::StoreOp>(op)) {
+    unsigned bits = 0;
+    mlir::Type valTy = s.getValue().getType();
+    if (valTy.isIntOrFloat())
+      bits = valTy.getIntOrFloatBitWidth();
+    return bits > 0 ? bits / 8 : 8; // conservative 8 bytes
+  }
+  if (auto l = mlir::dyn_cast<mlir::LLVM::LoadOp>(op)) {
+    unsigned bits = 0;
+    mlir::Type resTy = l.getResult().getType();
+    if (resTy.isIntOrFloat())
+      bits = resTy.getIntOrFloatBitWidth();
+    return bits > 0 ? bits / 8 : 8;
+  }
+
+  // vector.load / vector.store / vector.transfer_read / vector.transfer_write
+  for (mlir::Value result : op->getResults()) {
+    if (auto vecTy = mlir::dyn_cast<mlir::VectorType>(result.getType())) {
+      if (mlir::isa<mlir::vector::LoadOp, mlir::vector::TransferReadOp>(op))
+        return (vecTy.getNumElements() * vecTy.getElementTypeBitWidth()) / 8;
+    }
+  }
+  if (mlir::isa<mlir::vector::StoreOp, mlir::vector::TransferWriteOp>(op)) {
+    mlir::Value vecVal = op->getOperand(0);
+    if (auto vecTy = mlir::dyn_cast<mlir::VectorType>(vecVal.getType()))
+      return (vecTy.getNumElements() * vecTy.getElementTypeBitWidth()) / 8;
+  }
+
+  // CallOpInterface with memref args: sum of buffer sizes.
+  if (auto callOp = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
+    int64_t total = 0;
+    for (mlir::Value operand : callOp->getOperands()) {
+      auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(operand.getType());
+      if (!memrefTy)
+        continue;
+      if (memrefTy.hasStaticShape()) {
+        int64_t numElems = 1;
+        for (int64_t dim : memrefTy.getShape())
+          numElems *= dim;
+        unsigned elemBits = memrefTy.getElementTypeBitWidth();
+        total += elemBits > 0 ? numElems * (elemBits / 8) : 0;
+      } else {
+        total += cache.l2Size; // conservative for dynamic shapes
+      }
+    }
+    return total;
+  }
+
+  return 0; // non-memory op
+}
+
+// Forward declaration.
+static int64_t estimateBlockFootprintBytes(mlir::Block &block,
+                                           const CacheParams &cache,
+                                           const EnrichedCallGraph &callGraph);
+
+/// Estimate total memory footprint of all ops in a block, accounting for
+/// nested loops (body × trip count) and branches (max of alternatives).
+static int64_t estimateBlockFootprintBytes(mlir::Block &block,
+                                           const CacheParams &cache,
+                                           const EnrichedCallGraph &callGraph) {
+  int64_t total = 0;
+
+  for (mlir::Operation &op : block) {
+    // Loops: body footprint × trip count.
+    if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(&op)) {
+      mlir::Region &bodyRegion = op.getRegion(0);
+      if (!bodyRegion.empty()) {
+        int64_t bodyFP =
+            estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
+        auto tc = estimateTripCount(&op, callGraph);
+        if (tc)
+          total += bodyFP * *tc;
+        else
+          total += bodyFP * kDefaultTripCount;
+      }
+      continue;
+    }
+
+    // If/else: max of branches.
+    if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(&op)) {
+      int64_t thenFP = 0, elseFP = 0;
+      mlir::Region &thenRegion = op.getRegion(0);
+      if (!thenRegion.empty())
+        thenFP = estimateBlockFootprintBytes(thenRegion.front(), cache,
+                                             callGraph);
+      if (op.getNumRegions() > 1) {
+        mlir::Region &elseRegion = op.getRegion(1);
+        if (!elseRegion.empty())
+          elseFP = estimateBlockFootprintBytes(elseRegion.front(), cache,
+                                               callGraph);
+      }
+      total += std::max(thenFP, elseFP);
+      continue;
+    }
+
+    // scf.while: body × default trip count.
+    if (mlir::isa<mlir::scf::WhileOp>(&op)) {
+      if (op.getNumRegions() > 1) {
+        mlir::Region &bodyRegion = op.getRegion(1);
+        if (!bodyRegion.empty()) {
+          int64_t bodyFP =
+              estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
+          total += bodyFP * kDefaultTripCount;
+        }
+      }
+      continue;
+    }
+
+    // Leaf op.
+    total += estimateOpFootprintBytes(&op, cache);
+  }
+
+  return total;
+}
+
+// ===== Intervening Footprint Estimation =====
+
+/// Find the ancestor of `op` that lives directly in `targetBlock`.
+/// Returns nullptr if `op` is not nested inside `targetBlock`.
+static mlir::Operation *findAncestorInBlock(mlir::Operation *op,
+                                            mlir::Block *targetBlock) {
+  mlir::Operation *current = op;
+  while (current) {
+    if (current->getBlock() == targetBlock)
+      return current;
+    current = current->getParentOp();
+  }
+  return nullptr;
+}
+
+/// Sum the footprint of ops strictly between `from` and `to` in the same block.
+/// Both must be in the same block; `from` must precede `to`.
+static int64_t sumFootprintBetween(mlir::Operation *from, mlir::Operation *to,
+                                   const CacheParams &cache,
+                                   const EnrichedCallGraph &callGraph) {
+  int64_t total = 0;
+  for (mlir::Operation *it = from->getNextNode(); it && it != to;
+       it = it->getNextNode()) {
+    // If the op has regions (loop, if, etc.), estimate its full footprint.
+    if (it->getNumRegions() > 0) {
+      // Loops.
+      if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(it)) {
+        mlir::Region &body = it->getRegion(0);
+        if (!body.empty()) {
+          int64_t bodyFP =
+              estimateBlockFootprintBytes(body.front(), cache, callGraph);
+          auto tc = estimateTripCount(it, callGraph);
+          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
+        }
+        continue;
+      }
+      // If/else.
+      if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(it)) {
+        int64_t thenFP = 0, elseFP = 0;
+        if (!it->getRegion(0).empty())
+          thenFP = estimateBlockFootprintBytes(it->getRegion(0).front(), cache,
+                                               callGraph);
+        if (it->getNumRegions() > 1 && !it->getRegion(1).empty())
+          elseFP = estimateBlockFootprintBytes(it->getRegion(1).front(), cache,
+                                               callGraph);
+        total += std::max(thenFP, elseFP);
+        continue;
+      }
+      // While.
+      if (mlir::isa<mlir::scf::WhileOp>(it)) {
+        if (it->getNumRegions() > 1 && !it->getRegion(1).empty()) {
+          int64_t bodyFP = estimateBlockFootprintBytes(
+              it->getRegion(1).front(), cache, callGraph);
+          total += bodyFP * kDefaultTripCount;
+        }
+        continue;
+      }
+      // Other region-bearing ops: sum all regions.
+      for (mlir::Region &region : it->getRegions())
+        if (!region.empty())
+          total +=
+              estimateBlockFootprintBytes(region.front(), cache, callGraph);
+      continue;
+    }
+    total += estimateOpFootprintBytes(it, cache);
+  }
+  return total;
+}
+
+/// Sum the footprint of all ops after `op` in its block.
+static int64_t sumFootprintAfter(mlir::Operation *op, const CacheParams &cache,
+                                 const EnrichedCallGraph &callGraph) {
+  // Use the block terminator as the sentinel.
+  mlir::Block *block = op->getBlock();
+  if (!block)
+    return 0;
+  return sumFootprintBetween(op, block->getTerminator(), cache, callGraph);
+}
+
+/// Sum the footprint of all ops before `op` in its block.
+static int64_t sumFootprintBefore(mlir::Operation *op,
+                                  const CacheParams &cache,
+                                  const EnrichedCallGraph &callGraph) {
+  mlir::Block *block = op->getBlock();
+  if (!block || block->empty())
+    return 0;
+  // Walk from the first op up to (but not including) `op`.
+  int64_t total = 0;
+  for (mlir::Operation &it : *block) {
+    if (&it == op)
+      break;
+    if (it.getNumRegions() > 0) {
+      if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(&it)) {
+        mlir::Region &body = it.getRegion(0);
+        if (!body.empty()) {
+          int64_t bodyFP =
+              estimateBlockFootprintBytes(body.front(), cache, callGraph);
+          auto tc = estimateTripCount(&it, callGraph);
+          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
+        }
+        continue;
+      }
+      // Simplified: delegate to estimateBlockFootprintBytes for other regions.
+      for (mlir::Region &region : it.getRegions())
+        if (!region.empty())
+          total +=
+              estimateBlockFootprintBytes(region.front(), cache, callGraph);
+      continue;
+    }
+    total += estimateOpFootprintBytes(&it, cache);
+  }
+  return total;
+}
+
+/// Estimate the total memory footprint of operations between `storeOp` and
+/// `loadOp` in program order.  This is the "interjected" memory traffic that
+/// determines whether the stored value is still in cache when the load runs.
+static int64_t estimateInterveningFootprint(
+    mlir::Operation *storeOp, mlir::Operation *loadOp,
+    const CacheParams &cache, const EnrichedCallGraph &callGraph) {
+  // Case 0: different functions — conservative.
+  auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
+  auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
+  if (storeFn != loadFn)
+    return cache.l2Size;
+
+  mlir::Block *storeBlock = storeOp->getBlock();
+  mlir::Block *loadBlock = loadOp->getBlock();
+
+  // Case 1: same block.
+  if (storeBlock == loadBlock)
+    return sumFootprintBetween(storeOp, loadOp, cache, callGraph);
+
+  // Case 2: store is in a nested scope below load's block.
+  if (mlir::Operation *storeAnc =
+          findAncestorInBlock(storeOp, loadBlock)) {
+    int64_t fp = sumFootprintAfter(storeOp, cache, callGraph);
+    // Walk upward from store's block through enclosing scopes.
+    mlir::Operation *cur = storeOp->getParentOp();
+    while (cur && cur != storeAnc) {
+      mlir::Block *curBlock = cur->getBlock();
+      if (curBlock)
+        fp += sumFootprintAfter(cur, cache, callGraph);
+      cur = cur->getParentOp();
+    }
+    fp += sumFootprintBetween(storeAnc, loadOp, cache, callGraph);
+    return fp;
+  }
+
+  // Case 3: load is in a nested scope below store's block.
+  if (mlir::Operation *loadAnc =
+          findAncestorInBlock(loadOp, storeBlock)) {
+    int64_t fp = sumFootprintBetween(storeOp, loadAnc, cache, callGraph);
+    fp += sumFootprintBefore(loadOp, cache, callGraph);
+    // Walk upward from load's block through enclosing scopes.
+    mlir::Operation *cur = loadOp->getParentOp();
+    while (cur && cur != loadAnc) {
+      mlir::Block *curBlock = cur->getBlock();
+      if (curBlock)
+        fp += sumFootprintBefore(cur, cache, callGraph);
+      cur = cur->getParentOp();
+    }
+    return fp;
+  }
+
+  // Case 4: both in nested scopes — find common ancestor block.
+  // Walk store upward until we find a block that contains an ancestor of load.
+  for (mlir::Operation *sp = storeOp; sp; sp = sp->getParentOp()) {
+    mlir::Block *spBlock = sp->getBlock();
+    if (!spBlock)
+      continue;
+    mlir::Operation *loadAnc = findAncestorInBlock(loadOp, spBlock);
+    if (!loadAnc)
+      continue;
+    mlir::Operation *storeAnc = sp;
+    // Now storeAnc and loadAnc are both in spBlock.
+    int64_t fp = sumFootprintAfter(storeOp, cache, callGraph);
+    // Walk from store up to storeAnc.
+    mlir::Operation *cur = storeOp->getParentOp();
+    while (cur && cur != storeAnc) {
+      mlir::Block *curBlock = cur->getBlock();
+      if (curBlock)
+        fp += sumFootprintAfter(cur, cache, callGraph);
+      cur = cur->getParentOp();
+    }
+    fp += sumFootprintBetween(storeAnc, loadAnc, cache, callGraph);
+    // Walk from loadAnc down to load.
+    cur = loadOp->getParentOp();
+    while (cur && cur != loadAnc) {
+      mlir::Block *curBlock = cur->getBlock();
+      if (curBlock)
+        fp += sumFootprintBefore(cur, cache, callGraph);
+      cur = cur->getParentOp();
+    }
+    fp += sumFootprintBefore(loadOp, cache, callGraph);
+    return fp;
+  }
+
+  // Fallback: conservative.
+  return cache.l2Size;
+}
+
+/// Collect the memref values that the SSA operand tree of `val` loads from.
+/// These are the operands that would need to be re-loaded during recomputation.
+static void collectOperandMemrefs(
+    mlir::Value val,
+    llvm::SmallDenseSet<mlir::Value> &memrefs) {
+  llvm::SmallVector<mlir::Value, 8> worklist;
+  llvm::SmallDenseSet<mlir::Value> visited;
+  worklist.push_back(val);
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (mlir::isa<mlir::BlockArgument>(current))
+      continue;
+    mlir::Operation *defOp = current.getDefiningOp();
+    if (!defOp)
+      continue;
+
+    if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(defOp)) {
+      memrefs.insert(load.getMemRef());
+      continue;
+    }
+    if (auto load = mlir::dyn_cast<mlir::affine::AffineLoadOp>(defOp)) {
+      memrefs.insert(load.getMemRef());
+      continue;
+    }
+    if (mlir::isa<mlir::LLVM::LoadOp>(defOp))
+      continue; // can't extract memref from llvm.load
+
+    for (mlir::Value operand : defOp->getOperands())
+      worklist.push_back(operand);
+  }
+}
+
+/// Check whether any operation in the block range (from, to) in the same block
+/// accesses the given memref value.  Recurses into nested regions.
+static bool memrefAccessedInRange(mlir::Operation *from, mlir::Operation *to,
+                                  mlir::Value memref);
+
+/// Check whether a memref is accessed anywhere inside an operation's regions.
+static bool memrefAccessedInOp(mlir::Operation *op, mlir::Value memref) {
+  bool found = false;
+  op->walk([&](mlir::Operation *inner) {
+    if (found) return mlir::WalkResult::interrupt();
+    if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(inner)) {
+      if (load.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
+    } else if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(inner)) {
+      if (store.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
+    } else if (auto load = mlir::dyn_cast<mlir::affine::AffineLoadOp>(inner)) {
+      if (load.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
+    } else if (auto store = mlir::dyn_cast<mlir::affine::AffineStoreOp>(inner)) {
+      if (store.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
+    }
+    return mlir::WalkResult::advance();
+  });
+  return found;
+}
+
+static bool memrefAccessedInRange(mlir::Operation *from, mlir::Operation *to,
+                                  mlir::Value memref) {
+  for (mlir::Operation *it = from->getNextNode(); it && it != to;
+       it = it->getNextNode()) {
+    if (memrefAccessedInOp(it, memref))
+      return true;
+  }
+  return false;
+}
+
+/// Estimate the operand reload penalty for recomputation.
+///
+/// Walks the SSA operand tree of the stored value to find which memrefs
+/// recomputation would need to read.  For each, checks whether that memref
+/// is re-accessed in the intervening ops between store and load.  If it is,
+/// the operand is likely still in cache (warm); if not, the full intervening
+/// footprint applies and the operand may have been evicted.
+///
+/// Returns a per-element penalty in cycles that should be added to the
+/// recomputation cost.
+static unsigned estimateOperandReloadPenalty(
+    mlir::Value storedVal,
+    mlir::Operation *storeOp, mlir::Operation *loadOp,
+    int64_t storeToLoadFootprint,
+    const CacheParams &cache) {
+  // Collect memrefs needed by the recomputation chain.
+  llvm::SmallDenseSet<mlir::Value> operandMemrefs;
+  collectOperandMemrefs(storedVal, operandMemrefs);
+
+  if (operandMemrefs.empty())
+    return 0; // pure computation, no memory operands
+
+  // Check if store and load are in the same function (for range scanning).
+  auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
+  auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
+
+  unsigned totalPenalty = 0;
+  unsigned coldCount = 0;
+
+  for (mlir::Value memref : operandMemrefs) {
+    bool warm = false;
+
+    // If same function and same block, check the intervening range.
+    if (storeFn == loadFn && storeOp->getBlock() == loadOp->getBlock()) {
+      warm = memrefAccessedInRange(storeOp, loadOp, memref);
+    } else if (storeFn == loadFn) {
+      // Different blocks: check if the memref is accessed in the load's block
+      // before the load (most recent access).
+      mlir::Block *loadBlock = loadOp->getBlock();
+      if (loadBlock && !loadBlock->empty()) {
+        // Check ops before the load in its block.
+        for (mlir::Operation &it : *loadBlock) {
+          if (&it == loadOp) break;
+          if (memrefAccessedInOp(&it, memref)) {
+            warm = true;
+            break;
+          }
+        }
+      }
+    }
+    // Cross-function: conservatively assume cold.
+
+    if (!warm)
+      coldCount++;
+  }
+
+  if (coldCount == 0)
+    return 0; // all operands are warm
+
+  // For cold operands, estimate the reload cost based on intervening footprint.
+  // The penalty is the latency delta above L1 (since we assumed L1 in the base cost).
+  if (storeToLoadFootprint > (int64_t)cache.l1Size) {
+    unsigned evictedLatency = estimateLoadLatency(storeToLoadFootprint, cache);
+    unsigned delta = evictedLatency > cache.l1Latency
+                         ? evictedLatency - cache.l1Latency
+                         : 0;
+    // Scale by fraction of cold operands.
+    totalPenalty = (delta * coldCount) / operandMemrefs.size();
+  }
+
+  return totalPenalty;
+}
+
 /// Per-buffer materialization decision.
 struct MaterializationDecision {
-  bool recompute;         // true = eliminate buffer, false = keep it
-  unsigned computeCost;   // ALU cost to recompute one element
-  unsigned loadLatency;   // estimated load latency (from cache model)
-  unsigned numConsumers;  // number of SINGLE loads from this buffer
+  bool recompute;              // true = eliminate buffer, false = keep it
+  unsigned computeCost;        // ALU cost to recompute one element
+  unsigned loadLatency;        // estimated load latency (from cache model)
+  unsigned numConsumers;       // number of SINGLE loads from this buffer
   int64_t bufferSizeBytes;
+  int64_t storeToLoadFootprint;   // intervening bytes between store and load
+  unsigned operandPenalty;        // per-element operand reload penalty (cycles)
 };
 
 /// Decide whether to recompute or keep a buffer.
 ///
-/// Cost of keeping:   store_cost + numConsumers × loadLatency
-/// Cost of recomputing: numConsumers × computeCost
+/// When footprint analysis is disabled (storeToLoadFootprint = 0,
+/// operandPenalty = 0), this reduces to the original formula:
+///   keepCost      = computeCost + 1 + numConsumers × loadLatency
+///   recomputeCost = numConsumers × computeCost
 ///
-/// We recompute when recomputing is cheaper.  The store cost is approximated
-/// as equal to computeCost (you computed the value to store it).
+/// When enabled:
+///   - storeToLoadFootprint shifts the effective load latency (the buffer
+///     may have been evicted by intervening memory traffic).
+///   - operandPenalty (from estimateOperandReloadPenalty) accounts for the
+///     cost of re-fetching operands needed for recomputation, weighted by
+///     how many of those operands are still warm vs cold in cache.
 static MaterializationDecision
 decideBufferStrategy(unsigned computeCost, unsigned loadLatency,
-                     unsigned numConsumers, int64_t bufferSizeBytes) {
-  // Cost of keeping the buffer: we already computed the value (computeCost)
-  // plus stored it (~1 cycle write to L1), plus each consumer pays loadLatency.
-  unsigned keepCost = computeCost + 1 + numConsumers * loadLatency;
+                     unsigned numConsumers, int64_t bufferSizeBytes,
+                     int64_t storeToLoadFootprint,
+                     unsigned operandPenalty,
+                     const CacheParams &cache) {
+  // Effective load latency: account for cache eviction from intervening traffic.
+  unsigned effectiveLoadLatency = loadLatency;
+  if (storeToLoadFootprint > 0) {
+    int64_t workingSet = bufferSizeBytes + storeToLoadFootprint;
+    effectiveLoadLatency = estimateLoadLatency(workingSet, cache);
+  }
 
-  // Cost of recomputing: each consumer recomputes from scratch.
-  unsigned recomputeCost = numConsumers * computeCost;
+  unsigned keepCost = computeCost + 1 + numConsumers * effectiveLoadLatency;
+  unsigned recomputeCost = numConsumers * (computeCost + operandPenalty);
 
   bool recompute = recomputeCost <= keepCost;
 
-  return MaterializationDecision{recompute, computeCost, loadLatency,
-                                 numConsumers, bufferSizeBytes};
+  return MaterializationDecision{recompute,       computeCost,
+                                 effectiveLoadLatency, numConsumers,
+                                 bufferSizeBytes, storeToLoadFootprint,
+                                 operandPenalty};
 }
 
 /// Maximum number of load→store chains to follow during rematerialization.
@@ -1603,6 +2208,33 @@ void DataRecomputationPass::runOnOperation() {
         existing = std::max(existing, cost);
       }
 
+      // Compute per-buffer intervening footprints and operand penalties
+      // when footprint analysis is on.
+      llvm::DenseMap<mlir::Operation *, int64_t> bufferStoreToLoadFP;
+      llvm::DenseMap<mlir::Operation *, unsigned> bufferOperandPenalty;
+
+      if (drFootprintAnalysis) {
+        for (auto &entry : toProcess) {
+          mlir::Operation *root = findAllocRoot(entry.loadOp);
+          if (!root)
+            continue;
+          int64_t fp = estimateInterveningFootprint(entry.storeOp, entry.loadOp,
+                                                    cache, callGraph);
+          auto &existing = bufferStoreToLoadFP[root];
+          existing = std::max(existing, fp);
+
+          // Per-operand penalty: check which operand memrefs are still warm
+          // (re-accessed between store and load) vs cold (evicted).
+          mlir::Value storedVal = getStoredValue(entry.storeOp);
+          if (storedVal) {
+            unsigned penalty = estimateOperandReloadPenalty(
+                storedVal, entry.storeOp, entry.loadOp, fp, cache);
+            auto &existingPenalty = bufferOperandPenalty[root];
+            existingPenalty = std::max(existingPenalty, penalty);
+          }
+        }
+      }
+
       // Now decide per-buffer.
       for (auto &[allocRoot, numConsumers] : bufferConsumerCount) {
         unsigned computeCost = bufferComputeCost.lookup(allocRoot);
@@ -1610,28 +2242,42 @@ void DataRecomputationPass::runOnOperation() {
         int64_t sizeBytes = bufSize.value_or((int64_t)cache.l2Size + 1);
 
         unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
-        auto decision =
-            decideBufferStrategy(computeCost, loadLat, numConsumers, sizeBytes);
+
+        int64_t storeToLoadFP = bufferStoreToLoadFP.lookup(allocRoot);
+        unsigned opPenalty = bufferOperandPenalty.lookup(allocRoot);
+
+        auto decision = decideBufferStrategy(computeCost, loadLat, numConsumers,
+                                             sizeBytes, storeToLoadFP,
+                                             opPenalty, cache);
 
         DRDBG() << "=== Cost model for " << *allocRoot << " ===\n";
         DRDBG() << "  buffer size: "
                 << (bufSize ? std::to_string(*bufSize) + " bytes" : "dynamic")
                 << "\n";
         DRDBG() << "  compute cost: " << computeCost << " cycles\n";
-        DRDBG() << "  load latency: " << loadLat << " cycles\n";
+        DRDBG() << "  load latency: " << decision.loadLatency << " cycles\n";
         DRDBG() << "  consumers: " << numConsumers << "\n";
+        if (drFootprintAnalysis) {
+          DRDBG() << "  storeToLoad footprint: " << storeToLoadFP
+                  << " bytes\n";
+          DRDBG() << "  operand penalty: " << opPenalty << " cycles\n";
+        }
         DRDBG() << "  decision: "
                 << (decision.recompute ? "RECOMPUTE" : "KEEP BUFFER") << "\n";
 
-        if (drTestDiagnostics)
-          allocRoot->emitRemark()
+        if (drTestDiagnostics) {
+          auto diag = allocRoot->emitRemark()
               << "cost-model: "
               << (decision.recompute ? "RECOMPUTE" : "KEEP")
               << " (compute=" << computeCost
-              << ", load=" << loadLat
+              << ", load=" << decision.loadLatency
               << ", consumers=" << numConsumers
-              << ", size=" << (bufSize ? std::to_string(*bufSize) : "dynamic")
-              << ")";
+              << ", size=" << (bufSize ? std::to_string(*bufSize) : "dynamic");
+          if (drFootprintAnalysis)
+            diag << ", storeToLoadFP=" << storeToLoadFP
+                 << ", operandPenalty=" << opPenalty;
+          diag << ")";
+        }
 
         if (!decision.recompute)
           skipBuffers.insert(allocRoot);

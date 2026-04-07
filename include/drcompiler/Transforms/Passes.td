@@ -51,7 +51,9 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
     Option<"drMemLatency", "dr-mem-latency", "unsigned", "200",
            "DRAM access latency in cycles">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
-           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">
+           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">,
+    Option<"drFootprintAnalysis", "dr-footprint-analysis", "bool", "false",
+           "Enable intervening memory footprint analysis for cache eviction estimation">
   ];
 
   let dependentDialects = [
