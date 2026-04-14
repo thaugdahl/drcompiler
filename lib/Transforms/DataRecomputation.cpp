@@ -134,6 +134,7 @@ static AllocationRoots collectAllocationRoots(DRPassContext &passCtx,
       auto *symOp = passCtx.getSymTabCollection().lookupNearestSymbolFrom(
         passCtx.getModuleOp(), getGlobalOp.getNameAttr());
 
+
       for (mlir::Value res : op->getResults()) {
         if (mlir::isa<mlir::MemRefType>(res.getType())) {
           allocRootFor.try_emplace(res, symOp);
@@ -233,6 +234,7 @@ static StoreValueDeps computeStoreValueDeps(
         if (mlir::isa<mlir::MemRefType>(blockArg.getType())) {
           llvm::SmallVector<mlir::Value, 2> bases;
           collectBaseMemrefs(blockArg, allocRootFor, bases);
+
           for (mlir::Value base : bases) {
             auto it = allocRootFor.find(base);
             if (it != allocRootFor.end())
@@ -670,10 +672,22 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
   // --- scf.for / affine.for: may-execute loop ---
   if (mlir::isa<mlir::scf::ForOp>(op) ||
       mlir::isa<mlir::affine::AffineForOp>(op)) {
-    StoreMap bodyState = state;
     mlir::Region &bodyRegion = op->getRegion(0);
+
+    // First pass: body starts from pre-loop state.
+    StoreMap bodyState = state;
     if (!bodyRegion.empty())
       analyzeBlock(bodyRegion.front(), bodyState, ctx);
+
+    // Second pass: model loop-carried dependencies.  A store in the body can
+    // reach a load in the NEXT iteration of the same body, so join the
+    // post-body state back into the entry state and re-analyze.  This gives
+    // every load inside the body a conservative view of all stores that may
+    // have run before it (pre-loop init OR a prior iteration's body store).
+    StoreMap carriedEntry = joinStoreMaps(state, bodyState);
+    StoreMap bodyState2 = carriedEntry;
+    if (!bodyRegion.empty())
+      analyzeBlock(bodyRegion.front(), bodyState2, ctx);
 
     // For affine.for with provably-positive trip count (static lb < ub),
     // the body always executes at least once — use only the body state.
@@ -682,32 +696,40 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
           affineFor.hasConstantUpperBound() &&
           affineFor.getConstantLowerBound() <
               affineFor.getConstantUpperBound()) {
-        state = bodyState;
+        state = bodyState2;
         return;
       }
     }
 
     // Loop may not execute: join body-result with pre-loop state
-    state = joinStoreMaps(state, bodyState);
+    state = joinStoreMaps(state, bodyState2);
     return;
   }
 
   // --- scf.while: may-execute while loop ---
   if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(op)) {
-    // before-region (condition)
-    StoreMap condState = state;
     mlir::Region &beforeRegion = whileOp.getBefore();
+    mlir::Region &afterRegion  = whileOp.getAfter();
+
+    // First pass.
+    StoreMap condState = state;
     if (!beforeRegion.empty())
       analyzeBlock(beforeRegion.front(), condState, ctx);
-
-    // after-region (body)
     StoreMap bodyState = condState;
-    mlir::Region &afterRegion = whileOp.getAfter();
     if (!afterRegion.empty())
       analyzeBlock(afterRegion.front(), bodyState, ctx);
 
+    // Second pass: model loop-carried deps (body store visible on next iter).
+    StoreMap carriedEntry = joinStoreMaps(state, bodyState);
+    StoreMap condState2 = carriedEntry;
+    if (!beforeRegion.empty())
+      analyzeBlock(beforeRegion.front(), condState2, ctx);
+    StoreMap bodyState2 = condState2;
+    if (!afterRegion.empty())
+      analyzeBlock(afterRegion.front(), bodyState2, ctx);
+
     // Join with pre-loop (may not execute)
-    state = joinStoreMaps(state, bodyState);
+    state = joinStoreMaps(state, bodyState2);
     return;
   }
 
@@ -1666,7 +1688,8 @@ static unsigned estimateOperandReloadPenalty(
 /// Per-buffer materialization decision.
 struct MaterializationDecision {
   bool recompute;              // true = eliminate buffer, false = keep it
-  unsigned computeCost;        // ALU cost to recompute one element
+  unsigned aluCost;            // ALU cost to recompute one element
+  unsigned leafLoadCost;       // per-element cost of cloned partial leaf loads
   unsigned loadLatency;        // estimated load latency (from cache model)
   unsigned numConsumers;       // number of SINGLE loads from this buffer
   int64_t bufferSizeBytes;
@@ -1676,23 +1699,25 @@ struct MaterializationDecision {
 
 /// Decide whether to recompute or keep a buffer.
 ///
-/// When footprint analysis is disabled (storeToLoadFootprint = 0,
-/// operandPenalty = 0), this reduces to the original formula:
-///   keepCost      = computeCost + 1 + numConsumers × loadLatency
-///   recomputeCost = numConsumers × computeCost
+/// With leafLoadCost = 0 and footprint analysis disabled this reduces to
+/// the original formula:
+///   keepCost      = aluCost + 1 + numConsumers × loadLatency
+///   recomputeCost = numConsumers × aluCost
 ///
-/// When enabled:
+/// With leafLoadCost > 0 (partial rematerialization), each recomputed
+/// element also pays the cost of re-issuing its cloned leaf loads.
+///
+/// When footprint analysis is on:
 ///   - storeToLoadFootprint shifts the effective load latency (the buffer
 ///     may have been evicted by intervening memory traffic).
 ///   - operandPenalty (from estimateOperandReloadPenalty) accounts for the
 ///     cost of re-fetching operands needed for recomputation, weighted by
 ///     how many of those operands are still warm vs cold in cache.
 static MaterializationDecision
-decideBufferStrategy(unsigned computeCost, unsigned loadLatency,
-                     unsigned numConsumers, int64_t bufferSizeBytes,
-                     int64_t storeToLoadFootprint,
-                     unsigned operandPenalty,
-                     const CacheParams &cache) {
+decideBufferStrategy(unsigned aluCost, unsigned leafLoadCost,
+                     unsigned loadLatency, unsigned numConsumers,
+                     int64_t bufferSizeBytes, int64_t storeToLoadFootprint,
+                     unsigned operandPenalty, const CacheParams &cache) {
   // Effective load latency: account for cache eviction from intervening traffic.
   unsigned effectiveLoadLatency = loadLatency;
   if (storeToLoadFootprint > 0) {
@@ -1700,15 +1725,51 @@ decideBufferStrategy(unsigned computeCost, unsigned loadLatency,
     effectiveLoadLatency = estimateLoadLatency(workingSet, cache);
   }
 
-  unsigned keepCost = computeCost + 1 + numConsumers * effectiveLoadLatency;
-  unsigned recomputeCost = numConsumers * (computeCost + operandPenalty);
+  unsigned keepCost = aluCost + 1 + numConsumers * effectiveLoadLatency;
+  unsigned recomputeCost =
+      numConsumers * (aluCost + leafLoadCost + operandPenalty);
 
   bool recompute = recomputeCost <= keepCost;
 
-  return MaterializationDecision{recompute,       computeCost,
-                                 effectiveLoadLatency, numConsumers,
-                                 bufferSizeBytes, storeToLoadFootprint,
-                                 operandPenalty};
+  return MaterializationDecision{recompute,        aluCost,
+                                 leafLoadCost,     effectiveLoadLatency,
+                                 numConsumers,    bufferSizeBytes,
+                                 storeToLoadFootprint, operandPenalty};
+}
+
+// Forward declaration; definition follows the partial-remat helpers below.
+static mlir::Operation *lookupAllocRoot(
+    mlir::Value memref,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor);
+
+/// Estimate the per-element cost of re-issuing the partial-leaf loads
+/// cloned during partial rematerialization. Sums per-leaf cache-aware
+/// load latency using the same buffer-size → cache-level heuristic as the
+/// per-buffer decision.
+static unsigned
+estimateLeafLoadsCost(llvm::ArrayRef<mlir::Operation *> partialLeaves,
+                      const CacheParams &cache,
+                      llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
+  unsigned total = 0;
+  for (mlir::Operation *leaf : partialLeaves) {
+    mlir::Value memref;
+    if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(leaf))
+      memref = l.getMemRef();
+    else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(leaf))
+      memref = l.getMemRef();
+    if (!memref) {
+      total += cache.memLatency;
+      continue;
+    }
+    mlir::Operation *root = lookupAllocRoot(memref, allocRootFor);
+    int64_t sizeBytes = cache.l2Size + 1; // conservative if unknown
+    if (root) {
+      if (auto bs = estimateBufferSizeBytes(root))
+        sizeBytes = *bs;
+    }
+    total += estimateLoadLatency(sizeBytes, cache);
+  }
+  return total;
 }
 
 /// Maximum number of load→store chains to follow during rematerialization.
@@ -1717,6 +1778,222 @@ constexpr unsigned kMaxChainDepth = 8;
 /// Maximum number of ops that may be cloned for a single rematerialization.
 /// Prevents blowup on deeply chained arithmetic (e.g. SHA-256 rounds).
 constexpr unsigned kMaxRematOps = 64;
+
+/// Per-allocation-root write summary used by partial rematerialization.
+///
+/// writeCount: number of distinct memref/affine store ops whose base traces
+/// back to the root. A value > 1 makes the root ineligible for partial remat
+/// (we cannot prove re-reading yields the same value without tracking
+/// per-index coverage).
+///
+/// singleWriter: the one store op when writeCount == 1. Used to verify the
+/// writer dominates the partial remat insertion point.
+///
+/// escapesToCall: true if the root's memref (or a view of it) is passed to
+/// any call in the function. Escaping roots cannot be treated as write-once
+/// because an external callee may mutate them.
+struct RootWriteSummary {
+  unsigned writeCount = 0;
+  mlir::Operation *singleWriter = nullptr;
+  bool escapesToCall = false;
+};
+
+using RootWriteMap = llvm::DenseMap<mlir::Operation *, RootWriteSummary>;
+
+/// Build a write summary per allocation root, covering every function in the
+/// module. Stores are attributed to roots by tracing their memref through
+/// view-like ops via collectBaseMemrefs.
+static RootWriteMap
+buildRootWriteMap(mlir::ModuleOp moduleOp,
+                  llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
+  RootWriteMap result;
+
+  auto attribute = [&](mlir::Value memref, mlir::Operation *storeOp) {
+    llvm::SmallVector<mlir::Value, 2> bases;
+    collectBaseMemrefs(memref, allocRootFor, bases);
+    llvm::SmallDenseSet<mlir::Operation *, 2> attributedRoots;
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end())
+        continue;
+      if (!attributedRoots.insert(it->second).second)
+        continue;
+      auto &summary = result[it->second];
+      summary.writeCount++;
+      summary.singleWriter = (summary.writeCount == 1) ? storeOp : nullptr;
+    }
+  };
+
+  moduleOp.walk([&](mlir::Operation *op) {
+    if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(op))
+      attribute(store.getMemRef(), op);
+    else if (auto store = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
+      attribute(store.getMemRef(), op);
+    else if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
+      for (mlir::Value operand : call->getOperands()) {
+        if (!mlir::isa<mlir::MemRefType>(operand.getType()))
+          continue;
+        llvm::SmallVector<mlir::Value, 2> bases;
+        collectBaseMemrefs(operand, allocRootFor, bases);
+        for (mlir::Value base : bases) {
+          auto it = allocRootFor.find(base);
+          if (it != allocRootFor.end())
+            result[it->second].escapesToCall = true;
+        }
+      }
+    }
+  });
+
+  return result;
+}
+
+/// Look up an allocation root for a load-like op's memref value. Traces
+/// through view-like casts so subview/cast users resolve to their root.
+static mlir::Operation *lookupAllocRoot(
+    mlir::Value memref,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
+  auto it = allocRootFor.find(memref);
+  if (it != allocRootFor.end())
+    return it->second;
+  llvm::SmallVector<mlir::Value, 2> bases;
+  collectBaseMemrefs(memref, allocRootFor, bases);
+  for (mlir::Value base : bases) {
+    auto it2 = allocRootFor.find(base);
+    if (it2 != allocRootFor.end())
+      return it2->second;
+  }
+  return nullptr;
+}
+
+/// Validate that an SSA value used by a partial leaf load is available at
+/// insertionPoint. Mirrors the block-arg/dominance checks in
+/// isRematerializable.
+static bool isValueAvailableAt(mlir::Value operand,
+                               mlir::Operation *insertionPoint,
+                               mlir::DominanceInfo &domInfo,
+                               const mlir::IRMapping *argMapping) {
+  if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
+    if (argMapping) {
+      mlir::Block *block = blockArg.getOwner();
+      bool isEntryArg = block && block->isEntryBlock() &&
+                        mlir::isa_and_nonnull<mlir::FunctionOpInterface>(
+                            block->getParentOp());
+      if (!isEntryArg)
+        return false;
+      if (!argMapping->contains(blockArg))
+        return false;
+      return domInfo.dominates(argMapping->lookup(blockArg), insertionPoint);
+    }
+    return domInfo.dominates(operand, insertionPoint);
+  }
+  mlir::Operation *defOp = operand.getDefiningOp();
+  if (!defOp)
+    return false;
+  return domInfo.properlyDominates(defOp, insertionPoint);
+}
+
+/// Returns true if the writer's execution is guaranteed to have completed
+/// by the time control reaches insertionPoint. MLIR's DominanceInfo is
+/// conservative about ops inside loops/branches; we walk up the ancestor
+/// chain until we find a common-region ancestor and check sequential
+/// ordering there.
+///
+/// This is sound for partial rematerialization because the pass only
+/// considers replacing loads that the original program actually executed
+/// (SINGLE-provenance loads reaching insertionPoint) — if the writer is
+/// statically reachable and we observe the downstream load firing, any
+/// in-loop or in-branch wrapping of the writer must also have fired.
+static bool writerReachesInsertionPoint(mlir::Operation *writer,
+                                        mlir::Operation *insertionPoint) {
+  mlir::Block *ipBlock = insertionPoint->getBlock();
+  if (!ipBlock)
+    return false;
+  mlir::Operation *ancestor = writer;
+  while (ancestor && ancestor->getBlock() != ipBlock)
+    ancestor = ancestor->getParentOp();
+  if (!ancestor)
+    return false;
+  return ancestor->isBeforeInBlock(insertionPoint);
+}
+
+/// Why a partial leaf candidate was rejected. Consumed by diagnostics.
+enum class PartialLeafReject {
+  None,
+  NoAllocRoot,
+  AllocaOutOfScope,
+  Escapes,
+  MultiWrite,
+  WriterDoesNotDominate,
+  OperandNotLive,
+};
+
+/// Determine whether a non-chainable leaf load can be safely re-issued at
+/// insertionPoint. A safe leaf's clone reads the same memref cell as the
+/// original load did. See plan §3 for the write-once proxy rationale.
+static bool isSafeLeafAt(
+    mlir::Operation *loadOp, mlir::Operation *insertionPoint,
+    mlir::DominanceInfo &domInfo,
+    const mlir::IRMapping *argMapping,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor,
+    const RootWriteMap &rootWrites,
+    PartialLeafReject &reject) {
+  reject = PartialLeafReject::None;
+
+  mlir::Value memref;
+  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(loadOp))
+    memref = l.getMemRef();
+  else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(loadOp))
+    memref = l.getMemRef();
+  if (!memref)
+    return false;
+
+  mlir::Operation *root = lookupAllocRoot(memref, allocRootFor);
+  if (!root) {
+    reject = PartialLeafReject::NoAllocRoot;
+    return false;
+  }
+
+  // Scoped alloca: the alloca's parent region must enclose insertionPoint.
+  if (mlir::isa<mlir::memref::AllocaOp>(root)) {
+    mlir::Region *allocRegion = root->getParentRegion();
+    mlir::Region *ipRegion = insertionPoint->getParentRegion();
+    if (!allocRegion || !ipRegion || !allocRegion->isAncestor(ipRegion)) {
+      reject = PartialLeafReject::AllocaOutOfScope;
+      return false;
+    }
+  }
+
+  auto it = rootWrites.find(root);
+  if (it == rootWrites.end()) {
+    reject = PartialLeafReject::MultiWrite;
+    return false;
+  }
+  const RootWriteSummary &summary = it->second;
+  if (summary.escapesToCall) {
+    reject = PartialLeafReject::Escapes;
+    return false;
+  }
+  if (summary.writeCount != 1 || !summary.singleWriter) {
+    reject = PartialLeafReject::MultiWrite;
+    return false;
+  }
+  if (!writerReachesInsertionPoint(summary.singleWriter, insertionPoint)) {
+    reject = PartialLeafReject::WriterDoesNotDominate;
+    return false;
+  }
+  (void)domInfo;
+
+  // Every operand of the leaf load (including memref and indices/map operands)
+  // must be available at insertionPoint.
+  for (mlir::Value operand : loadOp->getOperands()) {
+    if (!isValueAvailableAt(operand, insertionPoint, domInfo, argMapping)) {
+      reject = PartialLeafReject::OperandNotLive;
+      return false;
+    }
+  }
+
+  return true;
+}
 
 /// Checks whether the SSA operand tree rooted at rootVal can be cloned
 /// (rematerialized) just before insertionPoint.
@@ -1733,6 +2010,19 @@ constexpr unsigned kMaxRematOps = 64;
 /// chained through. Used by rematerializeAt to wire up the substitutions.
 ///
 /// On success, opsToClone is filled in topological (def-before-use) order.
+/// Options controlling the partial-rematerialization path in
+/// isRematerializable. When enabled, non-chainable leaf loads may be
+/// cloned verbatim if isSafeLeafAt accepts them and the leaf budget
+/// has room.
+struct PartialRematOpts {
+  bool allow = false;
+  unsigned maxLeaves = 0;
+  llvm::DenseMap<mlir::Value, mlir::Operation *> *allocRootFor = nullptr;
+  const RootWriteMap *rootWrites = nullptr;
+  llvm::SmallVectorImpl<mlir::Operation *> *leaves = nullptr;
+  PartialLeafReject lastReject = PartialLeafReject::None;
+};
+
 static bool isRematerializable(
     mlir::Value rootVal, mlir::Operation *insertionPoint,
     mlir::DominanceInfo &domInfo,
@@ -1740,7 +2030,8 @@ static bool isRematerializable(
     const mlir::IRMapping *argMapping = nullptr,
     const LoadProvenanceMap *loadProv = nullptr,
     llvm::SmallVectorImpl<std::pair<mlir::Value, mlir::Value>> *loadSubs =
-        nullptr) {
+        nullptr,
+    PartialRematOpts *partial = nullptr) {
   opsToClone.clear();
   llvm::SmallVector<mlir::Value, 8> worklist;
   llvm::SmallDenseSet<mlir::Value> visited;
@@ -1780,9 +2071,29 @@ static bool isRematerializable(
     if (!defOp)
       return false;
 
-    // Special case: chain through SINGLE-provenance load ops
-    // (memref.load or affine.load).
+    // Special case: handle memref.load / affine.load.
     if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(defOp)) {
+      // Partial mode: prefer cloning as a partial leaf (no recursion into
+      // the load's upstream store value). This lets the pass rematerialize
+      // expressions whose chain would otherwise dead-end at a non-chainable
+      // inner load — Strategy 2 already tried the full chain path.
+      if (partial && partial->allow && partial->leaves &&
+          partial->rootWrites && partial->allocRootFor) {
+        if (partial->leaves->size() >= partial->maxLeaves)
+          return false;
+        PartialLeafReject why = PartialLeafReject::None;
+        if (isSafeLeafAt(defOp, insertionPoint, domInfo, argMapping,
+                         *partial->allocRootFor, *partial->rootWrites, why)) {
+          if (added.insert(defOp).second)
+            opsToClone.push_back(defOp);
+          partial->leaves->push_back(defOp);
+          continue;
+        }
+        partial->lastReject = why;
+        // Fall through to chain path as a last resort.
+      }
+
+      // Strict-chain path: chain through SINGLE-provenance loads only.
       if (loadProv && loadSubs && chainDepth < kMaxChainDepth) {
         auto provIt = loadProv->find(defOp);
         if (provIt != loadProv->end()) {
@@ -2108,6 +2419,17 @@ void DataRecomputationPass::runOnOperation() {
     CacheParams cache{drL1Size, drL2Size, drL1Latency,
                       drL2Latency, drL3Latency, drMemLatency};
 
+    // Partial remat requires cost model — warn if misconfigured.
+    bool partialRematEnabled = drPartialRemat && drCostModel;
+    if (drPartialRemat && !drCostModel)
+      moduleOp->emitWarning(
+          "dr-partial-remat requires dr-cost-model; partial remat disabled");
+
+    // Module-wide per-root write summary used by partial remat leaf-safety.
+    RootWriteMap rootWrites;
+    if (partialRematEnabled)
+      rootWrites = buildRootWriteMap(moduleOp, allocRootFor);
+
     // Collect load/store pairs to process (avoid iterator invalidation).
     // Handles memref.load/store and affine.load/store uniformly.
     struct SingleLoadEntry {
@@ -2220,6 +2542,7 @@ void DataRecomputationPass::runOnOperation() {
             continue;
           int64_t fp = estimateInterveningFootprint(entry.storeOp, entry.loadOp,
                                                     cache, callGraph);
+
           auto &existing = bufferStoreToLoadFP[root];
           existing = std::max(existing, fp);
 
@@ -2246,9 +2569,9 @@ void DataRecomputationPass::runOnOperation() {
         int64_t storeToLoadFP = bufferStoreToLoadFP.lookup(allocRoot);
         unsigned opPenalty = bufferOperandPenalty.lookup(allocRoot);
 
-        auto decision = decideBufferStrategy(computeCost, loadLat, numConsumers,
-                                             sizeBytes, storeToLoadFP,
-                                             opPenalty, cache);
+        auto decision = decideBufferStrategy(
+            computeCost, /*leafLoadCost=*/0, loadLat, numConsumers, sizeBytes,
+            storeToLoadFP, opPenalty, cache);
 
         DRDBG() << "=== Cost model for " << *allocRoot << " ===\n";
         DRDBG() << "  buffer size: "
@@ -2326,6 +2649,77 @@ void DataRecomputationPass::runOnOperation() {
           loadOp->erase();
           continue;
         }
+
+        // Strategy 2b: Partial rematerialization.
+        if (partialRematEnabled) {
+          llvm::SmallVector<mlir::Operation *> partialOps;
+          llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> partialSubs;
+          llvm::SmallVector<mlir::Operation *> partialLeaves;
+          PartialRematOpts partial;
+          partial.allow = true;
+          partial.maxLeaves = drPartialMaxLeaves;
+          partial.allocRootFor = &allocRootFor;
+          partial.rootWrites = &rootWrites;
+          partial.leaves = &partialLeaves;
+          if (isRematerializable(storedVal, loadOp, domInfo, partialOps,
+                                 /*argMapping=*/nullptr, &loadProv,
+                                 &partialSubs, &partial)) {
+            unsigned alu = estimateComputeCost(storedVal, costModel);
+            unsigned leaf =
+                estimateLeafLoadsCost(partialLeaves, cache, allocRootFor);
+            mlir::Value loadMemref =
+                mlir::isa<mlir::memref::LoadOp>(loadOp)
+                    ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
+                    : mlir::cast<mlir::affine::AffineLoadOp>(loadOp).getMemRef();
+            mlir::Operation *loadRoot =
+                lookupAllocRoot(loadMemref, allocRootFor);
+            int64_t sizeBytes = cache.l2Size + 1;
+            if (loadRoot)
+              if (auto bs = estimateBufferSizeBytes(loadRoot))
+                sizeBytes = *bs;
+            unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+            // Partial remat replaces one original load with a cloned
+            // expression of equal or greater memory traffic. Gate strictly:
+            // only fire if re-execution is cheaper than the original load.
+            if (alu + leaf >= loadLat) {
+              if (drTestDiagnostics)
+                loadOp->emitRemark()
+                    << "partial-remat: REJECT_COST (alu=" << alu
+                    << ", leaves=" << leaf << ", keep=" << loadLat << ")";
+              continue;
+            }
+            mlir::Value clonedVal = rematerializeAt(storedVal, loadOp,
+                                                    partialOps, nullptr,
+                                                    partialSubs);
+            if (clonedVal.getType() != loadOp->getResult(0).getType())
+              continue;
+            if (drTestDiagnostics)
+              loadOp->emitRemark()
+                  << "partial-remat: ACCEPT (alu=" << alu << ", leaves=" << leaf
+                  << ", load=" << loadLat << ")";
+            loadOp->getResult(0).replaceAllUsesWith(clonedVal);
+            loadOp->erase();
+            continue;
+          } else if (drTestDiagnostics &&
+                     partial.lastReject != PartialLeafReject::None) {
+            const char *reason = "unknown";
+            switch (partial.lastReject) {
+            case PartialLeafReject::None: reason = "none"; break;
+            case PartialLeafReject::NoAllocRoot: reason = "no-alloc-root"; break;
+            case PartialLeafReject::AllocaOutOfScope:
+              reason = "alloca-out-of-scope"; break;
+            case PartialLeafReject::Escapes: reason = "escapes-to-call"; break;
+            case PartialLeafReject::MultiWrite:
+              reason = "intervening-write"; break;
+            case PartialLeafReject::WriterDoesNotDominate:
+              reason = "writer-does-not-dominate"; break;
+            case PartialLeafReject::OperandNotLive:
+              reason = "index-not-live"; break;
+            }
+            loadOp->emitRemark()
+                << "partial-remat: REJECT_UNSAFE (reason=" << reason << ")";
+          }
+        }
       } else {
         // --- Interprocedural (Strategy 3) ---
         auto origIt = interproceduralOrigins.find(storeOp);
@@ -2360,8 +2754,64 @@ void DataRecomputationPass::runOnOperation() {
               continue; // type mismatch after interprocedural rematerialization
             loadOp->getResult(0).replaceAllUsesWith(clonedVal);
             loadOp->erase();
+
             replaced = true;
             break;
+          }
+
+          // Strategy 2b (interprocedural): partial rematerialization.
+          if (partialRematEnabled) {
+            llvm::SmallVector<mlir::Operation *> partialOps;
+            llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> partialSubs;
+            llvm::SmallVector<mlir::Operation *> partialLeaves;
+            PartialRematOpts partial;
+            partial.allow = true;
+            partial.maxLeaves = drPartialMaxLeaves;
+            partial.allocRootFor = &allocRootFor;
+            partial.rootWrites = &rootWrites;
+            partial.leaves = &partialLeaves;
+            if (isRematerializable(storedVal, loadOp, domInfo, partialOps,
+                                   &argMapping, &loadProv, &partialSubs,
+                                   &partial)) {
+              unsigned alu = estimateComputeCost(storedVal, costModel);
+              unsigned leaf =
+                  estimateLeafLoadsCost(partialLeaves, cache, allocRootFor);
+              mlir::Value loadMemref =
+                  mlir::isa<mlir::memref::LoadOp>(loadOp)
+                      ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
+                      : mlir::cast<mlir::affine::AffineLoadOp>(loadOp)
+                            .getMemRef();
+              mlir::Operation *loadRoot =
+                  lookupAllocRoot(loadMemref, allocRootFor);
+              int64_t sizeBytes = cache.l2Size + 1;
+              if (loadRoot)
+                if (auto bs = estimateBufferSizeBytes(loadRoot))
+                  sizeBytes = *bs;
+              unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+              auto dec = decideBufferStrategy(alu, leaf, loadLat,
+                                              /*numConsumers=*/1, sizeBytes,
+                                              /*storeToLoadFootprint=*/0,
+                                              /*operandPenalty=*/0, cache);
+              if (!dec.recompute) {
+                if (drTestDiagnostics)
+                  loadOp->emitRemark()
+                      << "partial-remat: REJECT_COST (alu=" << alu
+                      << ", leaves=" << leaf << ", keep=" << loadLat << ")";
+                continue;
+              }
+              mlir::Value clonedVal = rematerializeAt(
+                  storedVal, loadOp, partialOps, &argMapping, partialSubs);
+              if (clonedVal.getType() != loadOp->getResult(0).getType())
+                continue;
+              if (drTestDiagnostics)
+                loadOp->emitRemark()
+                    << "partial-remat: ACCEPT (alu=" << alu
+                    << ", leaves=" << leaf << ", load=" << loadLat << ")";
+              loadOp->getResult(0).replaceAllUsesWith(clonedVal);
+              loadOp->erase();
+              replaced = true;
+              break;
+            }
           }
         }
         (void)replaced;

@@ -1,39 +1,33 @@
-# Builds cgeist (Polygeist C/C++ → MLIR frontend) against LLVM 18.
-# Ubuntu 22.04 ships GCC 11 / libstdc++ 11, which LLVM 18 builds cleanly with.
+# ==========================================================================
+# drcc-cgeist-builder: builds cgeist (Polygeist C/C++ → MLIR frontend)
+# against Polygeist's bundled LLVM 18.
 #
-# Usage:
-#   docker build -f docker/cgeist-builder.Dockerfile -o polygeist-install .
+# Build and cache this image independently of LLVM 22:
+#   docker build -f docker/cgeist-builder.Dockerfile -t drcc-cgeist-builder .
 #
-# Result: polygeist-install/bin/cgeist
+# Used by base.Dockerfile via COPY --from=drcc-cgeist-builder.
+# ==========================================================================
 
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake ninja-build git ca-certificates \
-      g++ python3 lld \
+      cmake ninja-build git ca-certificates g++ python3 lld \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone Polygeist (includes llvm-project submodule pinned to LLVM 18)
 RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
       https://github.com/llvm/Polygeist.git /src/polygeist
 
-# Step 1: Build LLVM 18 + MLIR + Clang
-RUN cmake -G Ninja -S /src/polygeist/llvm-project/llvm -B /build/llvm \
+RUN cmake -G Ninja -S /src/polygeist/llvm-project/llvm -B /build/llvm18 \
       -DLLVM_ENABLE_PROJECTS="clang;mlir" \
       -DLLVM_TARGETS_TO_BUILD="host" \
       -DLLVM_ENABLE_ASSERTIONS=ON \
       -DCMAKE_BUILD_TYPE=Release \
       -DLLVM_USE_LINKER=lld \
-    && cmake --build /build/llvm -j"$(nproc)"
+    && cmake --build /build/llvm18 -j"$(nproc)"
 
-# Step 2: Build cgeist
 RUN cmake -G Ninja -S /src/polygeist -B /build/polygeist \
-      -DMLIR_DIR=/build/llvm/lib/cmake/mlir \
-      -DCLANG_DIR=/build/llvm/lib/cmake/clang \
+      -DMLIR_DIR=/build/llvm18/lib/cmake/mlir \
+      -DCLANG_DIR=/build/llvm18/lib/cmake/clang \
       -DLLVM_TARGETS_TO_BUILD="host" \
       -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /build/polygeist --target cgeist -j"$(nproc)"
-
-# Export just the binary
-FROM scratch AS export
-COPY --from=builder /build/polygeist/bin/cgeist /bin/cgeist

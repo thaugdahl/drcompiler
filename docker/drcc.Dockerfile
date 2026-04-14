@@ -13,10 +13,6 @@
 
 FROM drcc-base
 
-# lmbench for cache latency probing (baked into drcc-base on next full rebuild).
-RUN apt-get update && apt-get install -y --no-install-recommends lmbench \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY . /src/drcompiler
 
 RUN cmake -G Ninja -S /src/drcompiler -B /build/drcompiler \

@@ -53,7 +53,13 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
            "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">,
     Option<"drFootprintAnalysis", "dr-footprint-analysis", "bool", "false",
-           "Enable intervening memory footprint analysis for cache eviction estimation">
+           "Enable intervening memory footprint analysis for cache eviction estimation">,
+    Option<"drPartialRemat", "dr-partial-remat", "bool", "false",
+           "Allow rematerialization when operand tree contains non-chainable "
+           "leaf loads, subject to cache-aware cost gate (requires dr-cost-model)">,
+    Option<"drPartialMaxLeaves", "dr-partial-max-leaves", "unsigned", "4",
+           "Maximum number of non-chainable leaf loads permitted per "
+           "partial rematerialization">
   ];
 
   let dependentDialects = [
