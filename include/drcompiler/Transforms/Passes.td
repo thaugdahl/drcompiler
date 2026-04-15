@@ -50,6 +50,8 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "L3 cache hit latency in cycles">,
     Option<"drMemLatency", "dr-mem-latency", "unsigned", "200",
            "DRAM access latency in cycles">,
+    Option<"drCacheLineSize", "dr-cache-line-size", "unsigned", "64",
+           "Cache line size in bytes (used for stride-aware partial remat cost)">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
            "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">,
     Option<"drFootprintAnalysis", "dr-footprint-analysis", "bool", "false",

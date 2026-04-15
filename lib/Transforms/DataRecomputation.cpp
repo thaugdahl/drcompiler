@@ -1134,6 +1134,7 @@ struct CacheParams {
   unsigned l2Latency;
   unsigned l3Latency;
   unsigned memLatency;
+  unsigned cacheLineSize; // bytes
 };
 
 /// Estimate the ALU cost of recomputing a value by walking its SSA operand
@@ -1742,12 +1743,288 @@ static mlir::Operation *lookupAllocRoot(
     mlir::Value memref,
     llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor);
 
-/// Estimate the per-element cost of re-issuing the partial-leaf loads
-/// cloned during partial rematerialization. Sums per-leaf cache-aware
-/// load latency using the same buffer-size → cache-level heuristic as the
-/// per-buffer decision.
+/// Return the induction variable of the innermost enclosing loop of op,
+/// or a null Value when op is not inside any affine/scf loop.
+static mlir::Value innermostEnclosingIV(mlir::Operation *op) {
+  mlir::Operation *parent = op ? op->getParentOp() : nullptr;
+  while (parent) {
+    if (auto f = mlir::dyn_cast<mlir::affine::AffineForOp>(parent))
+      return f.getInductionVar();
+    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(parent))
+      return f.getInductionVar();
+    parent = parent->getParentOp();
+  }
+  return {};
+}
+
+/// Return the linear coefficient of dim `pos` in an affine expression.
+/// Returns std::nullopt when the expression is not affine-linear in that
+/// dim (e.g. uses mod/div/floordiv/ceildiv or multiplies the dim by a
+/// non-constant).
+static std::optional<int64_t> affineLinearCoef(mlir::AffineExpr expr,
+                                               unsigned pos) {
+  if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(expr))
+    return (int64_t)0;
+  if (auto d = mlir::dyn_cast<mlir::AffineDimExpr>(expr))
+    return (d.getPosition() == pos) ? (int64_t)1 : (int64_t)0;
+  if (mlir::isa<mlir::AffineSymbolExpr>(expr))
+    return (int64_t)0;
+  auto bin = mlir::dyn_cast<mlir::AffineBinaryOpExpr>(expr);
+  if (!bin)
+    return std::nullopt;
+  auto lhs = affineLinearCoef(bin.getLHS(), pos);
+  auto rhs = affineLinearCoef(bin.getRHS(), pos);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  switch (bin.getKind()) {
+  case mlir::AffineExprKind::Add:
+    return *lhs + *rhs;
+  case mlir::AffineExprKind::Mul: {
+    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getLHS()))
+      return c.getValue() * *rhs;
+    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getRHS()))
+      return *lhs * c.getValue();
+    return std::nullopt;
+  }
+  default:
+    return std::nullopt; // mod/floordiv/ceildiv
+  }
+}
+
+/// Return true when value `v` transitively depends on `iv`.  Walks defining
+/// ops; stops on block arguments (other than `iv` itself).
+static bool dependsOnValue(mlir::Value v, mlir::Value iv) {
+  if (!v || !iv)
+    return false;
+  llvm::SmallVector<mlir::Value, 8> worklist;
+  llvm::SmallDenseSet<mlir::Value> visited;
+  worklist.push_back(v);
+  while (!worklist.empty()) {
+    mlir::Value cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+    if (cur == iv)
+      return true;
+    mlir::Operation *defOp = cur.getDefiningOp();
+    if (!defOp)
+      continue;
+    for (mlir::Value o : defOp->getOperands())
+      worklist.push_back(o);
+  }
+  return false;
+}
+
+/// Estimate the per-iteration access stride (in elements) of a load/store
+/// access relative to the induction variable `iv`.  Returns:
+///   - 0 when the access is invariant in iv (same address every iteration).
+///   - a positive integer when the stride is statically determinable.
+///   - std::nullopt when the stride cannot be determined; callers should
+///     treat this as pessimistically full-cache-line.
+/// Handles both memref.load/store and affine.load/store.
+static std::optional<int64_t>
+estimateAccessStrideElements(mlir::Operation *accessOp, mlir::Value iv) {
+  if (!accessOp || !iv)
+    return std::nullopt;
+
+  mlir::MemRefType memrefTy;
+  mlir::ValueRange rawIndices;
+  mlir::AffineMap map;
+  mlir::ValueRange mapOperands;
+
+  if (auto op = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    rawIndices = op.getIndices();
+  } else if (auto op = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    rawIndices = op.getIndices();
+  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    map = op.getAffineMap();
+    mapOperands = op.getMapOperands();
+  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    map = op.getAffineMap();
+    mapOperands = op.getMapOperands();
+  } else {
+    return std::nullopt;
+  }
+
+  unsigned rank = memrefTy.getRank();
+  if (rank == 0)
+    return (int64_t)0; // scalar memref: always same address
+
+  llvm::ArrayRef<int64_t> shape = memrefTy.getShape();
+  // Trailing-dim-product for each dim gives the element stride that a
+  // coefficient of 1 in that dim contributes (row-major).
+  llvm::SmallVector<int64_t, 4> trailing(rank, 1);
+  for (int i = (int)rank - 2; i >= 0; --i) {
+    if (shape[i + 1] < 0)
+      return std::nullopt; // dynamic trailing dim
+    trailing[i] = trailing[i + 1] * shape[i + 1];
+  }
+
+  int64_t totalStride = 0;
+
+  if (map) {
+    // affine.load/store: analyze each result expression.
+    int ivPos = -1;
+    for (unsigned i = 0; i < mapOperands.size(); ++i) {
+      if (mapOperands[i] == iv) {
+        ivPos = (int)i;
+        break;
+      }
+    }
+    if (ivPos < 0)
+      return (int64_t)0; // iv not among the map operands
+
+    // In MLIR, affine map operands are laid out as [dims..., symbols...].
+    // AffineDimExpr positions reference the dim portion. If the iv is
+    // passed as a symbol, treat as unknown.
+    unsigned numDims = map.getNumDims();
+    if ((unsigned)ivPos >= numDims)
+      return std::nullopt;
+
+    for (unsigned i = 0; i < rank; ++i) {
+      auto coef = affineLinearCoef(map.getResult(i), (unsigned)ivPos);
+      if (!coef)
+        return std::nullopt;
+      totalStride += *coef * trailing[i];
+    }
+  } else {
+    // memref.load/store: inspect each index.
+    for (unsigned i = 0; i < rank; ++i) {
+      mlir::Value idx = rawIndices[i];
+      if (idx == iv) {
+        totalStride += trailing[i];
+        continue;
+      }
+      if (!dependsOnValue(idx, iv))
+        continue; // invariant in this dim
+      // Simple pattern: idx = iv * c  or  iv * c + k  (linear integer
+      // arithmetic via arith.muli/addi).  Walk and try to extract a
+      // constant coefficient; bail out otherwise.
+      std::function<std::optional<int64_t>(mlir::Value)> coefOf =
+          [&](mlir::Value v) -> std::optional<int64_t> {
+        if (v == iv)
+          return (int64_t)1;
+        if (!dependsOnValue(v, iv))
+          return (int64_t)0;
+        mlir::Operation *d = v.getDefiningOp();
+        if (!d)
+          return std::nullopt;
+        if (mlir::isa<mlir::arith::AddIOp>(d)) {
+          auto lhs = coefOf(d->getOperand(0));
+          auto rhs = coefOf(d->getOperand(1));
+          if (!lhs || !rhs)
+            return std::nullopt;
+          return *lhs + *rhs;
+        }
+        if (mlir::isa<mlir::arith::MulIOp>(d)) {
+          auto getConst = [](mlir::Value x) -> std::optional<int64_t> {
+            auto *dx = x.getDefiningOp();
+            if (!dx)
+              return std::nullopt;
+            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(dx))
+              return (int64_t)c.value();
+            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(dx))
+              return (int64_t)c.value();
+            return std::nullopt;
+          };
+          auto c0 = getConst(d->getOperand(0));
+          auto c1 = getConst(d->getOperand(1));
+          if (c0) {
+            auto r = coefOf(d->getOperand(1));
+            if (!r)
+              return std::nullopt;
+            return *c0 * *r;
+          }
+          if (c1) {
+            auto l = coefOf(d->getOperand(0));
+            if (!l)
+              return std::nullopt;
+            return *l * *c1;
+          }
+          return std::nullopt;
+        }
+        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(d))
+          return coefOf(cast.getOperand());
+        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastUIOp>(d))
+          return coefOf(cast.getOperand());
+        return std::nullopt;
+      };
+      auto c = coefOf(idx);
+      if (!c)
+        return std::nullopt;
+      totalStride += *c * trailing[i];
+    }
+  }
+
+  // Normalize: negative strides access in reverse but still touch one line
+  // per iteration conservatively; use magnitude.
+  if (totalStride < 0)
+    totalStride = -totalStride;
+  return totalStride;
+}
+
+/// Return the element size (bytes) of a load/store op's memref.
+static unsigned accessElementBytes(mlir::Operation *accessOp) {
+  mlir::Type elemTy;
+  if (auto o = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  if (!elemTy || !elemTy.isIntOrFloat())
+    return 8; // conservative
+  unsigned bits = elemTy.getIntOrFloatBitWidth();
+  return bits > 0 ? bits / 8 : 8;
+}
+
+/// Stride-aware per-issuance cost for a load/store at its current (or
+/// intended) site.  Scales the cold-miss latency by the fraction of a
+/// cache line touched per iteration of the innermost enclosing loop at
+/// `siteOp`:
+///
+///   effBytes = min(cacheLine, stride*elemSize + 1)
+///   cost     = ceil(missLatency * effBytes / cacheLine)
+///
+/// The `+1` pessimizes unaligned strided access that may straddle a line
+/// boundary.  When there is no enclosing loop, or the stride cannot be
+/// determined, the full miss latency is charged.
+static unsigned estimateAccessLatency(mlir::Operation *accessOp,
+                                      mlir::Operation *siteOp,
+                                      int64_t bufferBytes,
+                                      const CacheParams &cache) {
+  unsigned missLat = estimateLoadLatency(bufferBytes, cache);
+  unsigned cacheLine = cache.cacheLineSize ? cache.cacheLineSize : 64;
+
+  mlir::Value iv = innermostEnclosingIV(siteOp ? siteOp : accessOp);
+  if (!iv)
+    return missLat; // one-shot: charge a full cold miss.
+
+  auto strideOpt = estimateAccessStrideElements(accessOp, iv);
+  if (!strideOpt)
+    return missLat; // unknown stride → pessimize as full line per iter.
+
+  unsigned elemBytes = accessElementBytes(accessOp);
+  uint64_t strideBytes = (uint64_t)(*strideOpt) * elemBytes + 1;
+  uint64_t effBytes = std::min<uint64_t>(cacheLine, strideBytes);
+  uint64_t num = (uint64_t)missLat * effBytes;
+  unsigned scaled = (unsigned)((num + cacheLine - 1) / cacheLine);
+  return scaled ? scaled : 1; // at least 1 cycle of cost.
+}
+
+/// Estimate the per-issuance cost of the partial-leaf loads cloned during
+/// partial rematerialization.  Each leaf is priced against its buffer-size
+/// cache tier and scaled by stride-aware cache-line amortization relative
+/// to the innermost enclosing loop of `insertionPoint` (where the clones
+/// will execute).
 static unsigned
 estimateLeafLoadsCost(llvm::ArrayRef<mlir::Operation *> partialLeaves,
+                      mlir::Operation *insertionPoint,
                       const CacheParams &cache,
                       llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
   unsigned total = 0;
@@ -1767,7 +2044,7 @@ estimateLeafLoadsCost(llvm::ArrayRef<mlir::Operation *> partialLeaves,
       if (auto bs = estimateBufferSizeBytes(root))
         sizeBytes = *bs;
     }
-    total += estimateLoadLatency(sizeBytes, cache);
+    total += estimateAccessLatency(leaf, insertionPoint, sizeBytes, cache);
   }
   return total;
 }
@@ -1905,15 +2182,24 @@ static bool isValueAvailableAt(mlir::Value operand,
 /// in-loop or in-branch wrapping of the writer must also have fired.
 static bool writerReachesInsertionPoint(mlir::Operation *writer,
                                         mlir::Operation *insertionPoint) {
-  mlir::Block *ipBlock = insertionPoint->getBlock();
-  if (!ipBlock)
-    return false;
-  mlir::Operation *ancestor = writer;
-  while (ancestor && ancestor->getBlock() != ipBlock)
-    ancestor = ancestor->getParentOp();
-  if (!ancestor)
-    return false;
-  return ancestor->isBeforeInBlock(insertionPoint);
+  // Find the nearest enclosing block common to both writer and the
+  // insertion point, then compare the isBeforeInBlock order of the
+  // ancestor of `writer` against the ancestor of `insertionPoint` at
+  // that level.  This handles the case where the IP is in a deeper
+  // nested region than the writer (e.g. writer in a sibling top-level
+  // loop, IP inside a later loop body).
+  for (mlir::Operation *ipAncestor = insertionPoint; ipAncestor;
+       ipAncestor = ipAncestor->getParentOp()) {
+    mlir::Block *ipBlock = ipAncestor->getBlock();
+    if (!ipBlock)
+      return false;
+    mlir::Operation *wAncestor = writer;
+    while (wAncestor && wAncestor->getBlock() != ipBlock)
+      wAncestor = wAncestor->getParentOp();
+    if (wAncestor)
+      return wAncestor->isBeforeInBlock(ipAncestor);
+  }
+  return false;
 }
 
 /// Why a partial leaf candidate was rejected. Consumed by diagnostics.
@@ -2416,8 +2702,8 @@ void DataRecomputationPass::runOnOperation() {
   if (drRecompute) {
     mlir::DominanceInfo domInfo(moduleOp);
 
-    CacheParams cache{drL1Size, drL2Size, drL1Latency,
-                      drL2Latency, drL3Latency, drMemLatency};
+    CacheParams cache{drL1Size, drL2Size,     drL1Latency,    drL2Latency,
+                      drL3Latency, drMemLatency, drCacheLineSize};
 
     // Partial remat requires cost model — warn if misconfigured.
     bool partialRematEnabled = drPartialRemat && drCostModel;
@@ -2665,8 +2951,8 @@ void DataRecomputationPass::runOnOperation() {
                                  /*argMapping=*/nullptr, &loadProv,
                                  &partialSubs, &partial)) {
             unsigned alu = estimateComputeCost(storedVal, costModel);
-            unsigned leaf =
-                estimateLeafLoadsCost(partialLeaves, cache, allocRootFor);
+            unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
+                                                  cache, allocRootFor);
             mlir::Value loadMemref =
                 mlir::isa<mlir::memref::LoadOp>(loadOp)
                     ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
@@ -2677,7 +2963,8 @@ void DataRecomputationPass::runOnOperation() {
             if (loadRoot)
               if (auto bs = estimateBufferSizeBytes(loadRoot))
                 sizeBytes = *bs;
-            unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+            unsigned loadLat =
+                estimateAccessLatency(loadOp, loadOp, sizeBytes, cache);
             // Partial remat replaces one original load with a cloned
             // expression of equal or greater memory traffic. Gate strictly:
             // only fire if re-execution is cheaper than the original load.
@@ -2774,8 +3061,8 @@ void DataRecomputationPass::runOnOperation() {
                                    &argMapping, &loadProv, &partialSubs,
                                    &partial)) {
               unsigned alu = estimateComputeCost(storedVal, costModel);
-              unsigned leaf =
-                  estimateLeafLoadsCost(partialLeaves, cache, allocRootFor);
+              unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
+                                                    cache, allocRootFor);
               mlir::Value loadMemref =
                   mlir::isa<mlir::memref::LoadOp>(loadOp)
                       ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
@@ -2787,7 +3074,8 @@ void DataRecomputationPass::runOnOperation() {
               if (loadRoot)
                 if (auto bs = estimateBufferSizeBytes(loadRoot))
                   sizeBytes = *bs;
-              unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+              unsigned loadLat =
+                  estimateAccessLatency(loadOp, loadOp, sizeBytes, cache);
               auto dec = decideBufferStrategy(alu, leaf, loadLat,
                                               /*numConsumers=*/1, sizeBytes,
                                               /*storeToLoadFootprint=*/0,
