@@ -3,6 +3,8 @@ add_mlir_library(DRCompTransforms
   DataRecomputation.cpp
   MemoryFission.cpp
   RaiseMallocToMemRef.cpp
+  Utils/OpDispatchUtils.cpp
+  Utils/MemrefBaseAnalysis.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/drcompiler/Transforms

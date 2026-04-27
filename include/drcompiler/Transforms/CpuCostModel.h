@@ -37,6 +37,18 @@ public:
   /// Look up the cycle cost of a single operation.
   unsigned opCost(mlir::Operation *op) const;
 
+  /// Threshold queries used by passes (MemoryFission today; eligible
+  /// for tuning per cost-model JSON in the future).
+  ///
+  /// `minChainCost`    — sum of recompute costs (cycles) below which a
+  ///                     candidate chain is not worth materialising into a
+  ///                     buffer. 15 ≈ one int division on x86.
+  /// `minConsumerCost` — minimum opCost of a single follow-on user that
+  ///                     justifies extending an expensive-op tip across
+  ///                     that user (e.g. sqrt → div).
+  unsigned minChainCost() const { return 15; }
+  unsigned minConsumerCost() const { return 10; }
+
   /// Whether this model was loaded from a file (vs. built-in defaults).
   bool isFromFile() const { return fromFile; }
 

@@ -127,7 +127,7 @@ extractChains(affine::AffineForOp forOp,
   // Find expensive ops in the loop body.
   SmallVector<Operation *> expensiveOps;
   for (Operation &op : *forOp.getBody()) {
-    if (costModel.opCost(&op) >= 15)
+    if (costModel.opCost(&op) >= costModel.minChainCost())
       expensiveOps.push_back(&op);
   }
 
@@ -142,7 +142,7 @@ extractChains(affine::AffineForOp forOp,
     if (tip.hasOneUse()) {
       Operation *user = *tip.getUsers().begin();
       if (user->getNumResults() == 1 && isMemoryEffectFree(user) &&
-          costModel.opCost(user) >= 10 &&
+          costModel.opCost(user) >= costModel.minConsumerCost() &&
           !isa<affine::AffineYieldOp>(user)) {
         tip = user->getResult(0);
       }
@@ -179,7 +179,8 @@ extractChains(affine::AffineForOp forOp,
 
     traceBack(tip);
 
-    if (subtreeOps.empty() || !sourceMemref || cost < 15)
+    if (subtreeOps.empty() || !sourceMemref ||
+        cost < costModel.minChainCost())
       continue;
 
     // Reverse for topological order (defs before uses) since traceBack
@@ -332,38 +333,29 @@ void MemoryFissionPass::runOnOperation() {
       if (!shouldFission)
         continue;
 
-      // Safety: skip if any candidate loop stores to the source memref.
-      // The source must be read-only across all consumers for fission to
-      // be correct (otherwise loop order matters and the shared buffer
-      // would capture stale values).
+      // Safety: source must be read-only across all consumers (otherwise
+      // loop order matters and the shared buffer would capture stale
+      // values), and bodies must not contain nested affine.for (complex
+      // body unsupported). Both checks share one body walk per loop.
+      auto &[firstLoop, firstChain] = cand.loops[0];
       bool sourceWritten = false;
+      bool hasInnerLoop = false;
       for (auto &[loop, chain] : cand.loops) {
-        loop.getBody()->walk([&](affine::AffineStoreOp storeOp) {
-          if (storeOp.getMemRef() == cand.sourceMemref)
-            sourceWritten = true;
+        loop.getBody()->walk([&](Operation *op) {
+          if (auto storeOp = dyn_cast<affine::AffineStoreOp>(op)) {
+            if (storeOp.getMemRef() == cand.sourceMemref)
+              sourceWritten = true;
+          } else if (isa<affine::AffineForOp>(op)) {
+            hasInnerLoop = true;
+          }
         });
-        if (sourceWritten) break;
+        if (sourceWritten || hasInnerLoop) break;
       }
       if (sourceWritten) {
         DRDBG() << "  Skipping: source memref is written by a consumer\n";
         continue;
       }
-
-      // Safety: skip if any loop has a complex body (nested affine.for).
-      auto &[firstLoop, firstChain] = cand.loops[0];
-      bool allSimple = true;
-      for (auto &[loop, chain] : cand.loops) {
-        // Skip if this loop contains nested affine.for (complex body).
-        bool hasInnerLoop = false;
-        loop.getBody()->walk([&](affine::AffineForOp) {
-          hasInnerLoop = true;
-        });
-        if (hasInnerLoop) {
-          allSimple = false;
-          break;
-        }
-      }
-      if (!allSimple) {
+      if (hasInnerLoop) {
         DRDBG() << "  Skipping: nested loops not supported\n";
         continue;
       }

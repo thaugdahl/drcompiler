@@ -29,6 +29,8 @@
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/DotEmitter.h"
 #include "drcompiler/Transforms/DataRecomputationIndexing.h"
+#include "drcompiler/Transforms/Utils/MemrefBaseAnalysis.h"
+#include "drcompiler/Transforms/Utils/OpDispatchUtils.h"
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -161,51 +163,13 @@ static AllocationRoots collectAllocationRoots(DRPassContext &passCtx,
 // vv2 will yield %base
 ```
 */
-void collectBaseMemrefs(
-  mlir::Value v, llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor,
-  llvm::SmallVectorImpl<mlir::Value> &bases) {
-
-  llvm::SmallVector<mlir::Value, 4> worklist{v};
-  llvm::SmallDenseSet<mlir::Value> visited{};
-
-  while (!worklist.empty()) {
-    auto current = worklist.pop_back_val();
-    if (!visited.insert(current).second) {
-      continue;
-    }
-
-    // Base memref found
-    if (allocRootFor.contains(current) ||
-      mlir::isa<mlir::BlockArgument>(current)) {
-      bases.push_back(current);
-      continue;
-    }
-
-    // If the current value has a defining operation, and the operation
-    // is a view-taking operation, we get the first operand and add it to the
-    // worklist.
-    if (mlir::Operation *def = current.getDefiningOp()) {
-      if (OpTypeHelper<ViewLike>::anyOf(def)) {
-        worklist.push_back(def->getOperand(0));
-        continue;
-      }
-
-      // llvm.getelementptr: base pointer is operand 0
-      if (mlir::isa<mlir::LLVM::GEPOp>(def)) {
-        worklist.push_back(def->getOperand(0));
-        continue;
-      }
-
-      // polygeist.memref2pointer: source memref is operand 0
-      if (def->getName().getStringRef() == "polygeist.memref2pointer") {
-        worklist.push_back(def->getOperand(0));
-        continue;
-      }
-    }
-
-    // Fallback: Treat as a base if no other method of determining base
-    bases.push_back(current);
-  }
+// Forwarder so existing call sites keep their unqualified name.
+// Actual implementation lives in drcompiler/Transforms/Utils/MemrefBaseAnalysis.
+inline void collectBaseMemrefs(
+    mlir::Value v,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor,
+    llvm::SmallVectorImpl<mlir::Value> &bases) {
+  drcompiler::collectBaseMemrefs(v, allocRootFor, bases);
 }
 
 // ===== Phase 3: Store Value Dependency Analysis =====
@@ -432,6 +396,10 @@ void applyStore(
   collectBaseMemrefs(storeOp.getMemRef(), allocRootFor, bases);
   for (mlir::Value base : bases) {
     auto it = allocRootFor.find(base);
+    // collectBaseMemrefs may return a function argument or other unmodelled
+    // base. Stores through such bases are not tracked in our reaching-stores
+    // state — skip silently and rely on the conservative call-clobber phase
+    // to reflect the write at call boundaries.
     if (it == allocRootFor.end()) continue;
 
     // Kill stores whose values depended on the memory being overwritten
@@ -708,109 +676,95 @@ static void analyzeBlock(mlir::Block &block, StoreMap &state,
     analyzeOp(&op, state, ctx);
 }
 
-static void analyzeOp(mlir::Operation *op, StoreMap &state,
-    AnalysisContext &ctx) {
+// scf.if / affine.if: analyze each region from a copy of the entry state
+// then join the branches.
+static void analyzeIfOp(mlir::Operation *op, StoreMap &state,
+                        AnalysisContext &ctx) {
+  StoreMap thenState = state;
+  mlir::Region &thenRegion = op->getRegion(0);
+  if (!thenRegion.empty())
+    analyzeBlock(thenRegion.front(), thenState, ctx);
+
+  StoreMap elseState = state;
+  if (op->getNumRegions() > 1) {
+    mlir::Region &elseRegion = op->getRegion(1);
+    if (!elseRegion.empty())
+      analyzeBlock(elseRegion.front(), elseState, ctx);
+  }
+
+  state = joinStoreMaps(thenState, elseState);
+}
+
+// scf.for / affine.for: two-pass analysis to model loop-carried deps.
+// Pass 1 produces post-body state; pass 2 re-runs the body with the carried
+// entry to capture stores visible from a prior iteration. Affine loops with
+// statically-positive trip count skip the may-not-run join.
+static void analyzeForOp(mlir::Operation *op, StoreMap &state,
+                         AnalysisContext &ctx) {
+  mlir::Region &bodyRegion = op->getRegion(0);
+
+  StoreMap bodyState = state;
+  if (!bodyRegion.empty())
+    analyzeBlock(bodyRegion.front(), bodyState, ctx);
+
+  // Carry join — iteration N>1 always observes prior body stores, so no
+  // absent-path sentinel.
+  StoreMap carriedEntry =
+      joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
+  StoreMap bodyState2 = carriedEntry;
+  if (!bodyRegion.empty())
+    analyzeBlock(bodyRegion.front(), bodyState2, ctx);
+
+  if (auto affineFor = mlir::dyn_cast<mlir::affine::AffineForOp>(op)) {
+    if (affineFor.hasConstantLowerBound() &&
+        affineFor.hasConstantUpperBound() &&
+        affineFor.getConstantLowerBound() <
+            affineFor.getConstantUpperBound()) {
+      state = bodyState2;
+      return;
+    }
+  }
+
+  state = joinStoreMaps(state, bodyState2);
+}
+
+// scf.while: same two-pass treatment as analyzeForOp, but covers both the
+// before (condition) and after (body) regions.
+static void analyzeWhileOp(mlir::scf::WhileOp whileOp, StoreMap &state,
+                           AnalysisContext &ctx) {
+  mlir::Region &beforeRegion = whileOp.getBefore();
+  mlir::Region &afterRegion = whileOp.getAfter();
+
+  StoreMap condState = state;
+  if (!beforeRegion.empty())
+    analyzeBlock(beforeRegion.front(), condState, ctx);
+  StoreMap bodyState = condState;
+  if (!afterRegion.empty())
+    analyzeBlock(afterRegion.front(), bodyState, ctx);
+
+  StoreMap carriedEntry =
+      joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
+  StoreMap condState2 = carriedEntry;
+  if (!beforeRegion.empty())
+    analyzeBlock(beforeRegion.front(), condState2, ctx);
+  StoreMap bodyState2 = condState2;
+  if (!afterRegion.empty())
+    analyzeBlock(afterRegion.front(), bodyState2, ctx);
+
+  state = joinStoreMaps(state, bodyState2);
+}
+
+// memref/affine/llvm store: dispatch to dialect-specific applier or, for
+// affine.store, kill dependents and record nullopt coverage (affine maps
+// make index extraction non-trivial).
+static void analyzeStoreOp(mlir::Operation *op, StoreMap &state,
+                           AnalysisContext &ctx) {
   auto &allocRootFor = ctx.allocRootFor;
-  auto &loadProv = ctx.loadProv;
-
-  // --- scf.if / affine.if: branch + join ---
-  if (mlir::isa<mlir::scf::IfOp>(op) ||
-      mlir::isa<mlir::affine::AffineIfOp>(op)) {
-    // Then region (always present, region 0)
-    StoreMap thenState = state;
-    mlir::Region &thenRegion = op->getRegion(0);
-    if (!thenRegion.empty())
-      analyzeBlock(thenRegion.front(), thenState, ctx);
-
-    // Else region (region 1, may be empty or absent)
-    StoreMap elseState = state;
-    if (op->getNumRegions() > 1) {
-      mlir::Region &elseRegion = op->getRegion(1);
-      if (!elseRegion.empty())
-        analyzeBlock(elseRegion.front(), elseState, ctx);
-    }
-
-    state = joinStoreMaps(thenState, elseState);
-    return;
-  }
-
-  // --- scf.for / affine.for: may-execute loop ---
-  if (mlir::isa<mlir::scf::ForOp>(op) ||
-      mlir::isa<mlir::affine::AffineForOp>(op)) {
-    mlir::Region &bodyRegion = op->getRegion(0);
-
-    // First pass: body starts from pre-loop state.
-    StoreMap bodyState = state;
-    if (!bodyRegion.empty())
-      analyzeBlock(bodyRegion.front(), bodyState, ctx);
-
-    // Second pass: model loop-carried dependencies.  A store in the body can
-    // reach a load in the NEXT iteration of the same body, so join the
-    // post-body state back into the entry state and re-analyze.  This gives
-    // every load inside the body a conservative view of all stores that may
-    // have run before it (pre-loop init OR a prior iteration's body store).
-    // No absent-path sentinel here: this is a carry join, not a may-not-run
-    // join — iteration N>1 always observes prior body stores.
-    StoreMap carriedEntry =
-        joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
-    StoreMap bodyState2 = carriedEntry;
-    if (!bodyRegion.empty())
-      analyzeBlock(bodyRegion.front(), bodyState2, ctx);
-
-    // For affine.for with provably-positive trip count (static lb < ub),
-    // the body always executes at least once — use only the body state.
-    if (auto affineFor = mlir::dyn_cast<mlir::affine::AffineForOp>(op)) {
-      if (affineFor.hasConstantLowerBound() &&
-          affineFor.hasConstantUpperBound() &&
-          affineFor.getConstantLowerBound() <
-              affineFor.getConstantUpperBound()) {
-        state = bodyState2;
-        return;
-      }
-    }
-
-    // Loop may not execute: join body-result with pre-loop state
-    state = joinStoreMaps(state, bodyState2);
-    return;
-  }
-
-  // --- scf.while: may-execute while loop ---
-  if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(op)) {
-    mlir::Region &beforeRegion = whileOp.getBefore();
-    mlir::Region &afterRegion  = whileOp.getAfter();
-
-    // First pass.
-    StoreMap condState = state;
-    if (!beforeRegion.empty())
-      analyzeBlock(beforeRegion.front(), condState, ctx);
-    StoreMap bodyState = condState;
-    if (!afterRegion.empty())
-      analyzeBlock(afterRegion.front(), bodyState, ctx);
-
-    // Second pass: model loop-carried deps (body store visible on next iter).
-    // Carry join — no absent-path sentinel.
-    StoreMap carriedEntry =
-        joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
-    StoreMap condState2 = carriedEntry;
-    if (!beforeRegion.empty())
-      analyzeBlock(beforeRegion.front(), condState2, ctx);
-    StoreMap bodyState2 = condState2;
-    if (!afterRegion.empty())
-      analyzeBlock(afterRegion.front(), bodyState2, ctx);
-
-    // Join with pre-loop (may not execute)
-    state = joinStoreMaps(state, bodyState2);
-    return;
-  }
-
-  // --- memref.store / affine.store ---
   if (auto storeOp = mlir::dyn_cast<mlir::memref::StoreOp>(op)) {
     applyStore(storeOp, state, allocRootFor, ctx.storeValueDeps);
     return;
   }
   if (auto affStore = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op)) {
-    // Treat affine.store conservatively (nullopt coverage — affine maps
-    // make index extraction non-trivial).
     llvm::SmallVector<mlir::Value, 2> bases;
     collectBaseMemrefs(affStore.getMemRef(), allocRootFor, bases);
     for (mlir::Value base : bases) {
@@ -821,144 +775,143 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
     }
     return;
   }
-
-  // --- llvm.store: flat (no index coverage) ---
   if (auto llvmStore = mlir::dyn_cast<mlir::LLVM::StoreOp>(op)) {
     applyLLVMStore(llvmStore, state, allocRootFor, ctx.storeValueDeps);
     return;
   }
+}
 
-  // --- llvm.load: record provenance (flat, all stores match) ---
-  if (auto llvmLoad = mlir::dyn_cast<mlir::LLVM::LoadOp>(op)) {
-    llvm::SmallVector<mlir::Value, 2> bases;
-    collectBaseMemrefs(llvmLoad.getAddr(), allocRootFor, bases);
-    for (mlir::Value base : bases) {
-      auto it = allocRootFor.find(base);
-      if (it == allocRootFor.end()) continue;
-      auto rootIt = state.find(it->second);
-      if (rootIt == state.end()) continue;
+// Insert every reaching store for `loadOp`'s base allocation roots into
+// loadProv[loadOp]. For memref.load with concrete indices we filter by
+// PointSet overlap; affine.load and llvm.load record all reaching stores.
+static void recordLoadProvenance(mlir::Operation *loadOp, mlir::Value memref,
+                                 StoreMap &state, AnalysisContext &ctx) {
+  auto &allocRootFor = ctx.allocRootFor;
+  auto &loadProv = ctx.loadProv;
+  llvm::SmallVector<mlir::Value, 2> bases;
+  collectBaseMemrefs(memref, allocRootFor, bases);
 
-      auto &provSet = loadProv[op];
-      for (const auto &entry : rootIt->second)
-        provSet.insert(entry.storeOp);
+  bool isMemrefLoad = mlir::isa<mlir::memref::LoadOp>(loadOp);
+  for (mlir::Value base : bases) {
+    auto it = allocRootFor.find(base);
+    if (it == allocRootFor.end()) continue;
+    auto rootIt = state.find(it->second);
+    if (rootIt == state.end()) continue;
+
+    // Ensure the load appears in provenance even if no stores match
+    // (e.g. all stores were killed). An empty set classifies as MULTI.
+    auto &provSet = loadProv[loadOp];
+
+    std::optional<PointSet> loadCoverage;
+    if (isMemrefLoad) {
+      auto load = mlir::cast<mlir::memref::LoadOp>(loadOp);
+      bool throughView = (base != load.getMemRef());
+      loadCoverage = (load.getIndices().empty() || throughView)
+                         ? std::nullopt
+                         : computeAccessIndices(load.getIndices());
     }
-    return;
-  }
 
-  // --- affine.load: record provenance (flat / nullopt coverage) ---
-  if (auto affLoad = mlir::dyn_cast<mlir::affine::AffineLoadOp>(op)) {
-    llvm::SmallVector<mlir::Value, 2> bases;
-    collectBaseMemrefs(affLoad.getMemRef(), allocRootFor, bases);
-    for (mlir::Value base : bases) {
-      auto it = allocRootFor.find(base);
-      if (it == allocRootFor.end()) continue;
-      auto rootIt = state.find(it->second);
-      if (rootIt == state.end()) continue;
-
-      auto &provSet = loadProv[op];
-      for (const auto &entry : rootIt->second)
-        provSet.insert(entry.storeOp);
-    }
-    return;
-  }
-
-  // --- memref.load: record provenance (offset-sensitive) ---
-  if (auto loadOp = mlir::dyn_cast<mlir::memref::LoadOp>(op)) {
-    llvm::SmallVector<mlir::Value, 2> bases;
-    collectBaseMemrefs(loadOp.getMemRef(), allocRootFor, bases);
-    for (mlir::Value base : bases) {
-      auto it = allocRootFor.find(base);
-      if (it == allocRootFor.end()) continue;
-      auto rootIt = state.find(it->second);
-      if (rootIt == state.end()) continue;
-
-      // Ensure the load appears in provenance even if no stores match
-      // (e.g., all stores were killed). An empty provenance set is
-      // classified as MULTI by the downstream classifier.
-      auto &provSet = loadProv[op];
-
-      bool throughView = (base != loadOp.getMemRef());
-      auto loadCoverage = (loadOp.getIndices().empty() || throughView)
-                              ? std::nullopt
-                              : computeAccessIndices(loadOp.getIndices());
-
-      for (const auto &entry : rootIt->second) {
-        if (loadCoverage && entry.coverage) {
-          // Both have concrete coverage: only include if they overlap.
-          if (loadCoverage->overlaps(*entry.coverage))
-            provSet.insert(entry.storeOp);
-        } else {
-          // Either is nullopt: conservative, always overlaps.
+    for (const auto &entry : rootIt->second) {
+      if (loadCoverage && entry.coverage) {
+        if (loadCoverage->overlaps(*entry.coverage))
           provSet.insert(entry.storeOp);
-        }
-      }
-    }
-    return;
-  }
-
-  // --- CallOpInterface: record enriched edge, then conservative clobber ---
-  if (auto callIface = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
-    // Resolve callee
-    mlir::FunctionOpInterface callee = nullptr;
-    auto callableRef = callIface.getCallableForCallee();
-    if (auto symbol = mlir::dyn_cast<mlir::SymbolRefAttr>(callableRef)) {
-      auto *calleeOp = ctx.passCtx.getSymTabCollection().lookupSymbolIn(
-          ctx.passCtx.getModuleOp().getOperation(), symbol);
-      if (calleeOp)
-        callee = mlir::dyn_cast<mlir::FunctionOpInterface>(calleeOp);
-    }
-
-    // Build enriched call edge
-    EnrichedCallEdge edge;
-    edge.callSiteOp = op;
-    edge.callee = callee;
-    edge.argStores.resize(op->getNumOperands());
-
-    for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
-      if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
-              operand.getType()))
-        continue;
-
-      llvm::SmallVector<mlir::Value, 2> bases;
-      collectBaseMemrefs(operand, allocRootFor, bases);
-      for (mlir::Value base : bases) {
-        auto it = allocRootFor.find(base);
-        if (it == allocRootFor.end()) continue;
-        auto rootIt = state.find(it->second);
-        if (rootIt != state.end())
-          for (const auto &entry : rootIt->second)
-            edge.argStores[i].insert(entry.storeOp);
-      }
-    }
-
-    // Record edge (keyed by callee op, or null for indirect/external)
-    mlir::Operation *calleeOp = callee ? callee.getOperation() : nullptr;
-    ctx.callGraph[calleeOp].push_back(std::move(edge));
-
-    // Apply clobber with callee-aware refinements
-    applyCall(op, state, allocRootFor, ctx.storeValueDeps,
-              ctx.globalAllocOps, callee, ctx.interproceduralOrigins);
-    return;
-  }
-
-  // --- Generic op with regions (catch-all) ---
-  if (op->getNumRegions() > 0) {
-    // Conservatively iterate all regions sequentially and join results.
-    StoreMap joined = state;
-    bool first = true;
-    for (mlir::Region &region : op->getRegions()) {
-      if (region.empty()) continue;
-      StoreMap regionState = state;
-      analyzeBlock(region.front(), regionState, ctx);
-      if (first) {
-        joined = regionState;
-        first = false;
       } else {
-        joined = joinStoreMaps(joined, regionState);
+        provSet.insert(entry.storeOp);
       }
     }
-    if (!first)
-      state = joinStoreMaps(state, joined);
+  }
+}
+
+// CallOpInterface: record enriched call edge for interproc analysis, then
+// apply the conservative clobber.
+static void analyzeCallOp(mlir::CallOpInterface callIface, StoreMap &state,
+                          AnalysisContext &ctx) {
+  mlir::Operation *op = callIface.getOperation();
+  auto &allocRootFor = ctx.allocRootFor;
+
+  mlir::FunctionOpInterface callee = nullptr;
+  auto callableRef = callIface.getCallableForCallee();
+  if (auto symbol = mlir::dyn_cast<mlir::SymbolRefAttr>(callableRef)) {
+    auto *calleeOp = ctx.passCtx.getSymTabCollection().lookupSymbolIn(
+        ctx.passCtx.getModuleOp().getOperation(), symbol);
+    if (calleeOp)
+      callee = mlir::dyn_cast<mlir::FunctionOpInterface>(calleeOp);
+  }
+
+  EnrichedCallEdge edge;
+  edge.callSiteOp = op;
+  edge.callee = callee;
+  edge.argStores.resize(op->getNumOperands());
+
+  for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
+    if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+            operand.getType()))
+      continue;
+
+    llvm::SmallVector<mlir::Value, 2> bases;
+    collectBaseMemrefs(operand, allocRootFor, bases);
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end()) continue;
+      auto rootIt = state.find(it->second);
+      if (rootIt != state.end())
+        for (const auto &entry : rootIt->second)
+          edge.argStores[i].insert(entry.storeOp);
+    }
+  }
+
+  mlir::Operation *calleeOp = callee ? callee.getOperation() : nullptr;
+  ctx.callGraph[calleeOp].push_back(std::move(edge));
+
+  applyCall(op, state, allocRootFor, ctx.storeValueDeps,
+            ctx.globalAllocOps, callee, ctx.interproceduralOrigins);
+}
+
+// Generic op carrying regions: analyze each, then join across regions and
+// fold into the outer state. Catch-all for region-bearing ops not otherwise
+// handled.
+static void analyzeGenericRegionOp(mlir::Operation *op, StoreMap &state,
+                                   AnalysisContext &ctx) {
+  StoreMap joined = state;
+  bool first = true;
+  for (mlir::Region &region : op->getRegions()) {
+    if (region.empty()) continue;
+    StoreMap regionState = state;
+    analyzeBlock(region.front(), regionState, ctx);
+    if (first) {
+      joined = regionState;
+      first = false;
+    } else {
+      joined = joinStoreMaps(joined, regionState);
+    }
+  }
+  if (!first)
+    state = joinStoreMaps(state, joined);
+}
+
+static void analyzeOp(mlir::Operation *op, StoreMap &state,
+    AnalysisContext &ctx) {
+  if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(op))
+    return analyzeIfOp(op, state, ctx);
+
+  if (mlir::isa<mlir::scf::ForOp, mlir::affine::AffineForOp>(op))
+    return analyzeForOp(op, state, ctx);
+
+  if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(op))
+    return analyzeWhileOp(whileOp, state, ctx);
+
+  if (drcompiler::isAnyStoreOp(op))
+    return analyzeStoreOp(op, state, ctx);
+
+  if (drcompiler::isAnyLoadOp(op))
+    return recordLoadProvenance(op, drcompiler::getLoadStoreMemref(op),
+                                state, ctx);
+
+  if (auto callIface = mlir::dyn_cast<mlir::CallOpInterface>(op))
+    return analyzeCallOp(callIface, state, ctx);
+
+  if (op->getNumRegions() > 0) {
+    analyzeGenericRegionOp(op, state, ctx);
   }
 }
 
@@ -1074,18 +1027,16 @@ static bool isSafeToForward(mlir::Operation *storeOp,
   return domInfo.dominates(storeOp, loadOp);
 }
 
-/// Extract the value written by a store-like op (memref.store, affine.store).
-static mlir::Value getStoredValue(mlir::Operation *op) {
-  if (auto s = mlir::dyn_cast<mlir::memref::StoreOp>(op))
-    return s.getValueToStore();
-  if (auto s = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
-    return s.getValueToStore();
-  return {};
-}
+using drcompiler::getStoredValue;
 
 // ===== Footprint Analysis =====
 
-/// Default trip count when bounds cannot be statically determined.
+/// Default trip count when bounds cannot be statically determined. Picked
+/// to match a common per-loop iteration count seen in SPEC inner loops:
+/// big enough that small constants (1, 4) don't dominate cache estimates,
+/// small enough that footprint × trip stays within typical L2 sizes.
+/// Tuning beyond ±2× makes little difference to the cost model decisions
+/// downstream (cache-fit vs. memory-bound is the binary outcome).
 constexpr int64_t kDefaultTripCount = 128;
 
 /// Trace a value to a compile-time constant integer, walking through
@@ -1241,8 +1192,14 @@ static unsigned estimateComputeCost(mlir::Value val,
   return cost;
 }
 
-/// Estimate the size of an allocation in bytes.  Returns nullopt if the size
-/// cannot be determined statically (e.g. dynamic dimensions).
+/// Estimate the size of an allocation in bytes. Returns nullopt when the
+/// size cannot be determined statically:
+///   - allocOp is not a memref::AllocOp / AllocaOp (e.g. get_global, an
+///     unmodelled allocator, or a function-arg memref);
+///   - the memref shape contains dynamic dimensions;
+///   - the element type has zero bit-width (opaque/unknown type).
+/// Callers fall back to a conservative size (typically `cache.l2Size + 1`,
+/// i.e. assume the buffer misses cache).
 static std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
   mlir::MemRefType memrefTy;
 
@@ -1286,32 +1243,13 @@ static unsigned estimateLoadLatency(int64_t bufferSizeBytes,
 /// Estimate the memory footprint (bytes) of a single execution of an op.
 static int64_t estimateOpFootprintBytes(mlir::Operation *op,
                                         const CacheParams &cache) {
-  // memref.store / memref.load
-  if (auto s = mlir::dyn_cast<mlir::memref::StoreOp>(op))
-    return s.getMemRefType().getElementTypeBitWidth() / 8;
-  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(op))
-    return l.getMemRefType().getElementTypeBitWidth() / 8;
-
-  // affine.store / affine.load
-  if (auto s = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
-    return s.getMemRefType().getElementTypeBitWidth() / 8;
-  if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(op))
-    return l.getMemRefType().getElementTypeBitWidth() / 8;
-
-  // llvm.store / llvm.load
-  if (auto s = mlir::dyn_cast<mlir::LLVM::StoreOp>(op)) {
-    unsigned bits = 0;
-    mlir::Type valTy = s.getValue().getType();
-    if (valTy.isIntOrFloat())
-      bits = valTy.getIntOrFloatBitWidth();
-    return bits > 0 ? bits / 8 : 8; // conservative 8 bytes
-  }
-  if (auto l = mlir::dyn_cast<mlir::LLVM::LoadOp>(op)) {
-    unsigned bits = 0;
-    mlir::Type resTy = l.getResult().getType();
-    if (resTy.isIntOrFloat())
-      bits = resTy.getIntOrFloatBitWidth();
-    return bits > 0 ? bits / 8 : 8;
+  // memref / affine / llvm scalar load and store: derive element type from
+  // the memref/pointer operand.
+  if (drcompiler::isAnyLoadOp(op) || drcompiler::isAnyStoreOp(op)) {
+    mlir::Type elemTy = drcompiler::getLoadStoreElementType(op);
+    if (elemTy && elemTy.isIntOrFloat())
+      return elemTy.getIntOrFloatBitWidth() / 8;
+    return 8; // conservative fallback for opaque LLVM pointer types
   }
 
   // vector.load / vector.store / vector.transfer_read / vector.transfer_write
@@ -3068,9 +3006,7 @@ void DataRecomputationPass::runOnOperation() {
             unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
                                                   cache, allocRootFor);
             mlir::Value loadMemref =
-                mlir::isa<mlir::memref::LoadOp>(loadOp)
-                    ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
-                    : mlir::cast<mlir::affine::AffineLoadOp>(loadOp).getMemRef();
+                drcompiler::getLoadStoreMemref(loadOp);
             mlir::Operation *loadRoot =
                 lookupAllocRoot(loadMemref, allocRootFor);
             int64_t sizeBytes = cache.l2Size + 1;
@@ -3184,10 +3120,7 @@ void DataRecomputationPass::runOnOperation() {
               unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
                                                     cache, allocRootFor);
               mlir::Value loadMemref =
-                  mlir::isa<mlir::memref::LoadOp>(loadOp)
-                      ? mlir::cast<mlir::memref::LoadOp>(loadOp).getMemRef()
-                      : mlir::cast<mlir::affine::AffineLoadOp>(loadOp)
-                            .getMemRef();
+                  drcompiler::getLoadStoreMemref(loadOp);
               mlir::Operation *loadRoot =
                   lookupAllocRoot(loadMemref, allocRootFor);
               int64_t sizeBytes = cache.l2Size + 1;
