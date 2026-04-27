@@ -42,6 +42,8 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "L1 data cache size in bytes">,
     Option<"drL2Size", "dr-l2-size", "unsigned", "262144",
            "L2 cache size in bytes">,
+    Option<"drL3Size", "dr-l3-size", "unsigned", "0",
+           "L3 cache size in bytes (0 = unmodeled, buffers > L2 use mem latency)">,
     Option<"drL1Latency", "dr-l1-latency", "unsigned", "4",
            "L1 cache hit latency in cycles">,
     Option<"drL2Latency", "dr-l2-latency", "unsigned", "12",

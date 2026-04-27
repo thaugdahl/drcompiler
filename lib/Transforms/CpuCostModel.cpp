@@ -89,15 +89,33 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
   }
 
   // Read default_cost.
-  if (auto dc = root->getInteger("default_cost"))
-    m.defaultCost = static_cast<unsigned>(*dc);
+  if (auto dc = root->getInteger("default_cost")) {
+    if (*dc < 0) {
+      llvm::errs() << "drcompiler warning: negative default_cost in '"
+                   << path << "'; using built-in default\n";
+    } else {
+      m.defaultCost = static_cast<unsigned>(*dc);
+    }
+  }
 
   // Read ops table — overwrites any defaults for ops that appear.
   if (auto *ops = root->getObject("ops")) {
     for (auto &kv : *ops) {
-      if (auto cost = kv.second.getAsInteger())
+      if (auto cost = kv.second.getAsInteger()) {
+        if (*cost < 0) {
+          llvm::errs() << "drcompiler warning: negative cost for '"
+                       << kv.first << "' in '" << path << "'; skipping\n";
+          continue;
+        }
         m.table[kv.first] = static_cast<unsigned>(*cost);
+      } else {
+        llvm::errs() << "drcompiler warning: non-integer cost for '"
+                     << kv.first << "' in '" << path << "'; skipping\n";
+      }
     }
+  } else if (root->get("ops")) {
+    llvm::errs() << "drcompiler warning: 'ops' in '" << path
+                 << "' is not a JSON object; ignoring\n";
   }
 
   m.fromFile = true;

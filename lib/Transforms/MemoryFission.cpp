@@ -375,7 +375,9 @@ void MemoryFissionPass::runOnOperation() {
         auto &[loop, chain] = cand.loops[i];
         if (loop.getUpperBoundMap() != firstLoop.getUpperBoundMap() ||
             loop.getUpperBoundOperands() != firstLoop.getUpperBoundOperands() ||
-            loop.getLowerBoundMap() != firstLoop.getLowerBoundMap()) {
+            loop.getLowerBoundMap() != firstLoop.getLowerBoundMap() ||
+            loop.getLowerBoundOperands() !=
+                firstLoop.getLowerBoundOperands()) {
           boundsMatch = false;
           break;
         }

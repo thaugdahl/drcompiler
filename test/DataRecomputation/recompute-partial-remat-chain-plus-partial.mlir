@@ -2,8 +2,11 @@
 
 // Tree mixes a trivially-chainable leaf (%chain, constant store) with a
 // partial-leaf candidate (%partial, loop-IV-dependent store that breaks
-// the chain path). Partial-remat mode clones both as leaves and wires
-// them into the rematerialized addf.
+// the chain path).  Partial-remat ACCEPTs; the chain leaf collapses to
+// its constant store value (no clone of memref.load), while the partial
+// leaf is cloned as an affine.load.  Phase 1 (S1-A) tightened analysis
+// precision so the chain propagates the constant inline rather than
+// emitting a cloned load.
 
 module {
   func.func @test() -> f32 {
@@ -45,10 +48,11 @@ module {
   }
 }
 
-// Rematerialized expression contains loads of both upstream buffers and
-// an addf, feeding the return.
+// Rematerialized expression: chain leaf folded to constant, partial leaf
+// cloned as affine.load, addf feeding the return.
 // CHECK-LABEL: func.func @test
-// CHECK:         %[[LC:.*]] = memref.load %{{.*}}[] : memref<f32>
+// CHECK:         affine.store %{{.*}}, %{{.*}} : memref<1048576xf32>
+// CHECK:         %[[CST:.*]] = arith.constant 1.000000e+00 : f32
 // CHECK-NEXT:    %[[LP:.*]] = affine.load %{{.*}}[0] : memref<4xf32>
-// CHECK-NEXT:    %[[SUM:.*]] = arith.addf %[[LC]], %[[LP]] : f32
+// CHECK-NEXT:    %[[SUM:.*]] = arith.addf %[[CST]], %[[LP]] : f32
 // CHECK:         return %[[SUM]] : f32

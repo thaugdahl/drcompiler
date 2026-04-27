@@ -1172,6 +1172,7 @@ static std::optional<int64_t> estimateTripCount(
 struct CacheParams {
   unsigned l1Size;    // bytes
   unsigned l2Size;    // bytes
+  unsigned l3Size;    // bytes (0 = unknown / not modeled)
   unsigned l1Latency; // cycles
   unsigned l2Latency;
   unsigned l3Latency;
@@ -1247,7 +1248,9 @@ static unsigned estimateLoadLatency(int64_t bufferSizeBytes,
     return cache.l1Latency;
   if (bufferSizeBytes <= (int64_t)cache.l2Size)
     return cache.l2Latency;
-  return cache.l3Latency;
+  if (cache.l3Size > 0 && bufferSizeBytes <= (int64_t)cache.l3Size)
+    return cache.l3Latency;
+  return cache.memLatency;
 }
 
 // ===== Per-Op and Block Footprint Estimation =====
@@ -2772,8 +2775,9 @@ void DataRecomputationPass::runOnOperation() {
   if (drRecompute) {
     mlir::DominanceInfo domInfo(moduleOp);
 
-    CacheParams cache{drL1Size, drL2Size,     drL1Latency,    drL2Latency,
-                      drL3Latency, drMemLatency, drCacheLineSize};
+    CacheParams cache{drL1Size,    drL2Size,    drL3Size,
+                      drL1Latency, drL2Latency, drL3Latency,
+                      drMemLatency, drCacheLineSize};
 
     // Partial remat requires cost model — warn if misconfigured.
     bool partialRematEnabled = drPartialRemat && drCostModel;
