@@ -2310,6 +2310,33 @@ static bool isSafeLeafAt(
     reject = PartialLeafReject::WriterDoesNotDominate;
     return false;
   }
+  // S2-A: block-order reachability accepts a writer wrapped in a
+  // conditional (scf.if / affine.if) because the conditional itself
+  // sits before insertionPoint -- but the writer may never have fired
+  // if the condition was false.  Reject if any ancestor between the
+  // writer and the common-block level is a conditional region op.
+  // Loops are still accepted; S1-A's join-lattice sentinel ensures a
+  // may-zero loop yields LEAKED rather than SINGLE upstream.
+  {
+    for (mlir::Operation *ipAnc = insertionPoint; ipAnc;
+         ipAnc = ipAnc->getParentOp()) {
+      mlir::Operation *wAnc = summary.singleWriter;
+      while (wAnc && wAnc->getBlock() != ipAnc->getBlock())
+        wAnc = wAnc->getParentOp();
+      if (wAnc) {
+        for (mlir::Operation *cur = summary.singleWriter->getParentOp();
+             cur; cur = cur->getParentOp()) {
+          if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(cur)) {
+            reject = PartialLeafReject::WriterDoesNotDominate;
+            return false;
+          }
+          if (cur == wAnc)
+            break;
+        }
+        break;
+      }
+    }
+  }
   (void)domInfo;
 
   // Every operand of the leaf load (including memref and indices/map operands)
@@ -3055,6 +3082,12 @@ void DataRecomputationPass::runOnOperation() {
         auto origIt = interproceduralOrigins.find(storeOp);
         if (origIt == interproceduralOrigins.end())
           continue;
+
+        if (origIt->second.size() > 1) {
+          if (drTestDiagnostics)
+            loadOp->emitRemark() << "interproc: SKIP_AMBIGUOUS_ORIGIN";
+          continue;
+        }
 
         bool replaced = false;
         for (auto &origin : origIt->second) {
