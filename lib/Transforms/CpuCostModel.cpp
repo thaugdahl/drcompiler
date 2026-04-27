@@ -118,6 +118,34 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
                  << "' is not a JSON object; ignoring\n";
   }
 
+  // Read optional cache hierarchy parameters.
+  if (auto *cache = root->getObject("cache")) {
+    auto readUnsigned = [&](llvm::StringRef key,
+                            std::optional<unsigned> &dst) {
+      if (auto v = cache->getInteger(key)) {
+        if (*v < 0) {
+          llvm::errs() << "drcompiler warning: negative " << key << " in '"
+                       << path << "'; skipping\n";
+          return;
+        }
+        dst = static_cast<unsigned>(*v);
+      } else if (cache->get(key)) {
+        llvm::errs() << "drcompiler warning: non-integer " << key << " in '"
+                     << path << "'; skipping\n";
+      }
+    };
+    readUnsigned("l1_size", m.cache.l1Size);
+    readUnsigned("l2_size", m.cache.l2Size);
+    readUnsigned("l3_size", m.cache.l3Size);
+    readUnsigned("l1_latency", m.cache.l1Latency);
+    readUnsigned("l2_latency", m.cache.l2Latency);
+    readUnsigned("l3_latency", m.cache.l3Latency);
+    readUnsigned("mem_latency", m.cache.memLatency);
+  } else if (root->get("cache")) {
+    llvm::errs() << "drcompiler warning: 'cache' in '" << path
+                 << "' is not a JSON object; ignoring\n";
+  }
+
   m.fromFile = true;
   DRDBG() << "Loaded CPU cost model from '" << path << "' ("
           << m.table.size() << " ops)\n";

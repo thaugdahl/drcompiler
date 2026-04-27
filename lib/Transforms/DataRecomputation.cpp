@@ -634,6 +634,34 @@ void applyCall(
         killDependentStores(it->second, state, storeValueDeps);
 
         if (effect.mayWrite && !effect.passedToCall) {
+          // S3-D: detect an unconditional rank-0 store in the callee's
+          // entry block.  Such a store fully overwrites the root every
+          // call, so it kills prior caller-side stores (analogous to the
+          // rank-0 branch of applyStore).  Only the entry block counts —
+          // stores nested inside scf.if / loops in the callee may not
+          // execute, and treating them as kills would be unsound.
+          mlir::Region *calleeBody = callee.getCallableRegion();
+          mlir::Block *entryBlock = (calleeBody && !calleeBody->empty())
+                                        ? &calleeBody->front()
+                                        : nullptr;
+          bool calleeRank0Kill = false;
+          for (mlir::Operation *storeOp : effect.storeOps) {
+            if (storeOp->getBlock() != entryBlock)
+              continue;
+            bool rank0 = false;
+            if (auto m = mlir::dyn_cast<mlir::memref::StoreOp>(storeOp))
+              rank0 = m.getIndices().empty();
+            else if (auto a =
+                         mlir::dyn_cast<mlir::affine::AffineStoreOp>(storeOp))
+              rank0 = a.getIndices().empty();
+            if (rank0) {
+              calleeRank0Kill = true;
+              break;
+            }
+          }
+          if (calleeRank0Kill)
+            state[it->second].clear();
+
           // Direct writes only: propagate actual store ops.
           for (mlir::Operation *storeOp : effect.storeOps) {
             state[it->second].push_back({storeOp, std::nullopt});
@@ -2778,6 +2806,18 @@ void DataRecomputationPass::runOnOperation() {
     CacheParams cache{drL1Size,    drL2Size,    drL3Size,
                       drL1Latency, drL2Latency, drL3Latency,
                       drMemLatency, drCacheLineSize};
+
+    // S3-A: optional cache hierarchy parameters from the cost-model JSON
+    // override CLI defaults.  Per-field: only fields the file actually
+    // contained (parsed successfully) are applied.
+    const auto &jsonCache = costModel.cacheParams();
+    if (jsonCache.l1Size)    cache.l1Size    = *jsonCache.l1Size;
+    if (jsonCache.l2Size)    cache.l2Size    = *jsonCache.l2Size;
+    if (jsonCache.l3Size)    cache.l3Size    = *jsonCache.l3Size;
+    if (jsonCache.l1Latency) cache.l1Latency = *jsonCache.l1Latency;
+    if (jsonCache.l2Latency) cache.l2Latency = *jsonCache.l2Latency;
+    if (jsonCache.l3Latency) cache.l3Latency = *jsonCache.l3Latency;
+    if (jsonCache.memLatency) cache.memLatency = *jsonCache.memLatency;
 
     // Partial remat requires cost model — warn if misconfigured.
     bool partialRematEnabled = drPartialRemat && drCostModel;

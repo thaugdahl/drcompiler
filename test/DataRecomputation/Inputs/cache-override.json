@@ -1,0 +1,16 @@
+{
+  "default_cost": 5,
+  "ops": {
+    "arith.addi": 1,
+    "arith.muli": 3
+  },
+  "cache": {
+    "l1_size": 1024,
+    "l2_size": 4096,
+    "l3_size": 0,
+    "l1_latency": 7,
+    "l2_latency": 13,
+    "l3_latency": 41,
+    "mem_latency": 251
+  }
+}

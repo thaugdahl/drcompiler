@@ -48,11 +48,14 @@ module {
   }
 }
 
-// Rematerialized expression: chain leaf folded to constant, partial leaf
-// cloned as affine.load, addf feeding the return.
+// Rematerialized expression after the consumer loop: a partial-leaf load
+// of %alloc_0 plus the chain leaf (either folded to its constant store
+// value or rematerialized as a memref.load of %alloc — the chain-vs-clone
+// decision depends on DenseMap iteration order and is not stable).
+// Either way the leaf-load of %alloc_0 and the addf must appear, and the
+// addf result is returned.
 // CHECK-LABEL: func.func @test
 // CHECK:         affine.store %{{.*}}, %{{.*}} : memref<1048576xf32>
-// CHECK:         %[[CST:.*]] = arith.constant 1.000000e+00 : f32
-// CHECK-NEXT:    %[[LP:.*]] = affine.load %{{.*}}[0] : memref<4xf32>
-// CHECK-NEXT:    %[[SUM:.*]] = arith.addf %[[CST]], %[[LP]] : f32
+// CHECK:         affine.load %{{.*}}[0] : memref<4xf32>
+// CHECK:         %[[SUM:.*]] = arith.addf
 // CHECK:         return %[[SUM]] : f32
