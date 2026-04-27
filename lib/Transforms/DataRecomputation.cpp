@@ -332,11 +332,38 @@ static StoreValueDeps computeStoreValueDeps(
 /// Union-join two StoreMaps. Returns a new map containing,
 /// for each root, the merged entries from both maps.
 /// If the same store op appears in both maps, their coverages are unioned.
-StoreMap joinStoreMaps(StoreMap result, const StoreMap &other) {
+/// Union-join two StoreMaps.  When `injectAbsentSentinel` is true (the
+/// default), roots present in only one side gain an unknown-write
+/// sentinel `{nullptr, nullopt}` to model that the other path had no
+/// reaching store for that root.  This is the correct join for control
+/// flow where one branch may not execute (scf.if without else, may-zero
+/// loops).  Set `injectAbsentSentinel=false` for loop-carry joins, where
+/// every iteration past the first observes the body's prior writes.
+/// See BLOCKERS_CLAUDE.md §S1-A.
+StoreMap joinStoreMaps(StoreMap result, const StoreMap &other,
+                       bool injectAbsentSentinel = true) {
+  // Snapshot keys of `result` BEFORE merging.  Auto-vivify in the merge
+  // loop would otherwise erase the "absent on this side" signal.
+  llvm::SmallDenseSet<mlir::Operation *, 8> resultKeys;
+  if (injectAbsentSentinel) {
+    resultKeys.reserve(result.size());
+    for (auto &kv : result)
+      resultKeys.insert(kv.first);
+  }
+
+  auto ensureNullSentinel = [](IndexedStoreVec &entries) {
+    bool hasNullSentinel = llvm::any_of(entries, [](const IndexedStore &e) {
+      return e.storeOp == nullptr;
+    });
+    if (!hasNullSentinel)
+      entries.push_back({nullptr, std::nullopt});
+  };
+
   for (auto &[root, entries] : other) {
     auto &resultEntries = result[root];
+    if (injectAbsentSentinel && !resultKeys.count(root))
+      ensureNullSentinel(resultEntries);
     for (const auto &entry : entries) {
-      // Deduplicate: if the same store op exists, union coverages.
       auto it = llvm::find_if(resultEntries, [&](const IndexedStore &e) {
         return e.storeOp == entry.storeOp;
       });
@@ -350,6 +377,15 @@ StoreMap joinStoreMaps(StoreMap result, const StoreMap &other) {
       }
     }
   }
+
+  if (injectAbsentSentinel) {
+    for (auto root : resultKeys) {
+      if (other.count(root))
+        continue;
+      ensureNullSentinel(result[root]);
+    }
+  }
+
   return result;
 }
 
@@ -479,7 +515,8 @@ static CalleeArgEffect analyzeCalleeArg(
     for (mlir::OpOperand &use : current.getUses()) {
       mlir::Operation *user = use.getOwner();
       if (OpTypeHelper<ViewLike>::anyOf(user) ||
-          mlir::isa<mlir::LLVM::GEPOp>(user)) {
+          mlir::isa<mlir::LLVM::GEPOp>(user) ||
+          user->getName().getStringRef() == "polygeist.memref2pointer") {
         for (mlir::Value result : user->getResults()) {
           if (mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
                   result.getType())) {
@@ -684,7 +721,10 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
     // post-body state back into the entry state and re-analyze.  This gives
     // every load inside the body a conservative view of all stores that may
     // have run before it (pre-loop init OR a prior iteration's body store).
-    StoreMap carriedEntry = joinStoreMaps(state, bodyState);
+    // No absent-path sentinel here: this is a carry join, not a may-not-run
+    // join — iteration N>1 always observes prior body stores.
+    StoreMap carriedEntry =
+        joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
     StoreMap bodyState2 = carriedEntry;
     if (!bodyRegion.empty())
       analyzeBlock(bodyRegion.front(), bodyState2, ctx);
@@ -720,7 +760,9 @@ static void analyzeOp(mlir::Operation *op, StoreMap &state,
       analyzeBlock(afterRegion.front(), bodyState, ctx);
 
     // Second pass: model loop-carried deps (body store visible on next iter).
-    StoreMap carriedEntry = joinStoreMaps(state, bodyState);
+    // Carry join — no absent-path sentinel.
+    StoreMap carriedEntry =
+        joinStoreMaps(state, bodyState, /*injectAbsentSentinel=*/false);
     StoreMap condState2 = carriedEntry;
     if (!beforeRegion.empty())
       analyzeBlock(beforeRegion.front(), condState2, ctx);
@@ -2108,7 +2150,8 @@ buildRootWriteMap(mlir::ModuleOp moduleOp,
       attribute(store.getMemRef(), op);
     else if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
       for (mlir::Value operand : call->getOperands()) {
-        if (!mlir::isa<mlir::MemRefType>(operand.getType()))
+        if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+                operand.getType()))
           continue;
         llvm::SmallVector<mlir::Value, 2> bases;
         collectBaseMemrefs(operand, allocRootFor, bases);

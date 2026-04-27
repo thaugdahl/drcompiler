@@ -1,0 +1,109 @@
+#map = affine_map<(d0)[s0, s1, s2, s3, s4] -> (s0 - ((s2 ceildiv s4) * s4 - s2), -(d0 * s3 - s2) + s0, d0 * s3 + (s1 - 1) * s4 - s2 - ((s2 ceildiv s4) * s4 - s2) + 1, d0 * s3 + (s1 - 1) * s4 - s2 - (d0 * s3 - s2) + 1)>
+#map1 = affine_map<(d0, d1) -> (d1, d0 * 2 + d1)>
+module attributes {llvm.data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", llvm.target_triple = "x86_64-unknown-linux-gnu", "onnx-mlir.symbol-postfix" = "mnist"} {
+  func.func @main_graph(%arg0: memref<1x1x28x28xf32> {onnx.name = "image"}) -> (memref<1x10xf32> {onnx.name = "prediction"}) attributes {llvm.emit_c_interface} {
+    %cst = arith.constant 0.000000e+00 : f32
+    %cst_0 = arith.constant 0xFF800000 : f32
+    %c28 = arith.constant 28 : index
+    %c1 = arith.constant 1 : index
+    %c0 = arith.constant 0 : index
+    %c2 = arith.constant 2 : index
+    %0 = "krnl.global"() <{name = "constant_1", shape = [128, 196], value = dense_resource<__elided__> : tensor<128x196xf32>}> : () -> memref<128x196xf32>
+    %1 = "krnl.global"() <{name = "constant_2", shape = [128], value = dense_resource<__elided__> : tensor<128xf32>}> : () -> memref<128xf32>
+    %2 = "krnl.global"() <{name = "constant_3", shape = [10, 128], value = dense_resource<__elided__> : tensor<10x128xf32>}> : () -> memref<10x128xf32>
+    %3 = "krnl.global"() <{name = "constant_4", shape = [10], value = dense<[0.0360819325, 0.0303174332, -0.014957685, 0.0604293533, 0.0917338133, 0.0978015586, -0.0705472528, 0.121654645, -0.039008636, -0.0469057448]> : tensor<10xf32>}> : () -> memref<10xf32>
+    %alloc = memref.alloc() {alignment = 16 : i64} : memref<1x1x14x14xf32>
+    %alloca = memref.alloca() : memref<f32>
+    affine.for %arg1 = 0 to 1 {
+      affine.for %arg2 = 0 to 1 {
+        affine.for %arg3 = 0 to 14 {
+          affine.for %arg4 = 0 to 14 {
+            affine.store %cst_0, %alloca[] : memref<f32>
+            affine.for %arg5 = 0 to min #map(%arg3)[%c28, %c2, %c0, %c2, %c1] {
+              affine.for %arg6 = 0 to min #map(%arg4)[%c28, %c2, %c0, %c2, %c1] {
+                %5 = affine.max #map1(%arg3, %arg5)
+                %6 = affine.max #map1(%arg4, %arg6)
+                %7 = memref.load %arg0[%arg1, %arg2, %5, %6] : memref<1x1x28x28xf32>
+                %8 = affine.load %alloca[] : memref<f32>
+                %9 = arith.maxnumf %8, %7 : f32
+                affine.store %9, %alloca[] : memref<f32>
+              }
+            }
+            %4 = affine.load %alloca[] : memref<f32>
+            affine.store %4, %alloc[%arg1, %arg2, %arg3, %arg4] : memref<1x1x14x14xf32>
+          }
+        }
+      }
+    }
+    %reinterpret_cast = memref.reinterpret_cast %alloc to offset: [0], sizes: [1, 196], strides: [196, 1] : memref<1x1x14x14xf32> to memref<1x196xf32>
+    %alloc_1 = memref.alloc() {alignment = 128 : i64} : memref<1x128xf32>
+    affine.for %arg1 = 0 to 1 {
+      affine.for %arg2 = 0 to 128 {
+        %alloca_5 = memref.alloca() : memref<f32>
+        affine.store %cst, %alloca_5[] : memref<f32>
+        affine.for %arg3 = 0 to 196 {
+          %7 = affine.load %reinterpret_cast[%arg1, %arg3] : memref<1x196xf32>
+          %8 = affine.load %0[%arg2, %arg3] : memref<128x196xf32>
+          %9 = arith.mulf %7, %8 : f32
+          %10 = affine.load %alloca_5[] : memref<f32>
+          %11 = arith.addf %9, %10 : f32
+          affine.store %11, %alloca_5[] : memref<f32>
+        }
+        %4 = affine.load %alloca_5[] : memref<f32>
+        %5 = affine.load %1[%arg2] : memref<128xf32>
+        %6 = arith.addf %4, %5 : f32
+        affine.store %6, %alloc_1[%arg1, %arg2] : memref<1x128xf32>
+      }
+    }
+    %alloc_2 = memref.alloc() {alignment = 16 : i64} : memref<1x128xf32>
+    affine.for %arg1 = 0 to 1 {
+      affine.for %arg2 = 0 to 128 {
+        %4 = affine.load %alloc_1[%arg1, %arg2] : memref<1x128xf32>
+        %5 = arith.maxnumf %4, %cst : f32
+        affine.store %5, %alloc_2[%arg1, %arg2] : memref<1x128xf32>
+      }
+    }
+    %alloc_3 = memref.alloc() {alignment = 128 : i64} : memref<1x10xf32>
+    affine.for %arg1 = 0 to 1 {
+      affine.for %arg2 = 0 to 10 {
+        %alloca_5 = memref.alloca() : memref<f32>
+        affine.store %cst, %alloca_5[] : memref<f32>
+        affine.for %arg3 = 0 to 128 {
+          %7 = affine.load %alloc_2[%arg1, %arg3] : memref<1x128xf32>
+          %8 = affine.load %2[%arg2, %arg3] : memref<10x128xf32>
+          %9 = arith.mulf %7, %8 : f32
+          %10 = affine.load %alloca_5[] : memref<f32>
+          %11 = arith.addf %9, %10 : f32
+          affine.store %11, %alloca_5[] : memref<f32>
+        }
+        %4 = affine.load %alloca_5[] : memref<f32>
+        %5 = affine.load %3[%arg2] : memref<10xf32>
+        %6 = arith.addf %4, %5 : f32
+        affine.store %6, %alloc_3[%arg1, %arg2] : memref<1x10xf32>
+      }
+    }
+    %alloc_4 = memref.alloc() {alignment = 16 : i64} : memref<1x10xf32>
+    affine.for %arg1 = 0 to 1 {
+      %4 = affine.for %arg2 = 0 to 10 iter_args(%arg3 = %cst_0) -> (f32) {
+        %6 = affine.load %alloc_3[%arg1, %arg2] : memref<1x10xf32>
+        %7 = arith.maxnumf %arg3, %6 : f32
+        affine.yield %7 : f32
+      }
+      %5 = affine.for %arg2 = 0 to 10 iter_args(%arg3 = %cst) -> (f32) {
+        %6 = affine.load %alloc_3[%arg1, %arg2] : memref<1x10xf32>
+        %7 = arith.subf %6, %4 : f32
+        %8 = math.exp %7 : f32
+        %9 = arith.addf %arg3, %8 : f32
+        affine.store %8, %alloc_4[%arg1, %arg2] : memref<1x10xf32>
+        affine.yield %9 : f32
+      }
+      affine.for %arg2 = 0 to 10 {
+        %6 = affine.load %alloc_4[%arg1, %arg2] : memref<1x10xf32>
+        %7 = arith.divf %6, %5 : f32
+        affine.store %7, %alloc_4[%arg1, %arg2] : memref<1x10xf32>
+      }
+    }
+    return %alloc_4 : memref<1x10xf32>
+  }
+  "krnl.entry_point"() {func = @main_graph, numInputs = 1 : i32, numOutputs = 1 : i32, signature = "[    { \22type\22 : \22f32\22 , \22dims\22 : [1 , 1 , 28 , 28] , \22name\22 : \22image\22 }\0A\0A]\00@[   { \22type\22 : \22f32\22 , \22dims\22 : [1 , 10] , \22name\22 : \22prediction\22 }\0A\0A]\00"} : () -> ()
+}
