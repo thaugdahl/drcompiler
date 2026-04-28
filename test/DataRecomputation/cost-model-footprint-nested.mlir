@@ -31,8 +31,10 @@ module {
       }
     }
 
+    // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
     // expected-remark @below {{load: SINGLE}}
     %a = memref.load %buf[%c0] : memref<1xf64>
+    // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
     // expected-remark @below {{load: SINGLE}}
     %b = memref.load %buf[%c0] : memref<1xf64>
 

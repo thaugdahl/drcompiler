@@ -33,15 +33,20 @@ module {
     }
 
     affine.for %j = 0 to 1048576 {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %v1 = affine.load %l1[0] : memref<4xf32>
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %v2 = affine.load %l2[0] : memref<4xf32>
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %v3 = affine.load %l3[0] : memref<4xf32>
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %v4 = affine.load %l4[0] : memref<4xf32>
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %v5 = affine.load %l5[0] : memref<4xf32>
       %s1 = arith.addf %v1, %v2 : f32
       %s2 = arith.addf %s1, %v3 : f32
@@ -50,7 +55,8 @@ module {
       affine.store %s4, %dst[%j] : memref<1048576xf32>
     }
 
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{load: SINGLE}}
     %out = affine.load %dst[%c0] : memref<1048576xf32>
     memref.dealloc %l1 : memref<4xf32>
     memref.dealloc %l2 : memref<4xf32>

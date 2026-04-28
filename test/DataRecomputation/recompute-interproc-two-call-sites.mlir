@@ -23,8 +23,9 @@ module {
     %c2 = arith.constant 2 : i32
     call @write(%c1, %a) : (i32, memref<i32>) -> ()
     call @write(%c2, %b) : (i32, memref<i32>) -> ()
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{interproc: SKIP_AMBIGUOUS_ORIGIN}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{interproc-cross: REJECT_NOTGLOBAL}}
+    // expected-remark @below {{interproc: SKIP_AMBIGUOUS_ORIGIN}}
     %v = memref.load %b[] : memref<i32>
     memref.dealloc %a : memref<i32>
     memref.dealloc %b : memref<i32>

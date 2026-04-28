@@ -35,6 +35,7 @@ module {
       affine.yield %next : i32
     }
 
+    // expected-remark @below {{direct-forward: ACCEPT}}
     // expected-remark @below {{load: SINGLE}}
     %a = memref.load %buf[%c0] : memref<1xi32>
     %result = arith.addi %a, %r : i32

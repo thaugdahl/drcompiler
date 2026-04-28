@@ -24,14 +24,16 @@ module {
     }
 
     affine.for %j = 0 to 1048576 {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
       %v = affine.load %src[0] : memref<4xf32>
       %s = arith.addf %v, %one : f32
       affine.store %s, %dst[%j] : memref<1048576xf32>
     }
 
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{partial-remat: REJECT_UNSAFE (reason=escapes-to-call)}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{partial-remat: REJECT_UNSAFE (reason=escapes-to-call)}}
     %out = affine.load %dst[%c0] : memref<1048576xf32>
 
     // %src escapes to an external call as !llvm.ptr after the loads.

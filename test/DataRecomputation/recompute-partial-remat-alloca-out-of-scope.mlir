@@ -25,15 +25,17 @@ module {
         %new = arith.addf %cur, %one : f32
         memref.store %new, %acc[] : memref<f32>
       }
-      // expected-remark @+2 {{load: SINGLE}}
-      // expected-remark @+1 {{partial-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{partial-remat: REJECT_UNSAFE}}
       %final = memref.load %acc[] : memref<f32>
       %s = arith.addf %final, %one : f32
       affine.store %s, %dst[%j] : memref<1048576xf32>
     }
 
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{partial-remat: REJECT_UNSAFE (reason=alloca-out-of-scope)}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{partial-remat: REJECT_UNSAFE (reason=alloca-out-of-scope)}}
     %out = affine.load %dst[%c0] : memref<1048576xf32>
     memref.dealloc %dst : memref<1048576xf32>
     return %out : f32

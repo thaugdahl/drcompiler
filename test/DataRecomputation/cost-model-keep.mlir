@@ -22,11 +22,13 @@ module {
     memref.store %val, %buf[%c0] : memref<1xf64>
 
     // Consumer 1
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
+    // expected-remark @below {{load: SINGLE}}
     %a = memref.load %buf[%c0] : memref<1xf64>
 
     // Consumer 2
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
+    // expected-remark @below {{load: SINGLE}}
     %b = memref.load %buf[%c0] : memref<1xf64>
 
     %r = arith.addf %a, %b : f64

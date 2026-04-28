@@ -29,7 +29,8 @@ module {
     // Dst writer: constant-index read of %src feeds an add, stored at
     // strided indices into %dst.
     affine.for %k = 0 to 65536 {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %vs = affine.load %src[0] : memref<1048576xf32>
       %add = arith.addf %vs, %one : f32
       affine.store %add, %dst[%k * 16] : memref<1048576xf32>
@@ -39,14 +40,16 @@ module {
     // cloned leaf (src[0], stride 0) is near-free; the kept %dst load
     // is strided and costs a full miss per iter.
     affine.for %j = 0 to 65536 {
-      // expected-remark @+2 {{load: SINGLE}}
-      // expected-remark @+1 {{partial-remat: ACCEPT}}
+      // expected-remark @below {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{partial-remat: ACCEPT}}
       %v = affine.load %dst[%j * 16] : memref<1048576xf32>
       affine.store %v, %out_buf[%j] : memref<65536xf32>
     }
 
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{partial-remat: REJECT_COST}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{partial-remat: REJECT_COST}}
     %result = affine.load %out_buf[%c0] : memref<65536xf32>
     memref.dealloc %src : memref<1048576xf32>
     memref.dealloc %dst : memref<1048576xf32>

@@ -28,7 +28,9 @@ module {
     %cst0 = arith.constant 0.0 : f64
     %ni = arith.index_cast %n : i32 to index
     %s = affine.for %i = 0 to %ni iter_args(%acc = %cst0) -> (f64) {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
+      // expected-remark @below {{interproc-cross: REJECT_COST}}
+      // expected-remark @below {{load: SINGLE}}
       %v = affine.load %w[%i] : memref<?xf64>
       %r = arith.addf %acc, %v : f64
       affine.yield %r : f64
@@ -38,11 +40,15 @@ module {
 
   func.func @reduce_max(%w: memref<?xf64>, %n: i32) -> f64 {
     %c0 = arith.constant 0 : index
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
+    // expected-remark @below {{interproc-cross: REJECT_COST}}
+    // expected-remark @below {{load: SINGLE}}
     %init = affine.load %w[%c0] : memref<?xf64>
     %ni = arith.index_cast %n : i32 to index
     %m = affine.for %i = 1 to %ni iter_args(%best = %init) -> (f64) {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{cost-model: SKIP_LOAD (buffer kept)}}
+      // expected-remark @below {{interproc-cross: REJECT_COST}}
+      // expected-remark @below {{load: SINGLE}}
       %v = affine.load %w[%i] : memref<?xf64>
       %gt = arith.cmpf ogt, %v, %best : f64
       %r = arith.select %gt, %v, %best : f64

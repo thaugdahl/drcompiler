@@ -15,7 +15,8 @@ module {
     %val = arith.addi %x, %one : i32
     memref.store %val, %buf[%c0] : memref<1xi32>
 
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{direct-forward: ACCEPT}}
+    // expected-remark @below {{load: SINGLE}}
     %v = memref.load %buf[%c0] : memref<1xi32>
 
     memref.dealloc %buf : memref<1xi32>

@@ -120,6 +120,12 @@ using InterproceduralOriginMap =
     llvm::DenseMap<mlir::Operation *,
                    llvm::SmallVector<InterproceduralOrigin, 2>>;
 
+/// Module-wide writers per global op. Used to seed per-function initial
+/// state with stores from other functions, so loads of cross-function
+/// globals classify as SINGLE/MULTI instead of being silently skipped.
+using ModuleGlobalWrites =
+    llvm::DenseMap<mlir::Operation *, IndexedStoreVec>;
+
 /// All analysis state bundled for threading through analyzeBlock/analyzeOp.
 struct AnalysisContext {
   DRPassContext &passCtx;
@@ -130,6 +136,7 @@ struct AnalysisContext {
   const StoreValueDeps &storeValueDeps;
   const llvm::DenseSet<mlir::Operation *> &globalAllocOps;
   InterproceduralOriginMap &interproceduralOrigins;
+  const ModuleGlobalWrites &moduleGlobalWrites;
 };
 
 } // namespace dr

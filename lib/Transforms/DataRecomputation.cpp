@@ -34,6 +34,7 @@
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -67,6 +68,32 @@ namespace mlir {
 using namespace dr;
 
 namespace {
+
+/// Whitelist of Marco runtime intrinsics that are mathematically pure.
+/// Defined here so it's visible to both callee-effect helpers and the
+/// Strategy 4 plan-builder. Also accepts any call whose op advertises
+/// MemoryEffectFree (canonical MLIR purity check).
+static bool isPureRuntimeCall(mlir::Operation *op) {
+  auto call = mlir::dyn_cast<mlir::CallOpInterface>(op);
+  if (!call) return false;
+  if (mlir::isMemoryEffectFree(op)) return true;
+  auto callableRef = call.getCallableForCallee();
+  auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(callableRef);
+  if (!sym) return false;
+  llvm::StringRef name = sym.getRootReference().getValue();
+  static constexpr llvm::StringLiteral pureCalls[] = {
+    "_Msin_f64_f64",       "_Mcos_f64_f64",        "_Mtan_f64_f64",
+    "_Masin_f64_f64",      "_Macos_f64_f64",       "_Matan_f64_f64",
+    "_Matan2_f64_f64_f64", "_Msinh_f64_f64",       "_Mcosh_f64_f64",
+    "_Mtanh_f64_f64",      "_Mexp_f64_f64",        "_Mlog_f64_f64",
+    "_Mlog10_f64_f64",     "_Msqrt_f64_f64",       "_Mpow_f64_f64_f64",
+    "_Mabs_f64_f64",       "_Msign_f64_f64",       "_Mceil_f64_f64",
+    "_Mfloor_f64_f64",
+  };
+  for (auto p : pureCalls)
+    if (name == p) return true;
+  return false;
+}
 
 // ===== Op Type Dispatch Helpers =====
 
@@ -146,6 +173,33 @@ static AllocationRoots collectAllocationRoots(DRPassContext &passCtx,
   });
 
   return allocRootFor;
+}
+
+/// Walk the entire module and collect every store whose base traces to a
+/// `memref.global`.  The result is keyed on the global op and used to seed
+/// per-function initial state, so loads of cross-function globals classify
+/// as SINGLE/MULTI instead of being silently skipped.
+///
+/// Coverage is set to nullopt (may-write-anywhere) — we don't try to model
+/// loop context across function boundaries.
+static ModuleGlobalWrites
+collectModuleGlobalWrites(mlir::Operation *rootOp,
+                          AllocationRoots &allocRootFor) {
+  ModuleGlobalWrites result;
+  rootOp->walk([&](mlir::Operation *op) {
+    if (!drcompiler::isAnyStoreOp(op)) return;
+    mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+    llvm::SmallVector<mlir::Value, 2> bases;
+    drcompiler::collectBaseMemrefs(memref, allocRootFor, bases);
+    for (mlir::Value base : bases) {
+      auto it = allocRootFor.find(base);
+      if (it == allocRootFor.end()) continue;
+      mlir::Operation *root = it->second;
+      if (!mlir::isa<mlir::memref::GlobalOp>(root)) continue;
+      result[root].push_back({op, std::nullopt});
+    }
+  });
+  return result;
 }
 
 // ===== Phase 2: Base Memref Tracing =====
@@ -555,14 +609,17 @@ static bool calleeMayAccessGlobal(
       if (getGlobal.getName() == globalName)
         directAccess = true;
     }
-    if (mlir::isa<mlir::CallOpInterface>(op))
-      hasInnerCalls = true;
+    if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
+      // Pure runtime intrinsics don't access user globals.
+      if (!isPureRuntimeCall(op))
+        hasInnerCalls = true;
+    }
   });
 
   if (directAccess) return true;
   if (!hasInnerCalls) return false;
 
-  // Has inner calls but no direct access: conservatively assume
+  // Has non-pure inner calls but no direct access: conservatively assume
   // inner calls could access the global.
   return true;
 }
@@ -577,7 +634,8 @@ void applyCall(
     const StoreValueDeps &storeValueDeps,
     const llvm::DenseSet<mlir::Operation *> &globalAllocOps,
     mlir::FunctionOpInterface callee,
-    InterproceduralOriginMap &interproceduralOrigins) {
+    InterproceduralOriginMap &interproceduralOrigins,
+    const ModuleGlobalWrites &moduleGlobalWrites) {
   // Track which roots we've already clobbered to avoid redundant work.
   llvm::SmallDenseSet<mlir::Operation *, 8> clobbered;
 
@@ -657,7 +715,15 @@ void applyCall(
       continue;
 
     killDependentStores(globalOp, state, storeValueDeps);
-    state[globalOp].push_back({nullptr, std::nullopt});
+    // Globals whose writers are fully enumerated module-wide don't need a
+    // conservative nullptr — every real writer is already in state via the
+    // function-entry seed. Inject nullptr only for unenumerated globals
+    // (e.g. if collectModuleGlobalWrites missed them, or if the global has
+    // no writers at all in the module — in which case we can't know whether
+    // some external linker-visible code might write to it).
+    auto mit = moduleGlobalWrites.find(globalOp);
+    if (mit == moduleGlobalWrites.end() || mit->second.empty())
+      state[globalOp].push_back({nullptr, std::nullopt});
   }
 }
 
@@ -864,7 +930,8 @@ static void analyzeCallOp(mlir::CallOpInterface callIface, StoreMap &state,
   ctx.callGraph[calleeOp].push_back(std::move(edge));
 
   applyCall(op, state, allocRootFor, ctx.storeValueDeps,
-            ctx.globalAllocOps, callee, ctx.interproceduralOrigins);
+            ctx.globalAllocOps, callee, ctx.interproceduralOrigins,
+            ctx.moduleGlobalWrites);
 }
 
 // Generic op carrying regions: analyze each, then join across regions and
@@ -2524,6 +2591,319 @@ private:
 
 } // namespace
 
+// ===== Strategy 4: Cross-function ordered recomputation =====
+//
+// Triggers when a SINGLE load L in reader R reads a global G whose unique
+// reaching store S lives in a different function W, AND there exists a
+// caller C in which the call to W strictly precedes the call to R, with no
+// intervening writer to G. Recompute S's stored value at C and substitute
+// it for L inside R.
+//
+// Two rewrite modes:
+//   (a) IN-PLACE: R is private and has exactly one call site (the
+//       conforming one). Mutate R's signature in place.
+//   (b) SPECIALIZE: clone R into a private R'; rewrite only conforming
+//       call sites to call R'. Original R retained for non-conforming
+//       callers.
+
+namespace {
+
+struct CrossFnRematPlan {
+  /// Ops to clone, topologically ordered (defs before uses).
+  llvm::SmallVector<mlir::Operation *, 4> opsToClone;
+  /// Block-args of the writer function that the cloned expression depends on.
+  /// Each appears at the position they should be substituted at the caller.
+  llvm::SmallVector<mlir::BlockArgument, 4> writerArgs;
+  /// Globals read by hoisted memref.load ops in opsToClone. The caller must
+  /// have NO writers to these globals reachable in its static call subtree
+  /// between the materialization point and the writer call (verified by
+  /// the driver before accepting the plan for a given caller).
+  llvm::SmallVector<mlir::Operation *, 4> hoistedLoadGlobals;
+  /// The writer's original stored value (root of the operand tree).
+  mlir::Value rootValue;
+};
+
+/// Trace memref operand back to a memref.global op, accepting only the
+/// trivial chain memref.get_global → load. Returns nullptr if not such a
+/// trivial chain (e.g. through subview, cast, function arg).
+static mlir::Operation *traceLoadToGlobal(mlir::Value memref) {
+  if (auto getGlobal =
+          mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(memref.getDefiningOp()))
+    return getGlobal.getOperation();
+  return nullptr;
+}
+
+/// Walk \p storeOp's stored-value operand tree. Accept pure ops whose leaves
+/// are constants or block args of \p writerFn's entry block. Memref loads
+/// are accepted (and recorded as hoistable) only when the load's memref
+/// traces to a memref.get_global and the writer's static call-tree contains
+/// no transitive write to that global (\p fnWritesGlobal). Caller-side
+/// phase-disjoint check happens later. Pure runtime calls accepted.
+static bool buildCrossFunctionRematPlan(
+    mlir::Operation *storeOp,
+    mlir::FunctionOpInterface writerFn,
+    AllocationRoots &allocRootFor,
+    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+        fnWritesGlobal,
+    CrossFnRematPlan &plan) {
+  plan.opsToClone.clear();
+  plan.writerArgs.clear();
+  plan.hoistedLoadGlobals.clear();
+
+  mlir::Value root = getStoredValue(storeOp);
+  if (!root) return false;
+  plan.rootValue = root;
+
+  mlir::Region *body = writerFn.getCallableRegion();
+  if (!body || body->empty()) return false;
+  mlir::Block *entryBlock = &body->front();
+
+  llvm::SmallVector<mlir::Value, 8> worklist{root};
+  llvm::SmallDenseSet<mlir::Value> visited;
+  llvm::SmallDenseSet<mlir::Operation *> added;
+  llvm::SmallDenseSet<unsigned> seenArgIdx;
+
+  while (!worklist.empty()) {
+    mlir::Value cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second) continue;
+
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
+      if (barg.getOwner() != entryBlock)
+        return false; // loop IV / nested block — not available at caller
+      if (seenArgIdx.insert(barg.getArgNumber()).second)
+        plan.writerArgs.push_back(barg);
+      continue;
+    }
+
+    mlir::Operation *def = cur.getDefiningOp();
+    if (!def) return false;
+
+    bool isHoistableLoad = false;
+    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(def)) {
+      mlir::Value memref =
+          mlir::isa<mlir::memref::LoadOp>(def)
+              ? mlir::cast<mlir::memref::LoadOp>(def).getMemref()
+              : mlir::cast<mlir::affine::AffineLoadOp>(def).getMemref();
+      mlir::Operation *globalOp = traceLoadToGlobal(memref);
+      if (!globalOp) return false;
+      if (fnWritesGlobal(writerFn.getOperation(), globalOp))
+        return false;
+      (void)allocRootFor;
+      plan.hoistedLoadGlobals.push_back(globalOp);
+      isHoistableLoad = true;
+    } else if (mlir::isa<mlir::LLVM::LoadOp>(def)) {
+      return false; // LLVM dialect loads not yet supported
+    } else if (mlir::isa<mlir::CallOpInterface>(def)) {
+      if (!isPureRuntimeCall(def)) return false;
+      // Pure runtime calls: accept (treated as effect-free for cloning).
+    } else {
+      // Non-load, non-call op: must be memory-effect-free.
+      if (!mlir::isMemoryEffectFree(def)) return false;
+    }
+
+    if (added.insert(def).second) {
+      plan.opsToClone.push_back(def);
+      if (plan.opsToClone.size() > kMaxRematOps) return false;
+    }
+    for (mlir::Value operand : def->getOperands())
+      worklist.push_back(operand);
+    (void)isHoistableLoad;
+  }
+
+  std::reverse(plan.opsToClone.begin(), plan.opsToClone.end());
+  return true;
+}
+
+/// Find the latest call to \p writerFn in \p caller that strictly dominates
+/// \p readerCall and has no intervening writer to \p globalOp between them.
+/// Returns nullptr if no such call exists.
+static mlir::Operation *
+findEligibleWriterCall(mlir::FunctionOpInterface caller,
+                       mlir::Operation *readerCall,
+                       mlir::FunctionOpInterface writerFn,
+                       mlir::Operation *globalOp,
+                       mlir::DominanceInfo &domInfo,
+                       const ModuleGlobalWrites &moduleGlobalWrites,
+                       AllocationRoots &allocRootFor,
+                       const llvm::DenseSet<mlir::Operation *> &globalAllocOps,
+                       llvm::function_ref<bool(mlir::Operation *,
+                                               mlir::Operation *)>
+                           fnWritesGlobal) {
+  mlir::Region *body = caller.getCallableRegion();
+  if (!body || body->empty()) return nullptr;
+
+  // Collect candidate writer calls within caller.
+  llvm::SmallVector<mlir::Operation *, 4> candidates;
+  body->walk([&](mlir::CallOpInterface call) {
+    auto callableRef = call.getCallableForCallee();
+    auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(callableRef);
+    if (!sym) return;
+    auto rootName = sym.getRootReference().getValue();
+    if (rootName != writerFn.getName()) return;
+    if (!domInfo.properlyDominates(call.getOperation(), readerCall)) return;
+    candidates.push_back(call.getOperation());
+  });
+
+  if (candidates.empty()) return nullptr;
+
+  // Pick the latest (closest dominator). Sort by program order: the one
+  // that comes last and still dominates readerCall.
+  mlir::Operation *latest = nullptr;
+  for (mlir::Operation *c : candidates) {
+    if (!latest || domInfo.properlyDominates(latest, c))
+      latest = c;
+  }
+  if (!latest) return nullptr;
+
+  // Verify no intervening op between (latest, readerCall) writes to
+  // globalOp. We do a conservative scan:
+  //   - any direct store whose root is globalOp is a writer
+  //   - any call to a function (other than writerFn) that may write
+  //     globalOp is a writer
+  bool interfered = false;
+  body->walk([&](mlir::Operation *op) {
+    if (interfered) return mlir::WalkResult::skip();
+    if (!domInfo.properlyDominates(latest, op)) return mlir::WalkResult::advance();
+    if (!domInfo.properlyDominates(op, readerCall)) return mlir::WalkResult::advance();
+
+    // Direct store?
+    if (drcompiler::isAnyStoreOp(op)) {
+      mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+      llvm::SmallVector<mlir::Value, 2> bases;
+      drcompiler::collectBaseMemrefs(memref, allocRootFor, bases);
+      for (mlir::Value base : bases) {
+        auto it = allocRootFor.find(base);
+        if (it != allocRootFor.end() && it->second == globalOp)
+          interfered = true;
+      }
+    }
+    // Call site?
+    if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
+      auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(call.getCallableForCallee());
+      if (!sym) {
+        interfered = true; // unknown callee
+        return mlir::WalkResult::advance();
+      }
+      // Skip the writer-call itself; we already accept it as the writer.
+      if (op == latest) return mlir::WalkResult::advance();
+      // Resolve.
+      auto *calleeOp = mlir::SymbolTable::lookupNearestSymbolFrom(
+          op, sym);
+      auto callee = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(calleeOp);
+      if (!callee) {
+        interfered = true; return mlir::WalkResult::advance();
+      }
+      if (fnWritesGlobal(callee.getOperation(), globalOp))
+        interfered = true;
+    }
+    (void)moduleGlobalWrites;
+    (void)globalAllocOps;
+    return mlir::WalkResult::advance();
+  });
+
+  if (interfered) return nullptr;
+  return latest;
+}
+
+/// Materialize the writer's expression at the caller, just before
+/// \p writerCall, by cloning \p plan.opsToClone with the writer's
+/// block-args remapped to \p writerCall's call operands. Returns the
+/// materialized value (the equivalent of \p plan.rootValue).
+static mlir::Value materializeAtCaller(mlir::Operation *writerCall,
+                                       const CrossFnRematPlan &plan,
+                                       mlir::OpBuilder &builder) {
+  mlir::IRMapping mapping;
+  // Map writer's entry-block args to the caller's call operands.
+  for (mlir::BlockArgument arg : plan.writerArgs) {
+    unsigned idx = arg.getArgNumber();
+    if (idx >= writerCall->getNumOperands()) return {};
+    mapping.map((mlir::Value)arg, writerCall->getOperand(idx));
+  }
+  // Clone ops in topological order at the caller's insertion point.
+  builder.setInsertionPointAfter(writerCall);
+  for (mlir::Operation *op : plan.opsToClone) {
+    mlir::Operation *cloned = builder.clone(*op, mapping);
+    for (auto [oldRes, newRes] :
+         llvm::zip(op->getResults(), cloned->getResults()))
+      mapping.map(oldRes, newRes);
+  }
+  return mapping.lookupOrNull(plan.rootValue);
+}
+
+/// Add an extra entry-block argument of \p extraType to \p funcOp and
+/// replace every op in \p loadOps with that argument. Mutates the function
+/// signature in place. Returns the new argument.
+static mlir::BlockArgument
+addParamAndReplaceLoads(mlir::FunctionOpInterface funcOp,
+                        mlir::Type extraType,
+                        llvm::ArrayRef<mlir::Operation *> loadOps) {
+  mlir::Region *body = funcOp.getCallableRegion();
+  mlir::Block *entry = &body->front();
+  unsigned newArgIdx = entry->getNumArguments();
+  mlir::BlockArgument newArg =
+      entry->addArgument(extraType, funcOp.getLoc());
+
+  // Update the function type.
+  llvm::SmallVector<mlir::Type> newInputs(funcOp.getArgumentTypes().begin(),
+                                          funcOp.getArgumentTypes().end());
+  newInputs.push_back(extraType);
+  auto newFnTy = mlir::FunctionType::get(funcOp.getContext(), newInputs,
+                                         funcOp.getResultTypes());
+  funcOp.setType(newFnTy);
+  (void)newArgIdx;
+
+  // Replace each load with the new arg, then erase.
+  for (mlir::Operation *l : loadOps) {
+    l->getResult(0).replaceAllUsesWith(newArg);
+    l->erase();
+  }
+  return newArg;
+}
+
+/// Clone \p reader into a new private function with a "_dr_spec" suffix.
+/// Caller must rewrite call sites to use the clone.
+static mlir::FunctionOpInterface
+cloneReaderForSpec(mlir::FunctionOpInterface reader) {
+  mlir::OpBuilder builder(reader.getOperation()->getContext());
+  builder.setInsertionPointAfter(reader.getOperation());
+  auto cloned = mlir::cast<mlir::FunctionOpInterface>(
+      builder.clone(*reader.getOperation()));
+  // Make it private + give a unique name.
+  if (auto symOp = mlir::dyn_cast<mlir::SymbolOpInterface>(cloned.getOperation()))
+    symOp.setVisibility(mlir::SymbolTable::Visibility::Private);
+  static unsigned counter = 0;
+  std::string newName =
+      (reader.getName() + "__dr_spec_" + llvm::Twine(counter++)).str();
+  if (auto symOp = mlir::dyn_cast<mlir::SymbolOpInterface>(cloned.getOperation()))
+    symOp.setName(newName);
+  return cloned;
+}
+
+/// Rewrite \p oldCall to \p newCallee, appending \p extraOperands.
+static void rewriteCallSite(mlir::Operation *oldCall,
+                            mlir::FunctionOpInterface newCallee,
+                            llvm::ArrayRef<mlir::Value> extraOperands) {
+  mlir::OpBuilder builder(oldCall);
+  llvm::SmallVector<mlir::Value> newOperands(oldCall->getOperands().begin(),
+                                              oldCall->getOperands().end());
+  newOperands.append(extraOperands.begin(), extraOperands.end());
+
+  // Create a new call op of the same kind. We assume func.call.
+  if (auto fc = mlir::dyn_cast<mlir::func::CallOp>(oldCall)) {
+    auto newCall = builder.create<mlir::func::CallOp>(
+        oldCall->getLoc(), newCallee.getName(),
+        newCallee.getResultTypes(), newOperands);
+    for (auto [oldRes, newRes] :
+         llvm::zip(oldCall->getResults(), newCall->getResults()))
+      oldRes.replaceAllUsesWith(newRes);
+    oldCall->erase();
+    return;
+  }
+  // Other call ops not supported in v1.
+}
+
+} // namespace
+
 void DataRecomputationPass::runOnOperation() {
   moduleOp = this->getOperation();
 
@@ -2538,6 +2918,65 @@ void DataRecomputationPass::runOnOperation() {
 
   DRPassContext passCtx{context, symTabCollection, moduleOp};
 
+  // Strategy 0: constant-global direct-forward. memref.global with
+  // `constant` set never gets written, so any load can be replaced by
+  // the global's initial value. We only handle splat-dense / scalar
+  // initializers here; non-splat tables fall through to the dataflow
+  // strategies (where they classify KILLED and are left alone).
+  {
+    llvm::SmallVector<mlir::Operation *, 8> toErase;
+    moduleOp.walk([&](mlir::Operation *op) {
+      mlir::Value memref;
+      mlir::ValueRange rawIndices;
+      if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(op)) {
+        memref = load.getMemref();
+        rawIndices = load.getIndices();
+      } else if (auto load =
+                     mlir::dyn_cast<mlir::affine::AffineLoadOp>(op)) {
+        memref = load.getMemref();
+        rawIndices = load.getIndices();
+      } else {
+        return;
+      }
+      auto gg = memref.getDefiningOp<mlir::memref::GetGlobalOp>();
+      if (!gg) return;
+      auto *symOp = symTabCollection.lookupNearestSymbolFrom(
+          moduleOp, gg.getNameAttr());
+      auto globalOp =
+          mlir::dyn_cast_or_null<mlir::memref::GlobalOp>(symOp);
+      if (!globalOp || !globalOp.getConstant()) return;
+      auto initAttrOpt = globalOp.getInitialValue();
+      if (!initAttrOpt) return;
+      auto memrefTy =
+          mlir::cast<mlir::MemRefType>(globalOp.getType());
+      mlir::Type elemTy = memrefTy.getElementType();
+      mlir::Attribute valAttr;
+      if (auto dense =
+              mlir::dyn_cast<mlir::DenseElementsAttr>(*initAttrOpt)) {
+        if (!dense.isSplat()) return; // skip indexed lookup for now
+        if (auto fp = mlir::dyn_cast<mlir::DenseFPElementsAttr>(dense)) {
+          valAttr = mlir::FloatAttr::get(elemTy, fp.getSplatValue<llvm::APFloat>());
+        } else if (auto i =
+                       mlir::dyn_cast<mlir::DenseIntElementsAttr>(dense)) {
+          valAttr = mlir::IntegerAttr::get(elemTy, i.getSplatValue<llvm::APInt>());
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+      mlir::OpBuilder builder(op);
+      auto cst = builder.create<mlir::arith::ConstantOp>(
+          op->getLoc(), elemTy, mlir::cast<mlir::TypedAttr>(valAttr));
+      op->getResult(0).replaceAllUsesWith(cst);
+      if (drTestDiagnostics)
+        op->emitRemark() << "constant-global-fold: ACCEPT";
+      toErase.push_back(op);
+      (void)rawIndices;
+    });
+    for (mlir::Operation *op : toErase) op->erase();
+  }
+
   auto globalAllocs = collectGlobalStaticAllocations(passCtx);
 
   // Collect allocation roots for the whole module so the analysis can resolve
@@ -2550,17 +2989,157 @@ void DataRecomputationPass::runOnOperation() {
 
   StoreValueDeps storeValueDeps = computeStoreValueDeps(moduleOp, allocRootFor);
 
+  // Module-wide writers per global. Seeds each function's initial state.
+  ModuleGlobalWrites moduleGlobalWrites =
+      collectModuleGlobalWrites(moduleOp, allocRootFor);
+
+  // Direct caller map: callee Operation* -> set of FunctionOpInterface ops
+  // containing call sites. Phase-aware seeding uses this to filter out
+  // writes from functions that don't share a static caller with the
+  // reader, so disjoint execution phases (e.g. Marco's IC vs dynamic
+  // drivers) don't pollute each other's reaching-stores.
+  llvm::DenseMap<mlir::Operation *, llvm::SmallDenseSet<mlir::Operation *, 4>>
+      directCallersOf;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallDenseSet<mlir::Operation *, 4>>
+      directCalleesOf;
+  moduleOp.walk([&](mlir::CallOpInterface call) {
+    mlir::Operation *callable = call.resolveCallable();
+    if (!callable) return;
+    auto callerFn = call->getParentOfType<mlir::FunctionOpInterface>();
+    if (!callerFn) return;
+    directCallersOf[callable].insert(callerFn.getOperation());
+    directCalleesOf[callerFn.getOperation()].insert(callable);
+  });
+
+  // Per-global writer-function set, derived from moduleGlobalWrites. Used
+  // by fnTransitivelyWritesGlobal to detect transitive writes.
+  llvm::DenseMap<mlir::Operation *, llvm::SmallDenseSet<mlir::Operation *, 4>>
+      writersPerGlobal;
+  for (auto &kv : moduleGlobalWrites) {
+    for (auto &entry : kv.second) {
+      if (!entry.storeOp) continue;
+      auto wf =
+          entry.storeOp->getParentOfType<mlir::FunctionOpInterface>();
+      if (wf) writersPerGlobal[kv.first].insert(wf.getOperation());
+    }
+  }
+
+  // Lazy transitive-callees cache (incl. self) for any function. Shared by
+  // phase-root computation, hoist safety check, and write-interference
+  // refinement so we never recompute reach.
+  llvm::DenseMap<mlir::Operation *, llvm::SmallDenseSet<mlir::Operation *, 8>>
+      transCalleesCache;
+  auto transitiveCalleesOf = [&](mlir::Operation *root)
+      -> llvm::SmallDenseSet<mlir::Operation *, 8> & {
+    auto [it, inserted] = transCalleesCache.try_emplace(root);
+    if (!inserted) return it->second;
+    auto &result = it->second;
+    llvm::SmallVector<mlir::Operation *, 8> wl{root};
+    while (!wl.empty()) {
+      mlir::Operation *f = wl.pop_back_val();
+      if (!result.insert(f).second) continue;
+      auto cIt = directCalleesOf.find(f);
+      if (cIt == directCalleesOf.end()) continue;
+      for (mlir::Operation *callee : cIt->second) wl.push_back(callee);
+    }
+    return result;
+  };
+
+  // Sound transitive-write check: does the static call-tree rooted at
+  // \p fn (including fn itself) contain any function that stores to
+  // \p globalOp? Closes the soundness hole left by walking only fn's
+  // direct stores or only fn's immediate callees.
+  auto fnTransitivelyWritesGlobal = [&](mlir::Operation *fn,
+                                        mlir::Operation *globalOp) -> bool {
+    auto wIt = writersPerGlobal.find(globalOp);
+    if (wIt == writersPerGlobal.end()) return false;
+    auto &reach = transitiveCalleesOf(fn);
+    for (mlir::Operation *w : wIt->second)
+      if (reach.contains(w)) return true;
+    return false;
+  };
+
+  // Phase roots: functions never called inside the module (public drivers
+  // / external entry points). Two functions are in the same phase iff they
+  // share a phase root that transitively reaches both — strictly tighter
+  // than direct-caller sharing and sound by construction.
+  llvm::SmallVector<mlir::Operation *, 4> phaseRoots;
+  moduleOp.walk([&](mlir::FunctionOpInterface fn) {
+    auto cIt = directCallersOf.find(fn.getOperation());
+    if (cIt == directCallersOf.end() || cIt->second.empty())
+      phaseRoots.push_back(fn.getOperation());
+  });
+  llvm::DenseMap<mlir::Operation *, llvm::SmallDenseSet<mlir::Operation *, 2>>
+      phaseRootsReaching;
+  for (mlir::Operation *root : phaseRoots) {
+    auto &reach = transitiveCalleesOf(root);
+    for (mlir::Operation *f : reach)
+      phaseRootsReaching[f].insert(root);
+  }
+
   LoadProvenanceMap loadProv;
   EnrichedCallGraph callGraph;
   InterproceduralOriginMap interproceduralOrigins;
-  AnalysisContext ctx{passCtx, allocRootFor, loadProv, callGraph, {},
-                      storeValueDeps, globalAllocs, interproceduralOrigins};
+  AnalysisContext ctx{passCtx,        allocRootFor,
+                      loadProv,       callGraph,
+                      {},             storeValueDeps,
+                      globalAllocs,   interproceduralOrigins,
+                      moduleGlobalWrites};
 
-  // Analyze each top-level function
+  // Analyze each top-level function. Seed initial state with module-wide
+  // global writers from OTHER functions, filtered by phase: include a
+  // writer's stores only if the writer-function shares a direct caller
+  // with the reader (or one is a direct caller of the other). Functions
+  // with no callers fall back to coarse module-wide seeding.
   moduleOp.walk([&](mlir::FunctionOpInterface funcOp) {
     mlir::Region *body = funcOp.getCallableRegion();
     if (!body || body->empty()) return;
+
     StoreMap state;
+
+    // Find globals referenced in this function via memref.get_global.
+    llvm::DenseSet<mlir::Operation *> referencedGlobals;
+    funcOp.walk([&](mlir::memref::GetGlobalOp g) {
+      auto *symOp = symTabCollection.lookupNearestSymbolFrom(
+          moduleOp, g.getNameAttr());
+      if (symOp) referencedGlobals.insert(symOp);
+    });
+
+    auto readerRootsIt = phaseRootsReaching.find(funcOp.getOperation());
+    bool readerHasRoots = readerRootsIt != phaseRootsReaching.end() &&
+                          !readerRootsIt->second.empty();
+
+    // Sound phase filter: writer and reader must share a transitive
+    // ancestor that has no internal callers (a phase root). Direct-caller
+    // sharing was unsound — a writer reachable through a different chain
+    // could still execute between unrelated direct calls in a common
+    // grand-ancestor.
+    auto sharesPhase = [&](mlir::Operation *writerFn) -> bool {
+      if (!readerHasRoots) return true; // unreachable from any root: fallback
+      auto wIt = phaseRootsReaching.find(writerFn);
+      if (wIt == phaseRootsReaching.end()) return false;
+      for (mlir::Operation *r : wIt->second)
+        if (readerRootsIt->second.count(r)) return true;
+      return false;
+    };
+
+    for (mlir::Operation *globalOp : referencedGlobals) {
+      auto it = moduleGlobalWrites.find(globalOp);
+      if (it == moduleGlobalWrites.end()) continue;
+      auto &dest = state[globalOp];
+      for (auto &entry : it->second) {
+        if (!entry.storeOp) continue;
+        auto enclosing =
+            entry.storeOp->getParentOfType<mlir::FunctionOpInterface>();
+        if (!enclosing) continue;
+        if (enclosing.getOperation() == funcOp.getOperation())
+          continue; // own writes added precisely by dataflow
+        if (!sharesPhase(enclosing.getOperation()))
+          continue;
+        dest.push_back(entry);
+      }
+    }
+
     analyzeBlock(body->front(), state, ctx);
   });
 
@@ -2953,8 +3532,11 @@ void DataRecomputationPass::runOnOperation() {
       // If cost model says keep this buffer, skip rematerialization.
       if (drCostModel && !skipBuffers.empty()) {
         mlir::Operation *root = findAllocRoot(loadOp);
-        if (root && skipBuffers.contains(root))
-          continue; // cost model says keep — skip this load
+        if (root && skipBuffers.contains(root)) {
+          if (drTestDiagnostics)
+            loadOp->emitRemark() << "cost-model: SKIP_LOAD (buffer kept)";
+          continue;
+        }
       }
 
       auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
@@ -2965,8 +3547,13 @@ void DataRecomputationPass::runOnOperation() {
 
         // Strategy 1: Direct value forwarding (store dominates load).
         if (isSafeToForward(storeOp, loadOp, domInfo)) {
-          if (storedVal.getType() != loadOp->getResult(0).getType())
-            continue; // type mismatch (e.g. i32 store → i8 load via reinterpret)
+          if (storedVal.getType() != loadOp->getResult(0).getType()) {
+            if (drTestDiagnostics)
+              loadOp->emitRemark() << "direct-forward: REJECT_TYPE";
+            continue;
+          }
+          if (drTestDiagnostics)
+            loadOp->emitRemark() << "direct-forward: ACCEPT";
           loadOp->getResult(0).replaceAllUsesWith(storedVal);
           loadOp->erase();
           continue;
@@ -2981,11 +3568,18 @@ void DataRecomputationPass::runOnOperation() {
           mlir::Value clonedVal = rematerializeAt(
               storedVal, loadOp, opsToClone,
               /*argMapping=*/nullptr, loadSubs);
-          if (clonedVal.getType() != loadOp->getResult(0).getType())
-            continue; // type mismatch after rematerialization
+          if (clonedVal.getType() != loadOp->getResult(0).getType()) {
+            if (drTestDiagnostics)
+              loadOp->emitRemark() << "full-remat: REJECT_TYPE";
+            continue;
+          }
+          if (drTestDiagnostics)
+            loadOp->emitRemark() << "full-remat: ACCEPT";
           loadOp->getResult(0).replaceAllUsesWith(clonedVal);
           loadOp->erase();
           continue;
+        } else if (drTestDiagnostics) {
+          loadOp->emitRemark() << "full-remat: REJECT_UNSAFE";
         }
 
         // Strategy 2b: Partial rematerialization.
@@ -3028,8 +3622,11 @@ void DataRecomputationPass::runOnOperation() {
             mlir::Value clonedVal = rematerializeAt(storedVal, loadOp,
                                                     partialOps, nullptr,
                                                     partialSubs);
-            if (clonedVal.getType() != loadOp->getResult(0).getType())
+            if (clonedVal.getType() != loadOp->getResult(0).getType()) {
+              if (drTestDiagnostics)
+                loadOp->emitRemark() << "partial-remat: REJECT_TYPE";
               continue;
+            }
             if (drTestDiagnostics)
               loadOp->emitRemark()
                   << "partial-remat: ACCEPT (alu=" << alu << ", leaves=" << leaf
@@ -3093,13 +3690,20 @@ void DataRecomputationPass::runOnOperation() {
             mlir::Value clonedVal = rematerializeAt(
                 storedVal, loadOp, opsToClone, &argMapping,
                 loadSubs);
-            if (clonedVal.getType() != loadOp->getResult(0).getType())
-              continue; // type mismatch after interprocedural rematerialization
+            if (clonedVal.getType() != loadOp->getResult(0).getType()) {
+              if (drTestDiagnostics)
+                loadOp->emitRemark() << "interproc-remat: REJECT_TYPE";
+              continue;
+            }
+            if (drTestDiagnostics)
+              loadOp->emitRemark() << "interproc-remat: ACCEPT";
             loadOp->getResult(0).replaceAllUsesWith(clonedVal);
             loadOp->erase();
 
             replaced = true;
             break;
+          } else if (drTestDiagnostics) {
+            loadOp->emitRemark() << "interproc-remat: REJECT_UNSAFE";
           }
 
           // Strategy 2b (interprocedural): partial rematerialization.
@@ -3142,8 +3746,11 @@ void DataRecomputationPass::runOnOperation() {
               }
               mlir::Value clonedVal = rematerializeAt(
                   storedVal, loadOp, partialOps, &argMapping, partialSubs);
-              if (clonedVal.getType() != loadOp->getResult(0).getType())
+              if (clonedVal.getType() != loadOp->getResult(0).getType()) {
+                if (drTestDiagnostics)
+                  loadOp->emitRemark() << "partial-remat: REJECT_TYPE";
                 continue;
+              }
               if (drTestDiagnostics)
                 loadOp->emitRemark()
                     << "partial-remat: ACCEPT (alu=" << alu
@@ -3156,6 +3763,272 @@ void DataRecomputationPass::runOnOperation() {
           }
         }
         (void)replaced;
+      }
+    }
+
+    // Strategies 1-3 may have erased some loads in toProcess (UAF if we
+    // touch those pointers). Build a fresh set of live load ops by walking
+    // the module post-strategies-1-3.
+    llvm::SmallDenseSet<mlir::Operation *> liveLoads;
+    moduleOp.walk([&](mlir::Operation *op) {
+      if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(op))
+        liveLoads.insert(op);
+    });
+
+    // ===== Strategy 4: cross-function ordered recomputation =====
+    //
+    // For SINGLE loads where load and store are in different functions,
+    // try to find a common caller in which the writer call dominates the
+    // reader call. If found, materialize the writer's expression at the
+    // caller and pass it as an extra arg to the reader (in-place when the
+    // reader is private + single-caller, otherwise via a private clone).
+    //
+    // Group SINGLE loads per (readerFn, storeOp) so loads sharing the
+    // same store can share one specialization / one extra arg.
+    struct CrossFnKey {
+      mlir::Operation *readerFn;
+      mlir::Operation *storeOp;
+      bool operator==(const CrossFnKey &o) const {
+        return readerFn == o.readerFn && storeOp == o.storeOp;
+      }
+    };
+    struct CrossFnKeyInfo {
+      static CrossFnKey getEmptyKey() {
+        return {llvm::DenseMapInfo<mlir::Operation *>::getEmptyKey(), nullptr};
+      }
+      static CrossFnKey getTombstoneKey() {
+        return {llvm::DenseMapInfo<mlir::Operation *>::getTombstoneKey(),
+                nullptr};
+      }
+      static unsigned getHashValue(const CrossFnKey &k) {
+        return llvm::hash_combine(k.readerFn, k.storeOp);
+      }
+      static bool isEqual(const CrossFnKey &a, const CrossFnKey &b) {
+        return a == b;
+      }
+    };
+    llvm::DenseMap<CrossFnKey,
+                   llvm::SmallVector<mlir::Operation *>, CrossFnKeyInfo>
+        crossGroups;
+    for (auto &entry : toProcess) {
+      // Skip dangling pointers from erased loads.
+      if (!liveLoads.contains(entry.loadOp)) continue;
+      auto loadFn = entry.loadOp->getParentOfType<mlir::FunctionOpInterface>();
+      auto storeFn =
+          entry.storeOp->getParentOfType<mlir::FunctionOpInterface>();
+      if (!loadFn || !storeFn || loadFn == storeFn) continue;
+      crossGroups[{loadFn.getOperation(), entry.storeOp}].push_back(
+          entry.loadOp);
+    }
+
+    mlir::DominanceInfo domInfoTop(moduleOp);
+
+    for (auto &kv : crossGroups) {
+      mlir::Operation *readerFnOp = kv.first.readerFn;
+      mlir::Operation *storeOp = kv.first.storeOp;
+      auto &loadOps = kv.second;
+      auto readerFn = mlir::cast<mlir::FunctionOpInterface>(readerFnOp);
+      auto writerFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
+
+      // Cost gate: if the cost model decided to KEEP this load's buffer,
+      // skip Strategy 4 too — recomputing across functions can't beat a
+      // load the model already deemed cheaper than recomputation.
+      if (drCostModel && !skipBuffers.empty()) {
+        bool skipForCost = false;
+        for (auto *l : loadOps) {
+          mlir::Operation *root = findAllocRoot(l);
+          if (root && skipBuffers.contains(root)) {
+            skipForCost = true;
+            break;
+          }
+        }
+        if (skipForCost) {
+          if (drTestDiagnostics)
+            for (auto *l : loadOps)
+              l->emitRemark() << "interproc-cross: REJECT_COST";
+          continue;
+        }
+      }
+
+      // Build remat plan from the writer's stored value.
+      CrossFnRematPlan plan;
+      if (!buildCrossFunctionRematPlan(storeOp, writerFn, allocRootFor,
+                                       fnTransitivelyWritesGlobal, plan)) {
+        if (drTestDiagnostics)
+          for (auto *l : loadOps)
+            l->emitRemark() << "interproc-cross: REJECT_PLAN";
+        continue;
+      }
+
+      // Determine the global the load reads.
+      mlir::Value loadMemref =
+          drcompiler::getLoadStoreMemref(loadOps.front());
+      mlir::Operation *globalOp =
+          lookupAllocRoot(loadMemref, allocRootFor);
+      if (!globalOp || !mlir::isa<mlir::memref::GlobalOp>(globalOp)) {
+        if (drTestDiagnostics)
+          for (auto *l : loadOps)
+            l->emitRemark() << "interproc-cross: REJECT_NOTGLOBAL";
+        continue;
+      }
+
+      // Collect call sites of readerFn from the call graph.
+      auto cgIt = callGraph.find(readerFn.getOperation());
+      if (cgIt == callGraph.end() || cgIt->second.empty()) {
+        if (drTestDiagnostics)
+          for (auto *l : loadOps)
+            l->emitRemark() << "interproc-cross: REJECT_NOCALLERS";
+        continue;
+      }
+
+      // For each caller, find an eligible writer call.
+      struct ConformingSite {
+        mlir::Operation *readerCall;
+        mlir::Operation *writerCall;
+      };
+      llvm::SmallVector<ConformingSite, 4> conforming;
+      llvm::SmallVector<mlir::Operation *, 4> nonConforming;
+
+      // Cache transitive callees per caller (used to verify that no writer
+      // to a hoisted-load global is reachable from caller's call subtree).
+      llvm::DenseMap<mlir::Operation *,
+                     llvm::SmallDenseSet<mlir::Operation *, 8>>
+          callerCalleesCache;
+      auto computeTransClos = [&](mlir::Operation *root)
+          -> llvm::SmallDenseSet<mlir::Operation *, 8> & {
+        auto [it, inserted] = callerCalleesCache.try_emplace(root);
+        if (!inserted) return it->second;
+        auto &result = it->second;
+        llvm::SmallVector<mlir::Operation *, 8> wl{root};
+        while (!wl.empty()) {
+          mlir::Operation *f = wl.pop_back_val();
+          if (!result.insert(f).second) continue;
+          auto cIt = directCalleesOf.find(f);
+          if (cIt == directCalleesOf.end()) continue;
+          for (mlir::Operation *callee : cIt->second)
+            wl.push_back(callee);
+        }
+        return result;
+      };
+
+      // Hoisted-load safety per caller: writers of any hoisted global must
+      // not be reachable from the caller's static call subtree.
+      auto hoistedLoadsSafeAt = [&](mlir::Operation *callerOp) -> bool {
+        if (plan.hoistedLoadGlobals.empty()) return true;
+        auto &callees = computeTransClos(callerOp);
+        for (mlir::Operation *gOp : plan.hoistedLoadGlobals) {
+          auto wIt = moduleGlobalWrites.find(gOp);
+          if (wIt == moduleGlobalWrites.end()) continue;
+          for (auto &e : wIt->second) {
+            if (!e.storeOp) continue;
+            auto wFn =
+                e.storeOp->getParentOfType<mlir::FunctionOpInterface>();
+            if (!wFn) continue;
+            if (callees.count(wFn.getOperation())) return false;
+          }
+        }
+        return true;
+      };
+
+      for (auto &edge : cgIt->second) {
+        auto callerFn = edge.callSiteOp
+                            ->getParentOfType<mlir::FunctionOpInterface>();
+        if (!callerFn) { nonConforming.push_back(edge.callSiteOp); continue; }
+        if (!hoistedLoadsSafeAt(callerFn.getOperation())) {
+          nonConforming.push_back(edge.callSiteOp);
+          continue;
+        }
+        auto *writerCall = findEligibleWriterCall(
+            callerFn, edge.callSiteOp, writerFn, globalOp, domInfoTop,
+            moduleGlobalWrites, allocRootFor, globalAllocs,
+            fnTransitivelyWritesGlobal);
+        if (!writerCall) {
+          nonConforming.push_back(edge.callSiteOp);
+          continue;
+        }
+        conforming.push_back({edge.callSiteOp, writerCall});
+      }
+      if (conforming.empty()) {
+        if (drTestDiagnostics)
+          for (auto *l : loadOps)
+            l->emitRemark() << "interproc-cross: REJECT_NO_ORDERED_CALLER";
+        continue;
+      }
+
+      // Decide: in-place rewrite or specialize?
+      bool isPrivate = false;
+      if (auto symOp = mlir::dyn_cast<mlir::SymbolOpInterface>(readerFnOp))
+        isPrivate = symOp.getVisibility() ==
+                    mlir::SymbolTable::Visibility::Private;
+      bool inPlace = isPrivate && nonConforming.empty() &&
+                     cgIt->second.size() == conforming.size() &&
+                     conforming.size() == 1;
+
+      mlir::Type extraTy = plan.rootValue.getType();
+
+      if (inPlace) {
+        // Mutate readerFn in place. Replace all matching loads with the
+        // new arg.
+        addParamAndReplaceLoads(readerFn, extraTy, loadOps);
+        auto &site = conforming.front();
+        mlir::OpBuilder builder(site.writerCall);
+        mlir::Value matVal = materializeAtCaller(site.writerCall, plan, builder);
+        if (!matVal) continue;
+        if (drTestDiagnostics)
+          site.readerCall->emitRemark() << "interproc-cross: ACCEPT_INPLACE";
+        rewriteCallSite(site.readerCall, readerFn, {matVal});
+      } else {
+        // Specialize.
+        auto spec = cloneReaderForSpec(readerFn);
+        // Find equivalent loadOps inside the clone (parallel walk).
+        llvm::SmallVector<mlir::Operation *> clonedLoads;
+        {
+          mlir::Region *origBody = readerFn.getCallableRegion();
+          mlir::Region *specBody = spec.getCallableRegion();
+          // Build a position-index map: for each original loadOp, the
+          // (linear walk index) in origBody. Then pick the same index in
+          // specBody.
+          llvm::DenseMap<mlir::Operation *, unsigned> idxOfLoad;
+          unsigned i = 0;
+          origBody->walk([&](mlir::Operation *op) {
+            if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(op))
+              idxOfLoad[op] = i++;
+          });
+          llvm::SmallVector<mlir::Operation *> clonedLoadOrder;
+          specBody->walk([&](mlir::Operation *op) {
+            if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(op))
+              clonedLoadOrder.push_back(op);
+          });
+          for (mlir::Operation *l : loadOps) {
+            auto it = idxOfLoad.find(l);
+            if (it == idxOfLoad.end()) continue;
+            if (it->second < clonedLoadOrder.size())
+              clonedLoads.push_back(clonedLoadOrder[it->second]);
+          }
+        }
+        addParamAndReplaceLoads(spec, extraTy, clonedLoads);
+
+        // Cache one materialization per writerCall: multiple readers in
+        // the same caller may share the same writer-call as their latest
+        // dominator. Cloning the plan once and reusing the materialized
+        // value avoids duplicate IR + redundant compute at runtime.
+        llvm::DenseMap<mlir::Operation *, mlir::Value> matCache;
+        for (auto &site : conforming) {
+          mlir::Value matVal;
+          auto cIt = matCache.find(site.writerCall);
+          if (cIt != matCache.end()) {
+            matVal = cIt->second;
+          } else {
+            mlir::OpBuilder builder(site.writerCall);
+            matVal = materializeAtCaller(site.writerCall, plan, builder);
+            if (!matVal) continue;
+            matCache[site.writerCall] = matVal;
+          }
+          if (drTestDiagnostics)
+            site.readerCall->emitRemark()
+                << "interproc-cross: ACCEPT_SPECIALIZED";
+          rewriteCallSite(site.readerCall, spec, {matVal});
+        }
       }
     }
   }

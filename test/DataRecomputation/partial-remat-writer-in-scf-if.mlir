@@ -27,8 +27,9 @@ module {
       affine.store %s, %dst[%j] : memref<1048576xf32>
     }
 
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{partial-remat: REJECT_UNSAFE (reason=writer-does-not-dominate)}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{partial-remat: REJECT_UNSAFE (reason=writer-does-not-dominate)}}
     %out = affine.load %dst[%c0] : memref<1048576xf32>
 
     memref.dealloc %src : memref<4xf32>

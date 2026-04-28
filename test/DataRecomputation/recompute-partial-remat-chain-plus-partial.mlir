@@ -30,16 +30,19 @@ module {
     }
 
     affine.for %j = 0 to 1048576 {
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{direct-forward: ACCEPT}}
+      // expected-remark @below {{load: SINGLE}}
       %vc = memref.load %chain[] : memref<f32>
-      // expected-remark @+1 {{load: SINGLE}}
+      // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+      // expected-remark @below {{load: SINGLE}}
       %vp = affine.load %partial[0] : memref<4xf32>
       %s = arith.addf %vc, %vp : f32
       affine.store %s, %dst[%j] : memref<1048576xf32>
     }
 
-    // expected-remark @+2 {{load: SINGLE}}
-    // expected-remark @+1 {{partial-remat: ACCEPT}}
+    // expected-remark @below {{load: SINGLE}}
+    // expected-remark @below {{full-remat: REJECT_UNSAFE}}
+    // expected-remark @below {{partial-remat: ACCEPT}}
     %out = affine.load %dst[%c0] : memref<1048576xf32>
     memref.dealloc %chain : memref<f32>
     memref.dealloc %partial : memref<4xf32>

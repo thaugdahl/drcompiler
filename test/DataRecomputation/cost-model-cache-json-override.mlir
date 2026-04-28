@@ -13,7 +13,7 @@ module {
     %one = arith.constant 1 : i32
 
     // 8192 elements × 4 bytes = 32768 bytes (> l2_size=4096, l3_size=0).
-    // expected-remark @+1 {{cost-model: RECOMPUTE (compute=1, load=251}}
+    // expected-remark @below {{cost-model: RECOMPUTE (compute=1, load=251}}
     %buf = memref.alloc() : memref<8192xi32>
 
     affine.for %i = 0 to 8192 {
@@ -21,7 +21,8 @@ module {
       affine.store %val, %buf[%i] : memref<8192xi32>
     }
 
-    // expected-remark @+1 {{load: SINGLE}}
+    // expected-remark @below {{full-remat: ACCEPT}}
+    // expected-remark @below {{load: SINGLE}}
     %v = memref.load %buf[%c0] : memref<8192xi32>
 
     memref.dealloc %buf : memref<8192xi32>
