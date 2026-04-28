@@ -1,8 +1,12 @@
 // RUN: dr-opt %s --pass-pipeline='builtin.module(data-recomputation{dr-recompute dr-cost-model dr-test-diagnostics})' -verify-diagnostics | FileCheck %s
 
-// Strategy F: scf.for with constant bounds, store inside the loop body.
-// With one reader load whose index is a reader-arg, F.1 (single-iteration
-// extraction) fires in preference to F.2 — cheaper.
+// Strategy F.1: single-iteration extraction.
+//
+// Same writer/reader shape as cross-fn-loop-scf, but the reader has
+// exactly one load whose index is a reader entry-block arg (caller-
+// available value). The materializer should NOT allocate a scratch
+// buffer or clone the loop — instead it clones one iteration's worth
+// of body ops with the loop IV substituted by the load's index.
 
 module {
   // expected-remark @below {{cost-model:}}
@@ -37,9 +41,11 @@ module {
 }
 
 // CHECK-LABEL: func.func @run
+// No alloca, no scf.for clone — the iteration is extracted in straight-
+// line code reusing %arg1 (the index) as the substituted IV.
 // CHECK-NOT:     memref.alloca
 // CHECK-NOT:     scf.for
 // CHECK:         call @writer
-// CHECK:         arith.index_cast
-// CHECK:         arith.addi
-// CHECK:         call @reader
+// CHECK:         %[[IC:.*]] = arith.index_cast %arg1 : index to i32
+// CHECK:         %[[V:.*]] = arith.addi %arg0, %[[IC]] : i32
+// CHECK:         call @reader{{.*}}, %[[V]]

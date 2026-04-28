@@ -63,7 +63,12 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "leaf loads, subject to cache-aware cost gate (requires dr-cost-model)">,
     Option<"drPartialMaxLeaves", "dr-partial-max-leaves", "unsigned", "4",
            "Maximum number of non-chainable leaf loads permitted per "
-           "partial rematerialization">
+           "partial rematerialization">,
+    Option<"drDebug", "dr-debug", "bool", "false",
+           "Enable verbose DRDBG (DRCOMP:) trace output to llvm::dbgs()">,
+    Option<"drSummary", "dr-summary", "bool", "false",
+           "Print compact decision summary (buffer cost-model + per-load "
+           "remat outcomes with reasons) to stderr as DRSUM: lines">
   ];
 
   let dependentDialects = [
@@ -144,7 +149,9 @@ def MemoryFissionPass
     Option<"testDiagnostics", "test-diagnostics", "bool", "false",
            "Emit remarks for test diagnostics">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
-           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">
+           "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">,
+    Option<"debug", "debug", "bool", "false",
+           "Enable verbose DRDBG (DRCOMP-FISSION:) trace output">
   ];
 
   let dependentDialects = [

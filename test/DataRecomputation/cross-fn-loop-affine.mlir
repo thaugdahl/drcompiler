@@ -33,8 +33,11 @@ module {
 }
 
 // CHECK-LABEL: func.func @run
+// F.1 fires (single-load reader, IV-only store index, reader-arg load
+// index). No alloca, no loop clone.
+// CHECK-NOT:     memref.alloca
+// CHECK-NOT:     affine.for
 // CHECK:         call @writer
-// CHECK:         %[[SCRATCH:.*]] = memref.alloca() : memref<8xi32>
-// CHECK:         affine.for
-// CHECK:           affine.store {{.*}}, %[[SCRATCH]]
-// CHECK:         call @reader{{.*}}(%{{.*}}, %[[SCRATCH]]
+// CHECK:         arith.index_cast
+// CHECK:         arith.addi
+// CHECK:         call @reader

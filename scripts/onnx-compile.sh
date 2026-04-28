@@ -14,13 +14,28 @@
 #   ./scripts/onnx-compile.sh <model.onnx> [-o output.o] [options]
 #
 # Options:
-#   -o FILE            Output object path (default: <model>.o next to input)
-#   --keep-mlir DIR    Save all intermediate .mlir files to DIR
-#   --dr-flags FLAGS   Override dr-opt pass pipeline
-#   --diagnostics      Add dr-test-diagnostics to DR pass
-#   --dot FILE         Emit provenance GraphViz dot file
-#   --emit-llvm        Stop after LLVM IR (.ll) instead of compiling to .o
-#   -v / --verbose     Print each step to stderr
+#   -o FILE                 Output object path (default: <model>.o next to input)
+#   --keep-mlir DIR         Save all intermediate .mlir files to DIR
+#   --dr-flags FLAGS        Override entire dr-opt pass pipeline (escape hatch)
+#
+#   DR pass options (translated to data-recomputation{...}):
+#   --no-recompute          Disable dr-recompute (default: on)
+#   --cost-model            Enable dr-cost-model (cache-aware gating)
+#   --partial-remat         Enable dr-partial-remat (implies --cost-model)
+#   --full                  Preset: enable all input-less DR bool flags
+#                           (recompute, cost-model, partial-remat,
+#                            footprint-analysis, diagnostics)
+#   --partial-max-leaves N  Cap on partial remat leaves (default 4)
+#   --footprint-analysis    Enable dr-footprint-analysis
+#   --diagnostics           Add dr-test-diagnostics
+#   --dot FILE              Emit provenance GraphViz dot file
+#   --cpu-cost-model FILE   JSON per-op cycle costs (mounted into container)
+#   --l1-size N, --l2-size N, --l3-size N            Cache sizes (bytes)
+#   --l1-lat N, --l2-lat N, --l3-lat N, --mem-lat N  Latencies (cycles)
+#   --cache-line N          Cache line size in bytes (default 64)
+#
+#   --emit-llvm             Stop after LLVM IR (.ll) instead of .o
+#   -v / --verbose          Print each step to stderr
 #
 # Images:
 #   $ONNX_MLIR_IMAGE  (default: onnx-mlir)
@@ -41,23 +56,50 @@ CLANG_BIN="/opt/llvm/bin/clang"
 MODEL=""
 OUTPUT=""
 KEEP_MLIR_DIR=""
-DR_FLAGS="--pass-pipeline=builtin.module(data-recomputation{dr-recompute=true})"
+DR_FLAGS_OVERRIDE=""
 DIAGNOSTICS=0
 DOT_FILE=""
 EMIT_LLVM=0
 VERBOSE=0
 
+# DR pass options (assembled into data-recomputation{...} unless --dr-flags)
+DR_RECOMPUTE=1
+DR_COST_MODEL=0
+DR_PARTIAL_REMAT=0
+DR_PARTIAL_MAX_LEAVES=""
+DR_FOOTPRINT=0
+DR_CPU_COST_FILE=""
+DR_L1_SIZE=""; DR_L2_SIZE=""; DR_L3_SIZE=""
+DR_L1_LAT="";  DR_L2_LAT="";  DR_L3_LAT="";  DR_MEM_LAT=""
+DR_CACHE_LINE=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -o)             OUTPUT="$2";        shift 2 ;;
-    --keep-mlir)    KEEP_MLIR_DIR="$2"; shift 2 ;;
-    --dr-flags)     DR_FLAGS="$2";      shift 2 ;;
-    --diagnostics)  DIAGNOSTICS=1;      shift   ;;
-    --dot)          DOT_FILE="$2";      shift 2 ;;
-    --emit-llvm)    EMIT_LLVM=1;        shift   ;;
-    -v|--verbose)   VERBOSE=1;          shift   ;;
-    -*)             echo "onnx-compile: unknown option: $1" >&2; exit 1 ;;
-    *)              MODEL="$1";         shift   ;;
+    -o)                    OUTPUT="$2";              shift 2 ;;
+    --keep-mlir)           KEEP_MLIR_DIR="$2";       shift 2 ;;
+    --dr-flags)            DR_FLAGS_OVERRIDE="$2";   shift 2 ;;
+    --no-recompute)        DR_RECOMPUTE=0;           shift   ;;
+    --cost-model)          DR_COST_MODEL=1;          shift   ;;
+    --partial-remat)       DR_PARTIAL_REMAT=1; DR_COST_MODEL=1; shift ;;
+    --full)                DR_RECOMPUTE=1; DR_COST_MODEL=1; DR_PARTIAL_REMAT=1
+                           DR_FOOTPRINT=1; DIAGNOSTICS=1;       shift ;;
+    --partial-max-leaves)  DR_PARTIAL_MAX_LEAVES="$2"; shift 2 ;;
+    --footprint-analysis)  DR_FOOTPRINT=1;           shift   ;;
+    --cpu-cost-model)      DR_CPU_COST_FILE="$2";    shift 2 ;;
+    --l1-size)             DR_L1_SIZE="$2";          shift 2 ;;
+    --l2-size)             DR_L2_SIZE="$2";          shift 2 ;;
+    --l3-size)             DR_L3_SIZE="$2";          shift 2 ;;
+    --l1-lat)              DR_L1_LAT="$2";           shift 2 ;;
+    --l2-lat)              DR_L2_LAT="$2";           shift 2 ;;
+    --l3-lat)              DR_L3_LAT="$2";           shift 2 ;;
+    --mem-lat)             DR_MEM_LAT="$2";          shift 2 ;;
+    --cache-line)          DR_CACHE_LINE="$2";       shift 2 ;;
+    --diagnostics)         DIAGNOSTICS=1;            shift   ;;
+    --dot)                 DOT_FILE="$2";            shift 2 ;;
+    --emit-llvm)           EMIT_LLVM=1;              shift   ;;
+    -v|--verbose)          VERBOSE=1;                shift   ;;
+    -*)                    echo "onnx-compile: unknown option: $1" >&2; exit 1 ;;
+    *)                     MODEL="$1";               shift   ;;
   esac
 done
 
@@ -72,17 +114,37 @@ done
 log() { [[ "$VERBOSE" -eq 1 ]] && echo "[onnx-compile] $*" >&2 || true; }
 die() { echo "onnx-compile: error: $*" >&2; exit 1; }
 
-# --- Inject diagnostics / dot into DR_FLAGS ---
-if [[ "$DIAGNOSTICS" -eq 1 || -n "$DOT_FILE" ]]; then
-  EXTRA=""
-  [[ "$DIAGNOSTICS" -eq 1 ]] && EXTRA="${EXTRA}dr-test-diagnostics "
-  [[ -n "$DOT_FILE" ]]        && EXTRA="${EXTRA}dr-dot-file=$(realpath -m "$DOT_FILE") "
-  EXTRA="${EXTRA% }"  # trim trailing space
-  if [[ "$DR_FLAGS" == *"data-recomputation{"* ]]; then
-    DR_FLAGS="${DR_FLAGS/data-recomputation\{/data-recomputation\{${EXTRA} }"
-  elif [[ "$DR_FLAGS" == *"data-recomputation"* ]]; then
-    DR_FLAGS="${DR_FLAGS/data-recomputation/data-recomputation\{${EXTRA}\}}"
-  fi
+# --- Assemble DR pass options ---
+# Resolve dot/cost-model file paths early (need absolute for in-container access)
+DOT_ABS=""
+[[ -n "$DOT_FILE" ]] && DOT_ABS="$(realpath -m "$DOT_FILE")"
+CPU_COST_ABS=""
+if [[ -n "$DR_CPU_COST_FILE" ]]; then
+  [[ -f "$DR_CPU_COST_FILE" ]] || die "cpu cost model file not found: $DR_CPU_COST_FILE"
+  CPU_COST_ABS="$(realpath "$DR_CPU_COST_FILE")"
+fi
+
+if [[ -n "$DR_FLAGS_OVERRIDE" ]]; then
+  DR_FLAGS="$DR_FLAGS_OVERRIDE"
+else
+  DR_OPTS=()
+  [[ "$DR_RECOMPUTE"     -eq 1 ]] && DR_OPTS+=("dr-recompute")
+  [[ "$DR_COST_MODEL"    -eq 1 ]] && DR_OPTS+=("dr-cost-model")
+  [[ "$DR_PARTIAL_REMAT" -eq 1 ]] && DR_OPTS+=("dr-partial-remat")
+  [[ "$DR_FOOTPRINT"     -eq 1 ]] && DR_OPTS+=("dr-footprint-analysis")
+  [[ "$DIAGNOSTICS"      -eq 1 ]] && DR_OPTS+=("dr-test-diagnostics")
+  [[ -n "$DOT_ABS"             ]] && DR_OPTS+=("dr-dot-file=$DOT_ABS")
+  [[ -n "$CPU_COST_ABS"        ]] && DR_OPTS+=("cpu-cost-model-file=$CPU_COST_ABS")
+  [[ -n "$DR_PARTIAL_MAX_LEAVES" ]] && DR_OPTS+=("dr-partial-max-leaves=$DR_PARTIAL_MAX_LEAVES")
+  [[ -n "$DR_L1_SIZE"          ]] && DR_OPTS+=("dr-l1-size=$DR_L1_SIZE")
+  [[ -n "$DR_L2_SIZE"          ]] && DR_OPTS+=("dr-l2-size=$DR_L2_SIZE")
+  [[ -n "$DR_L3_SIZE"          ]] && DR_OPTS+=("dr-l3-size=$DR_L3_SIZE")
+  [[ -n "$DR_L1_LAT"           ]] && DR_OPTS+=("dr-l1-latency=$DR_L1_LAT")
+  [[ -n "$DR_L2_LAT"           ]] && DR_OPTS+=("dr-l2-latency=$DR_L2_LAT")
+  [[ -n "$DR_L3_LAT"           ]] && DR_OPTS+=("dr-l3-latency=$DR_L3_LAT")
+  [[ -n "$DR_MEM_LAT"          ]] && DR_OPTS+=("dr-mem-latency=$DR_MEM_LAT")
+  [[ -n "$DR_CACHE_LINE"       ]] && DR_OPTS+=("dr-cache-line-size=$DR_CACHE_LINE")
+  DR_FLAGS="--pass-pipeline=builtin.module(data-recomputation{${DR_OPTS[*]}})"
 fi
 
 # --- Resolve absolute paths ---
@@ -156,14 +218,15 @@ docker run --rm \
 # ===== Step 3: DataRecomputation (dr-opt) =====
 _MOUNTS=(); _SEEN=""
 add_mount "$TMPDIR"
-[[ -n "$DOT_FILE" ]] && add_mount "$(dirname "$(realpath -m "$DOT_FILE")")"
+[[ -n "$DOT_ABS"      ]] && add_mount "$(dirname "$DOT_ABS")"
+[[ -n "$CPU_COST_ABS" ]] && add_mount "$(dirname "$CPU_COST_ABS")"
 
 log "Step 3: dr-opt $DR_FLAGS  $AFFINE_MLIR → $DR_MLIR"
 docker run --rm \
   "${_MOUNTS[@]}" \
   --entrypoint "$DR_OPT_BIN" \
   "$DRCC_IMAGE" \
-  --allow-unregistered-dialect $DR_FLAGS "$AFFINE_MLIR" -o "$DR_MLIR" \
+  --allow-unregistered-dialect "$DR_FLAGS" "$AFFINE_MLIR" -o "$DR_MLIR" \
   || die "Step 3 (dr-opt data-recomputation) failed"
 
 [[ -n "$KEEP_DIR" ]] && cp "$DR_MLIR" "$KEEP_DIR/${BASE}.03-dr.mlir"

@@ -27,7 +27,16 @@
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
+#include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/DotEmitter.h"
+#include "drcompiler/Transforms/DataRecomputation/RematKernel.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/ConstantGlobalFold.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/CrossFnOrdered.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/DirectForward.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/FullRemat.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/InterprocRemat.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/PartialRemat.h"
+#include "drcompiler/Transforms/DataRecomputation/Strategies/Strategy.h"
 #include "drcompiler/Transforms/DataRecomputationIndexing.h"
 #include "drcompiler/Transforms/Utils/MemrefBaseAnalysis.h"
 #include "drcompiler/Transforms/Utils/OpDispatchUtils.h"
@@ -58,7 +67,20 @@
 #include "mlir/IR/IRMapping.h"
 #include "llvm/Support/FormatVariadic.h"
 
-#define DRDBG() llvm::dbgs() << "DRCOMP: "
+// Gated by pass options dr-debug / dr-summary; both default OFF (silent).
+// Set by runOnOperation before any DRDBG/DRSUM site fires.
+namespace {
+static bool drDebugEnabled = false;
+static bool drSummaryEnabled = false;
+} // namespace
+#define DRDBG()                                                                \
+  (drDebugEnabled ? llvm::dbgs()                                               \
+                  : static_cast<llvm::raw_ostream &>(llvm::nulls()))           \
+      << "DRCOMP: "
+#define DRSUM()                                                                \
+  (drSummaryEnabled ? llvm::errs()                                             \
+                    : static_cast<llvm::raw_ostream &>(llvm::nulls()))         \
+      << "DRSUM: "
 
 namespace mlir {
 #define GEN_PASS_DEF_DATARECOMPUTATIONPASS
@@ -357,9 +379,18 @@ static StoreValueDeps computeStoreValueDeps(
 /// flow where one branch may not execute (scf.if without else, may-zero
 /// loops).  Set `injectAbsentSentinel=false` for loop-carry joins, where
 /// every iteration past the first observes the body's prior writes.
-/// See BLOCKERS_CLAUDE.md §S1-A.
+///
+/// `skipSentinelRoots` (optional) suppresses sentinel injection for the
+/// listed roots even when `injectAbsentSentinel` is true.  Used by
+/// `analyzeForOp` to skip sentinel injection for allocs whose dynamic
+/// shape is bound to the loop's trip-count operand: when the loop runs
+/// zero iterations the alloc has zero elements along the corresponding
+/// dimension, making any later in-bounds access through that root
+/// unreachable.  See BLOCKERS_CLAUDE.md §S1-A.
 StoreMap joinStoreMaps(StoreMap result, const StoreMap &other,
-                       bool injectAbsentSentinel = true) {
+                       bool injectAbsentSentinel = true,
+                       const llvm::SmallDenseSet<mlir::Operation *>
+                           *skipSentinelRoots = nullptr) {
   // Snapshot keys of `result` BEFORE merging.  Auto-vivify in the merge
   // loop would otherwise erase the "absent on this side" signal.
   llvm::SmallDenseSet<mlir::Operation *, 8> resultKeys;
@@ -377,9 +408,13 @@ StoreMap joinStoreMaps(StoreMap result, const StoreMap &other,
       entries.push_back({nullptr, std::nullopt});
   };
 
+  auto shouldSkip = [&](mlir::Operation *root) {
+    return skipSentinelRoots && skipSentinelRoots->count(root);
+  };
+
   for (auto &[root, entries] : other) {
     auto &resultEntries = result[root];
-    if (injectAbsentSentinel && !resultKeys.count(root))
+    if (injectAbsentSentinel && !resultKeys.count(root) && !shouldSkip(root))
       ensureNullSentinel(resultEntries);
     for (const auto &entry : entries) {
       auto it = llvm::find_if(resultEntries, [&](const IndexedStore &e) {
@@ -399,6 +434,8 @@ StoreMap joinStoreMaps(StoreMap result, const StoreMap &other,
   if (injectAbsentSentinel) {
     for (auto root : resultKeys) {
       if (other.count(root))
+        continue;
+      if (shouldSkip(root))
         continue;
       ensureNullSentinel(result[root]);
     }
@@ -431,6 +468,73 @@ static std::optional<PointSet> computeAccessIndices(
     auto constOp = idx.getDefiningOp<mlir::arith::ConstantOp>();
     if (!constOp) return std::nullopt;
     auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue());
+    if (!intAttr) return std::nullopt;
+    coords.push_back(intAttr.getInt());
+  }
+  return PointSet::fromCoords(coords);
+}
+
+/// Try to fold an SSA value reaching an affine.store/load index into a
+/// constant. Handles arith.constant, statically trip-1 affine.for IVs (the
+/// IV must equal the constant lower bound on its single iteration), and
+/// affine.apply chains whose operands all fold.
+static std::optional<int64_t> tryFoldAffineValue(mlir::Value v) {
+  if (auto cst = mlir::getConstantIntValue(v))
+    return *cst;
+  if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+    if (auto forOp = mlir::dyn_cast<mlir::affine::AffineForOp>(
+            blockArg.getOwner()->getParentOp())) {
+      if (blockArg == forOp.getInductionVar() &&
+          forOp.hasConstantLowerBound() &&
+          forOp.hasConstantUpperBound()) {
+        int64_t lb = forOp.getConstantLowerBound();
+        int64_t ub = forOp.getConstantUpperBound();
+        int64_t step = forOp.getStepAsInt();
+        // Statically trip-exactly-1: one iteration with IV == lb.
+        if (step > 0 && ub > lb && (ub - lb) <= step)
+          return lb;
+      }
+    }
+    return std::nullopt;
+  }
+  if (auto applyOp = v.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+    llvm::SmallVector<mlir::Attribute, 4> attrs;
+    auto idxTy = mlir::IndexType::get(applyOp.getContext());
+    for (mlir::Value op : applyOp.getMapOperands()) {
+      auto folded = tryFoldAffineValue(op);
+      if (!folded) return std::nullopt;
+      attrs.push_back(mlir::IntegerAttr::get(idxTy, *folded));
+    }
+    llvm::SmallVector<mlir::Attribute, 1> results;
+    if (mlir::failed(applyOp.getAffineMap().constantFold(attrs, results)))
+      return std::nullopt;
+    if (results.size() != 1) return std::nullopt;
+    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(results[0]))
+      return intAttr.getInt();
+  }
+  return std::nullopt;
+}
+
+/// Like computeAccessIndices but for affine.store/load: applies the op's
+/// AffineMap to its operands after folding each operand to a constant.
+static std::optional<PointSet> computeAffineAccessIndices(
+    mlir::AffineMap map, mlir::Operation::operand_range mapOperands) {
+  if (map.getNumInputs() !=
+      static_cast<unsigned>(llvm::range_size(mapOperands)))
+    return std::nullopt;
+  auto idxTy = mlir::IndexType::get(map.getContext());
+  llvm::SmallVector<mlir::Attribute, 4> operandAttrs;
+  for (mlir::Value v : mapOperands) {
+    auto folded = tryFoldAffineValue(v);
+    if (!folded) return std::nullopt;
+    operandAttrs.push_back(mlir::IntegerAttr::get(idxTy, *folded));
+  }
+  llvm::SmallVector<mlir::Attribute, 4> results;
+  if (mlir::failed(map.constantFold(operandAttrs, results)))
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 4> coords;
+  for (mlir::Attribute a : results) {
+    auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(a);
     if (!intAttr) return std::nullopt;
     coords.push_back(intAttr.getInt());
   }
@@ -761,6 +865,71 @@ static void analyzeIfOp(mlir::Operation *op, StoreMap &state,
   state = joinStoreMaps(thenState, elseState);
 }
 
+// Canonical key for a dim-source SSA value. Two `memref.dim` ops on the
+// same memref with the same constant index produce equal keys even though
+// their results are distinct SSA values; they are observably equal at
+// runtime. The first element is the underlying value (the memref or, for
+// non-`memref.dim` values, the value itself); the second is the dim index
+// (or -1 for non-`memref.dim` keys).
+using DimKey = std::pair<mlir::Value, int64_t>;
+
+static DimKey canonicalDimKey(mlir::Value v) {
+  if (auto dimOp = v.getDefiningOp<mlir::memref::DimOp>()) {
+    auto idx = dimOp.getConstantIndex();
+    if (idx)
+      return {dimOp.getSource(), *idx};
+  }
+  return {v, -1};
+}
+
+// Collect alloc roots whose dynamic shape is bound to one of the SSA values
+// driving an affine.for's bounds. When the loop has zero trip count those
+// allocs have zero elements along the corresponding dimension, so any later
+// in-bounds access to the alloc is also unreachable on that path. This makes
+// it sound to suppress the absent-path sentinel for these roots in the join.
+//
+// Bound operands are normalised through `memref.dim %M, %c<k>` to the
+// canonical `(M, k)` key so that distinct SSA values from independent
+// `memref.dim` calls on the same source compare equal.
+static llvm::SmallDenseSet<mlir::Operation *>
+collectTripCorrelatedRoots(mlir::affine::AffineForOp affineFor,
+                           const StoreMap &candidates) {
+  llvm::SmallDenseSet<mlir::Operation *> result;
+
+  llvm::SmallDenseSet<DimKey, 4> boundKeys;
+  auto addBoundOperands = [&](mlir::ValueRange operands) {
+    for (mlir::Value v : operands)
+      boundKeys.insert(canonicalDimKey(v));
+  };
+  if (!affineFor.hasConstantLowerBound())
+    addBoundOperands(affineFor.getLowerBoundOperands());
+  if (!affineFor.hasConstantUpperBound())
+    addBoundOperands(affineFor.getUpperBoundOperands());
+  if (boundKeys.empty())
+    return result;
+
+  auto allocDynSizes = [](mlir::Operation *op,
+                          llvm::SmallVectorImpl<mlir::Value> &out) {
+    if (auto a = mlir::dyn_cast<mlir::memref::AllocOp>(op))
+      for (mlir::Value v : a.getDynamicSizes()) out.push_back(v);
+    else if (auto a = mlir::dyn_cast<mlir::memref::AllocaOp>(op))
+      for (mlir::Value v : a.getDynamicSizes()) out.push_back(v);
+  };
+
+  llvm::SmallVector<mlir::Value, 4> sizes;
+  for (auto &kv : candidates) {
+    sizes.clear();
+    allocDynSizes(kv.first, sizes);
+    for (mlir::Value sz : sizes) {
+      if (boundKeys.count(canonicalDimKey(sz))) {
+        result.insert(kv.first);
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 // scf.for / affine.for: two-pass analysis to model loop-carried deps.
 // Pass 1 produces post-body state; pass 2 re-runs the body with the carried
 // entry to capture stores visible from a prior iteration. Affine loops with
@@ -789,6 +958,12 @@ static void analyzeForOp(mlir::Operation *op, StoreMap &state,
       state = bodyState2;
       return;
     }
+    // May-zero-trip affine.for: suppress the absent-path sentinel for alloc
+    // roots whose dynamic shape is bound to the loop's trip-count operand.
+    auto correlated = collectTripCorrelatedRoots(affineFor, bodyState2);
+    state = joinStoreMaps(state, bodyState2, /*injectAbsentSentinel=*/true,
+                          correlated.empty() ? nullptr : &correlated);
+    return;
   }
 
   state = joinStoreMaps(state, bodyState2);
@@ -837,7 +1012,20 @@ static void analyzeStoreOp(mlir::Operation *op, StoreMap &state,
       auto it = allocRootFor.find(base);
       if (it == allocRootFor.end()) continue;
       killDependentStores(it->second, state, ctx.storeValueDeps);
-      state[it->second].push_back({op, std::nullopt});
+      bool throughView = (base != affStore.getMemRef());
+      auto coverage =
+          throughView
+              ? std::nullopt
+              : computeAffineAccessIndices(affStore.getAffineMap(),
+                                           affStore.getMapOperands());
+      if (coverage) {
+        llvm::erase_if(state[it->second], [&](IndexedStore &entry) {
+          if (!entry.coverage) return false;
+          *entry.coverage -= *coverage;
+          return entry.coverage->empty();
+        });
+      }
+      state[it->second].push_back({op, coverage});
     }
     return;
   }
@@ -875,6 +1063,13 @@ static void recordLoadProvenance(mlir::Operation *loadOp, mlir::Value memref,
       loadCoverage = (load.getIndices().empty() || throughView)
                          ? std::nullopt
                          : computeAccessIndices(load.getIndices());
+    } else if (auto affLoad =
+                   mlir::dyn_cast<mlir::affine::AffineLoadOp>(loadOp)) {
+      bool throughView = (base != affLoad.getMemRef());
+      loadCoverage = throughView
+                         ? std::nullopt
+                         : computeAffineAccessIndices(
+                               affLoad.getAffineMap(), affLoad.getMapOperands());
     }
 
     for (const auto &entry : rootIt->second) {
@@ -1085,1495 +1280,24 @@ static void printOperandTree(mlir::Value val, unsigned indent = 0,
     printOperandTree(operand, indent + 1, maxDepth);
 }
 
-// ===== Recomputation Helpers =====
-
-/// Returns true if the store dominates the load (same function, direct forward).
-static bool isSafeToForward(mlir::Operation *storeOp,
-                            mlir::Operation *loadOp,
-                            mlir::DominanceInfo &domInfo) {
-  return domInfo.dominates(storeOp, loadOp);
-}
-
+// Out-of-line helpers used by runOnOperation. The rematerialization
+// kernels and cache cost model live in:
+//   drcompiler/Transforms/DataRecomputation/CacheCostModel.h
+//   drcompiler/Transforms/DataRecomputation/RematKernel.h
+// Strategy classes live in
+//   drcompiler/Transforms/DataRecomputation/Strategies/*.h
 using drcompiler::getStoredValue;
+using dr::CacheParams;
+using dr::estimateBufferSizeBytes;
+using dr::estimateInterveningFootprint;
+using dr::estimateOperandReloadPenalty;
+using dr::estimateLoadLatency;
+using dr::decideBufferStrategy;
+using dr::lookupAllocRoot;
+using dr::buildRootWriteMap;
+using dr::RootWriteMap;
+using dr::estimateComputeCost;
 
-// ===== Footprint Analysis =====
-
-/// Default trip count when bounds cannot be statically determined. Picked
-/// to match a common per-loop iteration count seen in SPEC inner loops:
-/// big enough that small constants (1, 4) don't dominate cache estimates,
-/// small enough that footprint × trip stays within typical L2 sizes.
-/// Tuning beyond ±2× makes little difference to the cost model decisions
-/// downstream (cache-fit vs. memory-bound is the binary outcome).
-constexpr int64_t kDefaultTripCount = 128;
-
-/// Trace a value to a compile-time constant integer, walking through
-/// index_cast ops and (one level of) call-site argument forwarding.
-static std::optional<int64_t> traceToConstant(
-    mlir::Value val, const EnrichedCallGraph &callGraph) {
-  // Direct arith.constant / arith.constant index.
-  if (mlir::Operation *defOp = val.getDefiningOp()) {
-    if (auto cIdx = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(defOp))
-      return cIdx.value();
-    if (auto cInt = mlir::dyn_cast<mlir::arith::ConstantIntOp>(defOp))
-      return cInt.value();
-    // Walk through index_cast.
-    if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(defOp))
-      return traceToConstant(cast.getIn(), callGraph);
-    return std::nullopt;
-  }
-
-  // Block argument: check call graph for constant forwarding.
-  auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(val);
-  if (!blockArg)
-    return std::nullopt;
-
-  auto *parentOp = blockArg.getOwner()->getParentOp();
-  auto funcOp = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(parentOp);
-  if (!funcOp)
-    return std::nullopt;
-
-  unsigned argIdx = blockArg.getArgNumber();
-  auto cgIt = callGraph.find(funcOp.getOperation());
-  if (cgIt == callGraph.end() || cgIt->second.empty())
-    return std::nullopt;
-
-  std::optional<int64_t> commonVal;
-  for (const auto &edge : cgIt->second) {
-    if (argIdx >= edge.callSiteOp->getNumOperands())
-      return std::nullopt;
-    mlir::Value callerOperand = edge.callSiteOp->getOperand(argIdx);
-    // One-level trace: resolve the caller operand to a constant directly.
-    mlir::Operation *callerDef = callerOperand.getDefiningOp();
-    std::optional<int64_t> traced;
-    if (callerDef) {
-      if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(callerDef))
-        traced = c.value();
-      else if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(callerDef))
-        traced = c.value();
-      else if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(callerDef))
-        if (auto *inner = cast.getIn().getDefiningOp()) {
-          if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(inner))
-            traced = c.value();
-          else if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(inner))
-            traced = c.value();
-        }
-    }
-    if (!traced)
-      return std::nullopt;
-    if (commonVal && *commonVal != *traced)
-      return std::nullopt;
-    commonVal = traced;
-  }
-  return commonVal;
-}
-
-/// Estimate the trip count of a loop op (affine.for or scf.for).
-/// Returns nullopt if the trip count cannot be determined.
-static std::optional<int64_t> estimateTripCount(
-    mlir::Operation *loopOp, const EnrichedCallGraph &callGraph) {
-  // affine.for
-  if (auto affFor = mlir::dyn_cast<mlir::affine::AffineForOp>(loopOp)) {
-    int64_t step = affFor.getStepAsInt();
-    if (step <= 0) return std::nullopt;
-    // Both bounds constant.
-    if (affFor.hasConstantLowerBound() && affFor.hasConstantUpperBound()) {
-      int64_t lb = affFor.getConstantLowerBound();
-      int64_t ub = affFor.getConstantUpperBound();
-      if (ub <= lb) return 0;
-      return (ub - lb + step - 1) / step;
-    }
-    // Constant lower bound, try to trace dynamic upper bound.
-    if (affFor.hasConstantLowerBound()) {
-      auto ubOperands = affFor.getUpperBoundOperands();
-      if (ubOperands.size() == 1) {
-        auto ubVal = traceToConstant(ubOperands[0], callGraph);
-        if (ubVal) {
-          int64_t lb = affFor.getConstantLowerBound();
-          if (*ubVal <= lb) return 0;
-          return (*ubVal - lb + step - 1) / step;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  // scf.for
-  if (auto scfFor = mlir::dyn_cast<mlir::scf::ForOp>(loopOp)) {
-    auto lbVal = traceToConstant(scfFor.getLowerBound(), callGraph);
-    auto ubVal = traceToConstant(scfFor.getUpperBound(), callGraph);
-    auto stepVal = traceToConstant(scfFor.getStep(), callGraph);
-    if (lbVal && ubVal && stepVal && *stepVal > 0) {
-      if (*ubVal <= *lbVal) return 0;
-      return (*ubVal - *lbVal + *stepVal - 1) / *stepVal;
-    }
-    return std::nullopt;
-  }
-
-  return std::nullopt;
-}
-
-// ===== Cost Model =====
-
-/// Cache hierarchy parameters for the cost model.
-struct CacheParams {
-  unsigned l1Size;    // bytes
-  unsigned l2Size;    // bytes
-  unsigned l3Size;    // bytes (0 = unknown / not modeled)
-  unsigned l1Latency; // cycles
-  unsigned l2Latency;
-  unsigned l3Latency;
-  unsigned memLatency;
-  unsigned cacheLineSize; // bytes
-};
-
-/// Estimate the ALU cost of recomputing a value by walking its SSA operand
-/// tree.  Each operation is weighted via the CpuCostModel.  Loads and
-/// block arguments are free (they are inputs, not recomputed).
-static unsigned estimateComputeCost(mlir::Value val,
-                                    const drcompiler::CpuCostModel &costModel) {
-  llvm::SmallVector<mlir::Value, 8> worklist;
-  llvm::SmallDenseSet<mlir::Value> visited;
-  unsigned cost = 0;
-  worklist.push_back(val);
-
-  while (!worklist.empty()) {
-    mlir::Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    if (mlir::isa<mlir::BlockArgument>(current))
-      continue;
-    mlir::Operation *defOp = current.getDefiningOp();
-    if (!defOp)
-      continue;
-
-    // Loads are inputs — they represent values already in registers or memory.
-    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
-                  mlir::LLVM::LoadOp>(defOp))
-      continue;
-
-    cost += costModel.opCost(defOp);
-
-    for (mlir::Value operand : defOp->getOperands())
-      worklist.push_back(operand);
-  }
-  return cost;
-}
-
-/// Estimate the size of an allocation in bytes. Returns nullopt when the
-/// size cannot be determined statically:
-///   - allocOp is not a memref::AllocOp / AllocaOp (e.g. get_global, an
-///     unmodelled allocator, or a function-arg memref);
-///   - the memref shape contains dynamic dimensions;
-///   - the element type has zero bit-width (opaque/unknown type).
-/// Callers fall back to a conservative size (typically `cache.l2Size + 1`,
-/// i.e. assume the buffer misses cache).
-static std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
-  mlir::MemRefType memrefTy;
-
-  if (auto alloc = mlir::dyn_cast<mlir::memref::AllocOp>(allocOp))
-    memrefTy = alloc.getType();
-  else if (auto alloca = mlir::dyn_cast<mlir::memref::AllocaOp>(allocOp))
-    memrefTy = alloca.getType();
-  else
-    return std::nullopt;
-
-  if (!memrefTy.hasStaticShape())
-    return std::nullopt;
-
-  int64_t numElements = 1;
-  for (int64_t dim : memrefTy.getShape())
-    numElements *= dim;
-
-  unsigned elementBits = memrefTy.getElementTypeBitWidth();
-  if (elementBits == 0)
-    return std::nullopt;
-
-  return numElements * (elementBits / 8);
-}
-
-/// Estimate the cost of one load from a buffer, given its size and the cache
-/// hierarchy.  Uses a simple model: if the buffer fits in Lk, assume Lk
-/// latency.
-static unsigned estimateLoadLatency(int64_t bufferSizeBytes,
-                                    const CacheParams &cache) {
-  if (bufferSizeBytes <= (int64_t)cache.l1Size)
-    return cache.l1Latency;
-  if (bufferSizeBytes <= (int64_t)cache.l2Size)
-    return cache.l2Latency;
-  if (cache.l3Size > 0 && bufferSizeBytes <= (int64_t)cache.l3Size)
-    return cache.l3Latency;
-  return cache.memLatency;
-}
-
-// ===== Per-Op and Block Footprint Estimation =====
-
-/// Estimate the memory footprint (bytes) of a single execution of an op.
-static int64_t estimateOpFootprintBytes(mlir::Operation *op,
-                                        const CacheParams &cache) {
-  // memref / affine / llvm scalar load and store: derive element type from
-  // the memref/pointer operand.
-  if (drcompiler::isAnyLoadOp(op) || drcompiler::isAnyStoreOp(op)) {
-    mlir::Type elemTy = drcompiler::getLoadStoreElementType(op);
-    if (elemTy && elemTy.isIntOrFloat())
-      return elemTy.getIntOrFloatBitWidth() / 8;
-    return 8; // conservative fallback for opaque LLVM pointer types
-  }
-
-  // vector.load / vector.store / vector.transfer_read / vector.transfer_write
-  for (mlir::Value result : op->getResults()) {
-    if (auto vecTy = mlir::dyn_cast<mlir::VectorType>(result.getType())) {
-      if (mlir::isa<mlir::vector::LoadOp, mlir::vector::TransferReadOp>(op))
-        return (vecTy.getNumElements() * vecTy.getElementTypeBitWidth()) / 8;
-    }
-  }
-  if (mlir::isa<mlir::vector::StoreOp, mlir::vector::TransferWriteOp>(op)) {
-    mlir::Value vecVal = op->getOperand(0);
-    if (auto vecTy = mlir::dyn_cast<mlir::VectorType>(vecVal.getType()))
-      return (vecTy.getNumElements() * vecTy.getElementTypeBitWidth()) / 8;
-  }
-
-  // CallOpInterface with memref args: sum of buffer sizes.
-  if (auto callOp = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
-    int64_t total = 0;
-    for (mlir::Value operand : callOp->getOperands()) {
-      auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(operand.getType());
-      if (!memrefTy)
-        continue;
-      if (memrefTy.hasStaticShape()) {
-        int64_t numElems = 1;
-        for (int64_t dim : memrefTy.getShape())
-          numElems *= dim;
-        unsigned elemBits = memrefTy.getElementTypeBitWidth();
-        total += elemBits > 0 ? numElems * (elemBits / 8) : 0;
-      } else {
-        total += cache.l2Size; // conservative for dynamic shapes
-      }
-    }
-    return total;
-  }
-
-  return 0; // non-memory op
-}
-
-// Forward declaration.
-static int64_t estimateBlockFootprintBytes(mlir::Block &block,
-                                           const CacheParams &cache,
-                                           const EnrichedCallGraph &callGraph);
-
-/// Estimate total memory footprint of all ops in a block, accounting for
-/// nested loops (body × trip count) and branches (max of alternatives).
-static int64_t estimateBlockFootprintBytes(mlir::Block &block,
-                                           const CacheParams &cache,
-                                           const EnrichedCallGraph &callGraph) {
-  int64_t total = 0;
-
-  for (mlir::Operation &op : block) {
-    // Loops: body footprint × trip count.
-    if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(&op)) {
-      mlir::Region &bodyRegion = op.getRegion(0);
-      if (!bodyRegion.empty()) {
-        int64_t bodyFP =
-            estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
-        auto tc = estimateTripCount(&op, callGraph);
-        if (tc)
-          total += bodyFP * *tc;
-        else
-          total += bodyFP * kDefaultTripCount;
-      }
-      continue;
-    }
-
-    // If/else: max of branches.
-    if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(&op)) {
-      int64_t thenFP = 0, elseFP = 0;
-      mlir::Region &thenRegion = op.getRegion(0);
-      if (!thenRegion.empty())
-        thenFP = estimateBlockFootprintBytes(thenRegion.front(), cache,
-                                             callGraph);
-      if (op.getNumRegions() > 1) {
-        mlir::Region &elseRegion = op.getRegion(1);
-        if (!elseRegion.empty())
-          elseFP = estimateBlockFootprintBytes(elseRegion.front(), cache,
-                                               callGraph);
-      }
-      total += std::max(thenFP, elseFP);
-      continue;
-    }
-
-    // scf.while: body × default trip count.
-    if (mlir::isa<mlir::scf::WhileOp>(&op)) {
-      if (op.getNumRegions() > 1) {
-        mlir::Region &bodyRegion = op.getRegion(1);
-        if (!bodyRegion.empty()) {
-          int64_t bodyFP =
-              estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
-          total += bodyFP * kDefaultTripCount;
-        }
-      }
-      continue;
-    }
-
-    // Leaf op.
-    total += estimateOpFootprintBytes(&op, cache);
-  }
-
-  return total;
-}
-
-// ===== Intervening Footprint Estimation =====
-
-/// Find the ancestor of `op` that lives directly in `targetBlock`.
-/// Returns nullptr if `op` is not nested inside `targetBlock`.
-static mlir::Operation *findAncestorInBlock(mlir::Operation *op,
-                                            mlir::Block *targetBlock) {
-  mlir::Operation *current = op;
-  while (current) {
-    if (current->getBlock() == targetBlock)
-      return current;
-    current = current->getParentOp();
-  }
-  return nullptr;
-}
-
-/// Sum the footprint of ops strictly between `from` and `to` in the same block.
-/// Both must be in the same block; `from` must precede `to`.
-static int64_t sumFootprintBetween(mlir::Operation *from, mlir::Operation *to,
-                                   const CacheParams &cache,
-                                   const EnrichedCallGraph &callGraph) {
-  int64_t total = 0;
-  for (mlir::Operation *it = from->getNextNode(); it && it != to;
-       it = it->getNextNode()) {
-    // If the op has regions (loop, if, etc.), estimate its full footprint.
-    if (it->getNumRegions() > 0) {
-      // Loops.
-      if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(it)) {
-        mlir::Region &body = it->getRegion(0);
-        if (!body.empty()) {
-          int64_t bodyFP =
-              estimateBlockFootprintBytes(body.front(), cache, callGraph);
-          auto tc = estimateTripCount(it, callGraph);
-          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
-        }
-        continue;
-      }
-      // If/else.
-      if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(it)) {
-        int64_t thenFP = 0, elseFP = 0;
-        if (!it->getRegion(0).empty())
-          thenFP = estimateBlockFootprintBytes(it->getRegion(0).front(), cache,
-                                               callGraph);
-        if (it->getNumRegions() > 1 && !it->getRegion(1).empty())
-          elseFP = estimateBlockFootprintBytes(it->getRegion(1).front(), cache,
-                                               callGraph);
-        total += std::max(thenFP, elseFP);
-        continue;
-      }
-      // While.
-      if (mlir::isa<mlir::scf::WhileOp>(it)) {
-        if (it->getNumRegions() > 1 && !it->getRegion(1).empty()) {
-          int64_t bodyFP = estimateBlockFootprintBytes(
-              it->getRegion(1).front(), cache, callGraph);
-          total += bodyFP * kDefaultTripCount;
-        }
-        continue;
-      }
-      // Other region-bearing ops: sum all regions.
-      for (mlir::Region &region : it->getRegions())
-        if (!region.empty())
-          total +=
-              estimateBlockFootprintBytes(region.front(), cache, callGraph);
-      continue;
-    }
-    total += estimateOpFootprintBytes(it, cache);
-  }
-  return total;
-}
-
-/// Sum the footprint of all ops after `op` in its block.
-static int64_t sumFootprintAfter(mlir::Operation *op, const CacheParams &cache,
-                                 const EnrichedCallGraph &callGraph) {
-  // Use the block terminator as the sentinel.
-  mlir::Block *block = op->getBlock();
-  if (!block)
-    return 0;
-  return sumFootprintBetween(op, block->getTerminator(), cache, callGraph);
-}
-
-/// Sum the footprint of all ops before `op` in its block.
-static int64_t sumFootprintBefore(mlir::Operation *op,
-                                  const CacheParams &cache,
-                                  const EnrichedCallGraph &callGraph) {
-  mlir::Block *block = op->getBlock();
-  if (!block || block->empty())
-    return 0;
-  // Walk from the first op up to (but not including) `op`.
-  int64_t total = 0;
-  for (mlir::Operation &it : *block) {
-    if (&it == op)
-      break;
-    if (it.getNumRegions() > 0) {
-      if (mlir::isa<mlir::affine::AffineForOp, mlir::scf::ForOp>(&it)) {
-        mlir::Region &body = it.getRegion(0);
-        if (!body.empty()) {
-          int64_t bodyFP =
-              estimateBlockFootprintBytes(body.front(), cache, callGraph);
-          auto tc = estimateTripCount(&it, callGraph);
-          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
-        }
-        continue;
-      }
-      // Simplified: delegate to estimateBlockFootprintBytes for other regions.
-      for (mlir::Region &region : it.getRegions())
-        if (!region.empty())
-          total +=
-              estimateBlockFootprintBytes(region.front(), cache, callGraph);
-      continue;
-    }
-    total += estimateOpFootprintBytes(&it, cache);
-  }
-  return total;
-}
-
-/// Estimate the total memory footprint of operations between `storeOp` and
-/// `loadOp` in program order.  This is the "interjected" memory traffic that
-/// determines whether the stored value is still in cache when the load runs.
-static int64_t estimateInterveningFootprint(
-    mlir::Operation *storeOp, mlir::Operation *loadOp,
-    const CacheParams &cache, const EnrichedCallGraph &callGraph) {
-  // Case 0: different functions — conservative.
-  auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
-  auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
-  if (storeFn != loadFn)
-    return cache.l2Size;
-
-  mlir::Block *storeBlock = storeOp->getBlock();
-  mlir::Block *loadBlock = loadOp->getBlock();
-
-  // Case 1: same block.
-  if (storeBlock == loadBlock)
-    return sumFootprintBetween(storeOp, loadOp, cache, callGraph);
-
-  // Case 2: store is in a nested scope below load's block.
-  if (mlir::Operation *storeAnc =
-          findAncestorInBlock(storeOp, loadBlock)) {
-    int64_t fp = sumFootprintAfter(storeOp, cache, callGraph);
-    // Walk upward from store's block through enclosing scopes.
-    mlir::Operation *cur = storeOp->getParentOp();
-    while (cur && cur != storeAnc) {
-      mlir::Block *curBlock = cur->getBlock();
-      if (curBlock)
-        fp += sumFootprintAfter(cur, cache, callGraph);
-      cur = cur->getParentOp();
-    }
-    fp += sumFootprintBetween(storeAnc, loadOp, cache, callGraph);
-    return fp;
-  }
-
-  // Case 3: load is in a nested scope below store's block.
-  if (mlir::Operation *loadAnc =
-          findAncestorInBlock(loadOp, storeBlock)) {
-    int64_t fp = sumFootprintBetween(storeOp, loadAnc, cache, callGraph);
-    fp += sumFootprintBefore(loadOp, cache, callGraph);
-    // Walk upward from load's block through enclosing scopes.
-    mlir::Operation *cur = loadOp->getParentOp();
-    while (cur && cur != loadAnc) {
-      mlir::Block *curBlock = cur->getBlock();
-      if (curBlock)
-        fp += sumFootprintBefore(cur, cache, callGraph);
-      cur = cur->getParentOp();
-    }
-    return fp;
-  }
-
-  // Case 4: both in nested scopes — find common ancestor block.
-  // Walk store upward until we find a block that contains an ancestor of load.
-  for (mlir::Operation *sp = storeOp; sp; sp = sp->getParentOp()) {
-    mlir::Block *spBlock = sp->getBlock();
-    if (!spBlock)
-      continue;
-    mlir::Operation *loadAnc = findAncestorInBlock(loadOp, spBlock);
-    if (!loadAnc)
-      continue;
-    mlir::Operation *storeAnc = sp;
-    // Now storeAnc and loadAnc are both in spBlock.
-    int64_t fp = sumFootprintAfter(storeOp, cache, callGraph);
-    // Walk from store up to storeAnc.
-    mlir::Operation *cur = storeOp->getParentOp();
-    while (cur && cur != storeAnc) {
-      mlir::Block *curBlock = cur->getBlock();
-      if (curBlock)
-        fp += sumFootprintAfter(cur, cache, callGraph);
-      cur = cur->getParentOp();
-    }
-    fp += sumFootprintBetween(storeAnc, loadAnc, cache, callGraph);
-    // Walk from loadAnc down to load.
-    cur = loadOp->getParentOp();
-    while (cur && cur != loadAnc) {
-      mlir::Block *curBlock = cur->getBlock();
-      if (curBlock)
-        fp += sumFootprintBefore(cur, cache, callGraph);
-      cur = cur->getParentOp();
-    }
-    fp += sumFootprintBefore(loadOp, cache, callGraph);
-    return fp;
-  }
-
-  // Fallback: conservative.
-  return cache.l2Size;
-}
-
-/// Collect the memref values that the SSA operand tree of `val` loads from.
-/// These are the operands that would need to be re-loaded during recomputation.
-static void collectOperandMemrefs(
-    mlir::Value val,
-    llvm::SmallDenseSet<mlir::Value> &memrefs) {
-  llvm::SmallVector<mlir::Value, 8> worklist;
-  llvm::SmallDenseSet<mlir::Value> visited;
-  worklist.push_back(val);
-
-  while (!worklist.empty()) {
-    mlir::Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    if (mlir::isa<mlir::BlockArgument>(current))
-      continue;
-    mlir::Operation *defOp = current.getDefiningOp();
-    if (!defOp)
-      continue;
-
-    if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(defOp)) {
-      memrefs.insert(load.getMemRef());
-      continue;
-    }
-    if (auto load = mlir::dyn_cast<mlir::affine::AffineLoadOp>(defOp)) {
-      memrefs.insert(load.getMemRef());
-      continue;
-    }
-    if (mlir::isa<mlir::LLVM::LoadOp>(defOp))
-      continue; // can't extract memref from llvm.load
-
-    for (mlir::Value operand : defOp->getOperands())
-      worklist.push_back(operand);
-  }
-}
-
-/// Check whether any operation in the block range (from, to) in the same block
-/// accesses the given memref value.  Recurses into nested regions.
-static bool memrefAccessedInRange(mlir::Operation *from, mlir::Operation *to,
-                                  mlir::Value memref);
-
-/// Check whether a memref is accessed anywhere inside an operation's regions.
-static bool memrefAccessedInOp(mlir::Operation *op, mlir::Value memref) {
-  bool found = false;
-  op->walk([&](mlir::Operation *inner) {
-    if (found) return mlir::WalkResult::interrupt();
-    if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(inner)) {
-      if (load.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
-    } else if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(inner)) {
-      if (store.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
-    } else if (auto load = mlir::dyn_cast<mlir::affine::AffineLoadOp>(inner)) {
-      if (load.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
-    } else if (auto store = mlir::dyn_cast<mlir::affine::AffineStoreOp>(inner)) {
-      if (store.getMemRef() == memref) { found = true; return mlir::WalkResult::interrupt(); }
-    }
-    return mlir::WalkResult::advance();
-  });
-  return found;
-}
-
-static bool memrefAccessedInRange(mlir::Operation *from, mlir::Operation *to,
-                                  mlir::Value memref) {
-  for (mlir::Operation *it = from->getNextNode(); it && it != to;
-       it = it->getNextNode()) {
-    if (memrefAccessedInOp(it, memref))
-      return true;
-  }
-  return false;
-}
-
-/// Estimate the operand reload penalty for recomputation.
-///
-/// Walks the SSA operand tree of the stored value to find which memrefs
-/// recomputation would need to read.  For each, checks whether that memref
-/// is re-accessed in the intervening ops between store and load.  If it is,
-/// the operand is likely still in cache (warm); if not, the full intervening
-/// footprint applies and the operand may have been evicted.
-///
-/// Returns a per-element penalty in cycles that should be added to the
-/// recomputation cost.
-static unsigned estimateOperandReloadPenalty(
-    mlir::Value storedVal,
-    mlir::Operation *storeOp, mlir::Operation *loadOp,
-    int64_t storeToLoadFootprint,
-    const CacheParams &cache) {
-  // Collect memrefs needed by the recomputation chain.
-  llvm::SmallDenseSet<mlir::Value> operandMemrefs;
-  collectOperandMemrefs(storedVal, operandMemrefs);
-
-  if (operandMemrefs.empty())
-    return 0; // pure computation, no memory operands
-
-  // Check if store and load are in the same function (for range scanning).
-  auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
-  auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
-
-  unsigned totalPenalty = 0;
-  unsigned coldCount = 0;
-
-  for (mlir::Value memref : operandMemrefs) {
-    bool warm = false;
-
-    // If same function and same block, check the intervening range.
-    if (storeFn == loadFn && storeOp->getBlock() == loadOp->getBlock()) {
-      warm = memrefAccessedInRange(storeOp, loadOp, memref);
-    } else if (storeFn == loadFn) {
-      // Different blocks: check if the memref is accessed in the load's block
-      // before the load (most recent access).
-      mlir::Block *loadBlock = loadOp->getBlock();
-      if (loadBlock && !loadBlock->empty()) {
-        // Check ops before the load in its block.
-        for (mlir::Operation &it : *loadBlock) {
-          if (&it == loadOp) break;
-          if (memrefAccessedInOp(&it, memref)) {
-            warm = true;
-            break;
-          }
-        }
-      }
-    }
-    // Cross-function: conservatively assume cold.
-
-    if (!warm)
-      coldCount++;
-  }
-
-  if (coldCount == 0)
-    return 0; // all operands are warm
-
-  // For cold operands, estimate the reload cost based on intervening footprint.
-  // The penalty is the latency delta above L1 (since we assumed L1 in the base cost).
-  if (storeToLoadFootprint > (int64_t)cache.l1Size) {
-    unsigned evictedLatency = estimateLoadLatency(storeToLoadFootprint, cache);
-    unsigned delta = evictedLatency > cache.l1Latency
-                         ? evictedLatency - cache.l1Latency
-                         : 0;
-    // Scale by fraction of cold operands.
-    totalPenalty = (delta * coldCount) / operandMemrefs.size();
-  }
-
-  return totalPenalty;
-}
-
-/// Per-buffer materialization decision.
-struct MaterializationDecision {
-  bool recompute;              // true = eliminate buffer, false = keep it
-  unsigned aluCost;            // ALU cost to recompute one element
-  unsigned leafLoadCost;       // per-element cost of cloned partial leaf loads
-  unsigned loadLatency;        // estimated load latency (from cache model)
-  unsigned numConsumers;       // number of SINGLE loads from this buffer
-  int64_t bufferSizeBytes;
-  int64_t storeToLoadFootprint;   // intervening bytes between store and load
-  unsigned operandPenalty;        // per-element operand reload penalty (cycles)
-};
-
-/// Decide whether to recompute or keep a buffer.
-///
-/// With leafLoadCost = 0 and footprint analysis disabled this reduces to
-/// the original formula:
-///   keepCost      = aluCost + 1 + numConsumers × loadLatency
-///   recomputeCost = numConsumers × aluCost
-///
-/// With leafLoadCost > 0 (partial rematerialization), each recomputed
-/// element also pays the cost of re-issuing its cloned leaf loads.
-///
-/// When footprint analysis is on:
-///   - storeToLoadFootprint shifts the effective load latency (the buffer
-///     may have been evicted by intervening memory traffic).
-///   - operandPenalty (from estimateOperandReloadPenalty) accounts for the
-///     cost of re-fetching operands needed for recomputation, weighted by
-///     how many of those operands are still warm vs cold in cache.
-static MaterializationDecision
-decideBufferStrategy(unsigned aluCost, unsigned leafLoadCost,
-                     unsigned loadLatency, unsigned numConsumers,
-                     int64_t bufferSizeBytes, int64_t storeToLoadFootprint,
-                     unsigned operandPenalty, const CacheParams &cache) {
-  // Effective load latency: account for cache eviction from intervening traffic.
-  unsigned effectiveLoadLatency = loadLatency;
-  if (storeToLoadFootprint > 0) {
-    int64_t workingSet = bufferSizeBytes + storeToLoadFootprint;
-    effectiveLoadLatency = estimateLoadLatency(workingSet, cache);
-  }
-
-  unsigned keepCost = aluCost + 1 + numConsumers * effectiveLoadLatency;
-  unsigned recomputeCost =
-      numConsumers * (aluCost + leafLoadCost + operandPenalty);
-
-  bool recompute = recomputeCost <= keepCost;
-
-  return MaterializationDecision{recompute,        aluCost,
-                                 leafLoadCost,     effectiveLoadLatency,
-                                 numConsumers,    bufferSizeBytes,
-                                 storeToLoadFootprint, operandPenalty};
-}
-
-// Forward declaration; definition follows the partial-remat helpers below.
-static mlir::Operation *lookupAllocRoot(
-    mlir::Value memref,
-    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor);
-
-/// Return the induction variable of the innermost enclosing loop of op,
-/// or a null Value when op is not inside any affine/scf loop.
-static mlir::Value innermostEnclosingIV(mlir::Operation *op) {
-  mlir::Operation *parent = op ? op->getParentOp() : nullptr;
-  while (parent) {
-    if (auto f = mlir::dyn_cast<mlir::affine::AffineForOp>(parent))
-      return f.getInductionVar();
-    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(parent))
-      return f.getInductionVar();
-    parent = parent->getParentOp();
-  }
-  return {};
-}
-
-/// Return the linear coefficient of dim `pos` in an affine expression.
-/// Returns std::nullopt when the expression is not affine-linear in that
-/// dim (e.g. uses mod/div/floordiv/ceildiv or multiplies the dim by a
-/// non-constant).
-static std::optional<int64_t> affineLinearCoef(mlir::AffineExpr expr,
-                                               unsigned pos) {
-  if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(expr))
-    return (int64_t)0;
-  if (auto d = mlir::dyn_cast<mlir::AffineDimExpr>(expr))
-    return (d.getPosition() == pos) ? (int64_t)1 : (int64_t)0;
-  if (mlir::isa<mlir::AffineSymbolExpr>(expr))
-    return (int64_t)0;
-  auto bin = mlir::dyn_cast<mlir::AffineBinaryOpExpr>(expr);
-  if (!bin)
-    return std::nullopt;
-  auto lhs = affineLinearCoef(bin.getLHS(), pos);
-  auto rhs = affineLinearCoef(bin.getRHS(), pos);
-  if (!lhs || !rhs)
-    return std::nullopt;
-  switch (bin.getKind()) {
-  case mlir::AffineExprKind::Add:
-    return *lhs + *rhs;
-  case mlir::AffineExprKind::Mul: {
-    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getLHS()))
-      return c.getValue() * *rhs;
-    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getRHS()))
-      return *lhs * c.getValue();
-    return std::nullopt;
-  }
-  default:
-    return std::nullopt; // mod/floordiv/ceildiv
-  }
-}
-
-/// Return true when value `v` transitively depends on `iv`.  Walks defining
-/// ops; stops on block arguments (other than `iv` itself).
-static bool dependsOnValue(mlir::Value v, mlir::Value iv) {
-  if (!v || !iv)
-    return false;
-  llvm::SmallVector<mlir::Value, 8> worklist;
-  llvm::SmallDenseSet<mlir::Value> visited;
-  worklist.push_back(v);
-  while (!worklist.empty()) {
-    mlir::Value cur = worklist.pop_back_val();
-    if (!visited.insert(cur).second)
-      continue;
-    if (cur == iv)
-      return true;
-    mlir::Operation *defOp = cur.getDefiningOp();
-    if (!defOp)
-      continue;
-    for (mlir::Value o : defOp->getOperands())
-      worklist.push_back(o);
-  }
-  return false;
-}
-
-/// Estimate the per-iteration access stride (in elements) of a load/store
-/// access relative to the induction variable `iv`.  Returns:
-///   - 0 when the access is invariant in iv (same address every iteration).
-///   - a positive integer when the stride is statically determinable.
-///   - std::nullopt when the stride cannot be determined; callers should
-///     treat this as pessimistically full-cache-line.
-/// Handles both memref.load/store and affine.load/store.
-static std::optional<int64_t>
-estimateAccessStrideElements(mlir::Operation *accessOp, mlir::Value iv) {
-  if (!accessOp || !iv)
-    return std::nullopt;
-
-  mlir::MemRefType memrefTy;
-  mlir::ValueRange rawIndices;
-  mlir::AffineMap map;
-  mlir::ValueRange mapOperands;
-
-  if (auto op = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp)) {
-    memrefTy = op.getMemRefType();
-    rawIndices = op.getIndices();
-  } else if (auto op = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp)) {
-    memrefTy = op.getMemRefType();
-    rawIndices = op.getIndices();
-  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp)) {
-    memrefTy = op.getMemRefType();
-    map = op.getAffineMap();
-    mapOperands = op.getMapOperands();
-  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp)) {
-    memrefTy = op.getMemRefType();
-    map = op.getAffineMap();
-    mapOperands = op.getMapOperands();
-  } else {
-    return std::nullopt;
-  }
-
-  unsigned rank = memrefTy.getRank();
-  if (rank == 0)
-    return (int64_t)0; // scalar memref: always same address
-
-  llvm::ArrayRef<int64_t> shape = memrefTy.getShape();
-  // Trailing-dim-product for each dim gives the element stride that a
-  // coefficient of 1 in that dim contributes (row-major).
-  llvm::SmallVector<int64_t, 4> trailing(rank, 1);
-  for (int i = (int)rank - 2; i >= 0; --i) {
-    if (shape[i + 1] < 0)
-      return std::nullopt; // dynamic trailing dim
-    trailing[i] = trailing[i + 1] * shape[i + 1];
-  }
-
-  int64_t totalStride = 0;
-
-  if (map) {
-    // affine.load/store: analyze each result expression.
-    int ivPos = -1;
-    for (unsigned i = 0; i < mapOperands.size(); ++i) {
-      if (mapOperands[i] == iv) {
-        ivPos = (int)i;
-        break;
-      }
-    }
-    if (ivPos < 0)
-      return (int64_t)0; // iv not among the map operands
-
-    // In MLIR, affine map operands are laid out as [dims..., symbols...].
-    // AffineDimExpr positions reference the dim portion. If the iv is
-    // passed as a symbol, treat as unknown.
-    unsigned numDims = map.getNumDims();
-    if ((unsigned)ivPos >= numDims)
-      return std::nullopt;
-
-    for (unsigned i = 0; i < rank; ++i) {
-      auto coef = affineLinearCoef(map.getResult(i), (unsigned)ivPos);
-      if (!coef)
-        return std::nullopt;
-      totalStride += *coef * trailing[i];
-    }
-  } else {
-    // memref.load/store: inspect each index.
-    for (unsigned i = 0; i < rank; ++i) {
-      mlir::Value idx = rawIndices[i];
-      if (idx == iv) {
-        totalStride += trailing[i];
-        continue;
-      }
-      if (!dependsOnValue(idx, iv))
-        continue; // invariant in this dim
-      // Simple pattern: idx = iv * c  or  iv * c + k  (linear integer
-      // arithmetic via arith.muli/addi).  Walk and try to extract a
-      // constant coefficient; bail out otherwise.
-      std::function<std::optional<int64_t>(mlir::Value)> coefOf =
-          [&](mlir::Value v) -> std::optional<int64_t> {
-        if (v == iv)
-          return (int64_t)1;
-        if (!dependsOnValue(v, iv))
-          return (int64_t)0;
-        mlir::Operation *d = v.getDefiningOp();
-        if (!d)
-          return std::nullopt;
-        if (mlir::isa<mlir::arith::AddIOp>(d)) {
-          auto lhs = coefOf(d->getOperand(0));
-          auto rhs = coefOf(d->getOperand(1));
-          if (!lhs || !rhs)
-            return std::nullopt;
-          return *lhs + *rhs;
-        }
-        if (mlir::isa<mlir::arith::MulIOp>(d)) {
-          auto getConst = [](mlir::Value x) -> std::optional<int64_t> {
-            auto *dx = x.getDefiningOp();
-            if (!dx)
-              return std::nullopt;
-            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(dx))
-              return (int64_t)c.value();
-            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(dx))
-              return (int64_t)c.value();
-            return std::nullopt;
-          };
-          auto c0 = getConst(d->getOperand(0));
-          auto c1 = getConst(d->getOperand(1));
-          if (c0) {
-            auto r = coefOf(d->getOperand(1));
-            if (!r)
-              return std::nullopt;
-            return *c0 * *r;
-          }
-          if (c1) {
-            auto l = coefOf(d->getOperand(0));
-            if (!l)
-              return std::nullopt;
-            return *l * *c1;
-          }
-          return std::nullopt;
-        }
-        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(d))
-          return coefOf(cast.getOperand());
-        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastUIOp>(d))
-          return coefOf(cast.getOperand());
-        return std::nullopt;
-      };
-      auto c = coefOf(idx);
-      if (!c)
-        return std::nullopt;
-      totalStride += *c * trailing[i];
-    }
-  }
-
-  // Normalize: negative strides access in reverse but still touch one line
-  // per iteration conservatively; use magnitude.
-  if (totalStride < 0)
-    totalStride = -totalStride;
-  return totalStride;
-}
-
-/// Return the element size (bytes) of a load/store op's memref.
-static unsigned accessElementBytes(mlir::Operation *accessOp) {
-  mlir::Type elemTy;
-  if (auto o = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp))
-    elemTy = o.getMemRefType().getElementType();
-  else if (auto o = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp))
-    elemTy = o.getMemRefType().getElementType();
-  else if (auto o = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp))
-    elemTy = o.getMemRefType().getElementType();
-  else if (auto o = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp))
-    elemTy = o.getMemRefType().getElementType();
-  if (!elemTy || !elemTy.isIntOrFloat())
-    return 8; // conservative
-  unsigned bits = elemTy.getIntOrFloatBitWidth();
-  return bits > 0 ? bits / 8 : 8;
-}
-
-/// Stride-aware per-issuance cost for a load/store at its current (or
-/// intended) site.  Scales the cold-miss latency by the fraction of a
-/// cache line touched per iteration of the innermost enclosing loop at
-/// `siteOp`:
-///
-///   effBytes = min(cacheLine, stride*elemSize + 1)
-///   cost     = ceil(missLatency * effBytes / cacheLine)
-///
-/// The `+1` pessimizes unaligned strided access that may straddle a line
-/// boundary.  When there is no enclosing loop, or the stride cannot be
-/// determined, the full miss latency is charged.
-static unsigned estimateAccessLatency(mlir::Operation *accessOp,
-                                      mlir::Operation *siteOp,
-                                      int64_t bufferBytes,
-                                      const CacheParams &cache) {
-  unsigned missLat = estimateLoadLatency(bufferBytes, cache);
-  unsigned cacheLine = cache.cacheLineSize ? cache.cacheLineSize : 64;
-
-  mlir::Value iv = innermostEnclosingIV(siteOp ? siteOp : accessOp);
-  if (!iv)
-    return missLat; // one-shot: charge a full cold miss.
-
-  auto strideOpt = estimateAccessStrideElements(accessOp, iv);
-  if (!strideOpt)
-    return missLat; // unknown stride → pessimize as full line per iter.
-
-  unsigned elemBytes = accessElementBytes(accessOp);
-  uint64_t strideBytes = (uint64_t)(*strideOpt) * elemBytes + 1;
-  uint64_t effBytes = std::min<uint64_t>(cacheLine, strideBytes);
-  uint64_t num = (uint64_t)missLat * effBytes;
-  unsigned scaled = (unsigned)((num + cacheLine - 1) / cacheLine);
-  return scaled ? scaled : 1; // at least 1 cycle of cost.
-}
-
-/// Estimate the per-issuance cost of the partial-leaf loads cloned during
-/// partial rematerialization.  Each leaf is priced against its buffer-size
-/// cache tier and scaled by stride-aware cache-line amortization relative
-/// to the innermost enclosing loop of `insertionPoint` (where the clones
-/// will execute).
-static unsigned
-estimateLeafLoadsCost(llvm::ArrayRef<mlir::Operation *> partialLeaves,
-                      mlir::Operation *insertionPoint,
-                      const CacheParams &cache,
-                      llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
-  unsigned total = 0;
-  for (mlir::Operation *leaf : partialLeaves) {
-    mlir::Value memref;
-    if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(leaf))
-      memref = l.getMemRef();
-    else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(leaf))
-      memref = l.getMemRef();
-    if (!memref) {
-      total += cache.memLatency;
-      continue;
-    }
-    mlir::Operation *root = lookupAllocRoot(memref, allocRootFor);
-    int64_t sizeBytes = cache.l2Size + 1; // conservative if unknown
-    if (root) {
-      if (auto bs = estimateBufferSizeBytes(root))
-        sizeBytes = *bs;
-    }
-    total += estimateAccessLatency(leaf, insertionPoint, sizeBytes, cache);
-  }
-  return total;
-}
-
-/// Maximum number of load→store chains to follow during rematerialization.
-constexpr unsigned kMaxChainDepth = 8;
-
-/// Maximum number of ops that may be cloned for a single rematerialization.
-/// Prevents blowup on deeply chained arithmetic (e.g. SHA-256 rounds).
-constexpr unsigned kMaxRematOps = 64;
-
-/// Per-allocation-root write summary used by partial rematerialization.
-///
-/// writeCount: number of distinct memref/affine store ops whose base traces
-/// back to the root. A value > 1 makes the root ineligible for partial remat
-/// (we cannot prove re-reading yields the same value without tracking
-/// per-index coverage).
-///
-/// singleWriter: the one store op when writeCount == 1. Used to verify the
-/// writer dominates the partial remat insertion point.
-///
-/// escapesToCall: true if the root's memref (or a view of it) is passed to
-/// any call in the function. Escaping roots cannot be treated as write-once
-/// because an external callee may mutate them.
-struct RootWriteSummary {
-  unsigned writeCount = 0;
-  mlir::Operation *singleWriter = nullptr;
-  bool escapesToCall = false;
-};
-
-using RootWriteMap = llvm::DenseMap<mlir::Operation *, RootWriteSummary>;
-
-/// Build a write summary per allocation root, covering every function in the
-/// module. Stores are attributed to roots by tracing their memref through
-/// view-like ops via collectBaseMemrefs.
-static RootWriteMap
-buildRootWriteMap(mlir::ModuleOp moduleOp,
-                  llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
-  RootWriteMap result;
-
-  auto attribute = [&](mlir::Value memref, mlir::Operation *storeOp) {
-    llvm::SmallVector<mlir::Value, 2> bases;
-    collectBaseMemrefs(memref, allocRootFor, bases);
-    llvm::SmallDenseSet<mlir::Operation *, 2> attributedRoots;
-    for (mlir::Value base : bases) {
-      auto it = allocRootFor.find(base);
-      if (it == allocRootFor.end())
-        continue;
-      if (!attributedRoots.insert(it->second).second)
-        continue;
-      auto &summary = result[it->second];
-      summary.writeCount++;
-      summary.singleWriter = (summary.writeCount == 1) ? storeOp : nullptr;
-    }
-  };
-
-  moduleOp.walk([&](mlir::Operation *op) {
-    if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(op))
-      attribute(store.getMemRef(), op);
-    else if (auto store = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op))
-      attribute(store.getMemRef(), op);
-    else if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
-      for (mlir::Value operand : call->getOperands()) {
-        if (!mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
-                operand.getType()))
-          continue;
-        llvm::SmallVector<mlir::Value, 2> bases;
-        collectBaseMemrefs(operand, allocRootFor, bases);
-        for (mlir::Value base : bases) {
-          auto it = allocRootFor.find(base);
-          if (it != allocRootFor.end())
-            result[it->second].escapesToCall = true;
-        }
-      }
-    }
-  });
-
-  return result;
-}
-
-/// Look up an allocation root for a load-like op's memref value. Traces
-/// through view-like casts so subview/cast users resolve to their root.
-static mlir::Operation *lookupAllocRoot(
-    mlir::Value memref,
-    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor) {
-  auto it = allocRootFor.find(memref);
-  if (it != allocRootFor.end())
-    return it->second;
-  llvm::SmallVector<mlir::Value, 2> bases;
-  collectBaseMemrefs(memref, allocRootFor, bases);
-  for (mlir::Value base : bases) {
-    auto it2 = allocRootFor.find(base);
-    if (it2 != allocRootFor.end())
-      return it2->second;
-  }
-  return nullptr;
-}
-
-/// Validate that an SSA value used by a partial leaf load is available at
-/// insertionPoint. Mirrors the block-arg/dominance checks in
-/// isRematerializable.
-static bool isValueAvailableAt(mlir::Value operand,
-                               mlir::Operation *insertionPoint,
-                               mlir::DominanceInfo &domInfo,
-                               const mlir::IRMapping *argMapping) {
-  if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
-    if (argMapping) {
-      mlir::Block *block = blockArg.getOwner();
-      bool isEntryArg = block && block->isEntryBlock() &&
-                        mlir::isa_and_nonnull<mlir::FunctionOpInterface>(
-                            block->getParentOp());
-      if (!isEntryArg)
-        return false;
-      if (!argMapping->contains(blockArg))
-        return false;
-      return domInfo.dominates(argMapping->lookup(blockArg), insertionPoint);
-    }
-    return domInfo.dominates(operand, insertionPoint);
-  }
-  mlir::Operation *defOp = operand.getDefiningOp();
-  if (!defOp)
-    return false;
-  return domInfo.properlyDominates(defOp, insertionPoint);
-}
-
-/// Returns true if the writer's execution is guaranteed to have completed
-/// by the time control reaches insertionPoint. MLIR's DominanceInfo is
-/// conservative about ops inside loops/branches; we walk up the ancestor
-/// chain until we find a common-region ancestor and check sequential
-/// ordering there.
-///
-/// This is sound for partial rematerialization because the pass only
-/// considers replacing loads that the original program actually executed
-/// (SINGLE-provenance loads reaching insertionPoint) — if the writer is
-/// statically reachable and we observe the downstream load firing, any
-/// in-loop or in-branch wrapping of the writer must also have fired.
-static bool writerReachesInsertionPoint(mlir::Operation *writer,
-                                        mlir::Operation *insertionPoint) {
-  // Find the nearest enclosing block common to both writer and the
-  // insertion point, then compare the isBeforeInBlock order of the
-  // ancestor of `writer` against the ancestor of `insertionPoint` at
-  // that level.  This handles the case where the IP is in a deeper
-  // nested region than the writer (e.g. writer in a sibling top-level
-  // loop, IP inside a later loop body).
-  for (mlir::Operation *ipAncestor = insertionPoint; ipAncestor;
-       ipAncestor = ipAncestor->getParentOp()) {
-    mlir::Block *ipBlock = ipAncestor->getBlock();
-    if (!ipBlock)
-      return false;
-    mlir::Operation *wAncestor = writer;
-    while (wAncestor && wAncestor->getBlock() != ipBlock)
-      wAncestor = wAncestor->getParentOp();
-    if (wAncestor)
-      return wAncestor->isBeforeInBlock(ipAncestor);
-  }
-  return false;
-}
-
-/// Why a partial leaf candidate was rejected. Consumed by diagnostics.
-enum class PartialLeafReject {
-  None,
-  NoAllocRoot,
-  AllocaOutOfScope,
-  Escapes,
-  MultiWrite,
-  WriterDoesNotDominate,
-  OperandNotLive,
-};
-
-/// Determine whether a non-chainable leaf load can be safely re-issued at
-/// insertionPoint. A safe leaf's clone reads the same memref cell as the
-/// original load did. See plan §3 for the write-once proxy rationale.
-static bool isSafeLeafAt(
-    mlir::Operation *loadOp, mlir::Operation *insertionPoint,
-    mlir::DominanceInfo &domInfo,
-    const mlir::IRMapping *argMapping,
-    llvm::DenseMap<mlir::Value, mlir::Operation *> &allocRootFor,
-    const RootWriteMap &rootWrites,
-    PartialLeafReject &reject) {
-  reject = PartialLeafReject::None;
-
-  mlir::Value memref;
-  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(loadOp))
-    memref = l.getMemRef();
-  else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(loadOp))
-    memref = l.getMemRef();
-  if (!memref)
-    return false;
-
-  mlir::Operation *root = lookupAllocRoot(memref, allocRootFor);
-  if (!root) {
-    reject = PartialLeafReject::NoAllocRoot;
-    return false;
-  }
-
-  // Scoped alloca: the alloca's parent region must enclose insertionPoint.
-  if (mlir::isa<mlir::memref::AllocaOp>(root)) {
-    mlir::Region *allocRegion = root->getParentRegion();
-    mlir::Region *ipRegion = insertionPoint->getParentRegion();
-    if (!allocRegion || !ipRegion || !allocRegion->isAncestor(ipRegion)) {
-      reject = PartialLeafReject::AllocaOutOfScope;
-      return false;
-    }
-  }
-
-  auto it = rootWrites.find(root);
-  if (it == rootWrites.end()) {
-    reject = PartialLeafReject::MultiWrite;
-    return false;
-  }
-  const RootWriteSummary &summary = it->second;
-  if (summary.escapesToCall) {
-    reject = PartialLeafReject::Escapes;
-    return false;
-  }
-  if (summary.writeCount != 1 || !summary.singleWriter) {
-    reject = PartialLeafReject::MultiWrite;
-    return false;
-  }
-  if (!writerReachesInsertionPoint(summary.singleWriter, insertionPoint)) {
-    reject = PartialLeafReject::WriterDoesNotDominate;
-    return false;
-  }
-  // S2-A: block-order reachability accepts a writer wrapped in a
-  // conditional (scf.if / affine.if) because the conditional itself
-  // sits before insertionPoint -- but the writer may never have fired
-  // if the condition was false.  Reject if any ancestor between the
-  // writer and the common-block level is a conditional region op.
-  // Loops are still accepted; S1-A's join-lattice sentinel ensures a
-  // may-zero loop yields LEAKED rather than SINGLE upstream.
-  {
-    for (mlir::Operation *ipAnc = insertionPoint; ipAnc;
-         ipAnc = ipAnc->getParentOp()) {
-      mlir::Operation *wAnc = summary.singleWriter;
-      while (wAnc && wAnc->getBlock() != ipAnc->getBlock())
-        wAnc = wAnc->getParentOp();
-      if (wAnc) {
-        for (mlir::Operation *cur = summary.singleWriter->getParentOp();
-             cur; cur = cur->getParentOp()) {
-          if (mlir::isa<mlir::scf::IfOp, mlir::affine::AffineIfOp>(cur)) {
-            reject = PartialLeafReject::WriterDoesNotDominate;
-            return false;
-          }
-          if (cur == wAnc)
-            break;
-        }
-        break;
-      }
-    }
-  }
-  (void)domInfo;
-
-  // Every operand of the leaf load (including memref and indices/map operands)
-  // must be available at insertionPoint.
-  for (mlir::Value operand : loadOp->getOperands()) {
-    if (!isValueAvailableAt(operand, insertionPoint, domInfo, argMapping)) {
-      reject = PartialLeafReject::OperandNotLive;
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/// Checks whether the SSA operand tree rooted at rootVal can be cloned
-/// (rematerialized) just before insertionPoint.
-///
-/// argMapping: optional mapping from callee entry block arguments to caller
-/// values (for interprocedural use).
-///
-/// loadProv: if non-null, enables chaining through SINGLE-provenance loads.
-/// When the operand tree encounters a memref.load whose provenance is SINGLE,
-/// the load is substituted with the unique store's value and recursion
-/// continues into that value's operand tree.
-///
-/// loadSubs: output pairs of (loadResult, storeValue) for each load that was
-/// chained through. Used by rematerializeAt to wire up the substitutions.
-///
-/// On success, opsToClone is filled in topological (def-before-use) order.
-/// Options controlling the partial-rematerialization path in
-/// isRematerializable. When enabled, non-chainable leaf loads may be
-/// cloned verbatim if isSafeLeafAt accepts them and the leaf budget
-/// has room.
-struct PartialRematOpts {
-  bool allow = false;
-  unsigned maxLeaves = 0;
-  llvm::DenseMap<mlir::Value, mlir::Operation *> *allocRootFor = nullptr;
-  const RootWriteMap *rootWrites = nullptr;
-  llvm::SmallVectorImpl<mlir::Operation *> *leaves = nullptr;
-  PartialLeafReject lastReject = PartialLeafReject::None;
-};
-
-static bool isRematerializable(
-    mlir::Value rootVal, mlir::Operation *insertionPoint,
-    mlir::DominanceInfo &domInfo,
-    llvm::SmallVectorImpl<mlir::Operation *> &opsToClone,
-    const mlir::IRMapping *argMapping = nullptr,
-    const LoadProvenanceMap *loadProv = nullptr,
-    llvm::SmallVectorImpl<std::pair<mlir::Value, mlir::Value>> *loadSubs =
-        nullptr,
-    PartialRematOpts *partial = nullptr) {
-  opsToClone.clear();
-  llvm::SmallVector<mlir::Value, 8> worklist;
-  llvm::SmallDenseSet<mlir::Value> visited;
-  llvm::SmallDenseSet<mlir::Operation *> added;
-  unsigned chainDepth = 0;
-  worklist.push_back(rootVal);
-
-  while (!worklist.empty()) {
-    mlir::Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-
-    // Block argument: check dominance (possibly through argMapping).
-    if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(current)) {
-      if (argMapping) {
-        // Interprocedural: check if this is an entry block arg of a function.
-        mlir::Block *block = blockArg.getOwner();
-        bool isEntryArg =
-            block && block->isEntryBlock() &&
-            mlir::isa_and_nonnull<mlir::FunctionOpInterface>(
-                block->getParentOp());
-        if (!isEntryArg)
-          return false; // Loop IV or similar — not available in caller.
-        if (!argMapping->contains(blockArg))
-          return false; // Unmapped argument.
-        mlir::Value mapped = argMapping->lookup(blockArg);
-        if (!domInfo.dominates(mapped, insertionPoint))
-          return false;
-      } else {
-        if (!domInfo.dominates(current, insertionPoint))
-          return false;
-      }
-      continue;
-    }
-
-    mlir::Operation *defOp = current.getDefiningOp();
-    if (!defOp)
-      return false;
-
-    // Special case: handle memref.load / affine.load.
-    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(defOp)) {
-      // Partial mode: prefer cloning as a partial leaf (no recursion into
-      // the load's upstream store value). This lets the pass rematerialize
-      // expressions whose chain would otherwise dead-end at a non-chainable
-      // inner load — Strategy 2 already tried the full chain path.
-      if (partial && partial->allow && partial->leaves &&
-          partial->rootWrites && partial->allocRootFor) {
-        if (partial->leaves->size() >= partial->maxLeaves)
-          return false;
-        PartialLeafReject why = PartialLeafReject::None;
-        if (isSafeLeafAt(defOp, insertionPoint, domInfo, argMapping,
-                         *partial->allocRootFor, *partial->rootWrites, why)) {
-          if (added.insert(defOp).second)
-            opsToClone.push_back(defOp);
-          partial->leaves->push_back(defOp);
-          continue;
-        }
-        partial->lastReject = why;
-        // Fall through to chain path as a last resort.
-      }
-
-      // Strict-chain path: chain through SINGLE-provenance loads only.
-      if (loadProv && loadSubs && chainDepth < kMaxChainDepth) {
-        auto provIt = loadProv->find(defOp);
-        if (provIt != loadProv->end()) {
-          const auto &provSet = provIt->second;
-          if (provSet.size() == 1 && !provSet.contains(nullptr)) {
-            auto *uniqueStore = *provSet.begin();
-            mlir::Value chainedVal = getStoredValue(uniqueStore);
-            if (chainedVal) {
-              loadSubs->push_back({defOp->getResult(0), chainedVal});
-              worklist.push_back(chainedVal);
-              ++chainDepth;
-              continue;
-            }
-          }
-        }
-      }
-      // Not SINGLE, not resolvable, or depth exceeded.
-      return false;
-    }
-
-    // Reject ops with memory effects or calls.
-    if (!mlir::isMemoryEffectFree(defOp))
-      return false;
-    if (mlir::isa<mlir::CallOpInterface>(defOp))
-      return false;
-
-    // Leaf op (no operands): e.g., constants.
-    if (defOp->getNumOperands() == 0) {
-      if (added.insert(defOp).second)
-        opsToClone.push_back(defOp);
-      continue;
-    }
-
-    // Interior op: add and recurse into operands.
-    if (added.insert(defOp).second) {
-      opsToClone.push_back(defOp);
-      if (opsToClone.size() > kMaxRematOps)
-        return false;
-    }
-    for (mlir::Value operand : defOp->getOperands())
-      worklist.push_back(operand);
-  }
-
-  // Reverse for topological order (defs before uses).
-  std::reverse(opsToClone.begin(), opsToClone.end());
-  return true;
-}
-
-/// Clone the ops in opsToClone at insertionPoint and return the rematerialized
-/// value corresponding to originalVal.
-///
-/// loadSubs: pairs of (loadResult, storeValue) from isRematerializable.
-/// Each load result is mapped to the (possibly cloned) store value so that
-/// downstream cloned ops see the substituted value instead of the load.
-static mlir::Value rematerializeAt(
-    mlir::Value originalVal, mlir::Operation *insertionPoint,
-    llvm::ArrayRef<mlir::Operation *> opsToClone,
-    const mlir::IRMapping *argMapping = nullptr,
-    llvm::ArrayRef<std::pair<mlir::Value, mlir::Value>> loadSubs = {}) {
-  mlir::OpBuilder builder(insertionPoint);
-  mlir::IRMapping mapping;
-  if (argMapping) {
-    // Copy callee-arg → caller-value mappings.
-    for (auto &[from, to] :
-         llvm::make_range(argMapping->getValueMap().begin(),
-                          argMapping->getValueMap().end()))
-      mapping.map(from, to);
-  }
-  for (mlir::Operation *op : opsToClone) {
-    // Eagerly resolve load substitutions whose store value is now available.
-    for (auto &[loadResult, storeValue] : loadSubs) {
-      if (!mapping.contains(loadResult)) {
-        mlir::Value resolved = mapping.lookupOrDefault(storeValue);
-        if (resolved != storeValue || !storeValue.getDefiningOp()) {
-          // storeValue was cloned or is a dominating value — resolve now.
-          mapping.map(loadResult, resolved);
-        }
-      }
-    }
-    builder.clone(*op, mapping);
-  }
-  // Final pass: resolve any loadSubs for dominating values not in opsToClone.
-  for (auto &[loadResult, storeValue] : loadSubs) {
-    if (!mapping.contains(loadResult))
-      mapping.map(loadResult, mapping.lookupOrDefault(storeValue));
-  }
-  return mapping.lookupOrDefault(originalVal);
-}
 
 // ===== Pass Class =====
 
@@ -2591,823 +1315,17 @@ private:
 
 } // namespace
 
-// ===== Strategy 4: Cross-function ordered recomputation =====
-//
-// Triggers when a SINGLE load L in reader R reads a global G whose unique
-// reaching store S lives in a different function W, AND there exists a
-// caller C in which the call to W strictly precedes the call to R, with no
-// intervening writer to G. Recompute S's stored value at C and substitute
-// it for L inside R.
-//
-// Two rewrite modes:
-//   (a) IN-PLACE: R is private and has exactly one call site (the
-//       conforming one). Mutate R's signature in place.
-//   (b) SPECIALIZE: clone R into a private R'; rewrite only conforming
-//       call sites to call R'. Original R retained for non-conforming
-//       callers.
-
-namespace {
-
-struct CrossFnRematPlan;
-
-/// Recursive sub-plan record: an inner memref.load whose hoist-path failed
-/// is substituted with a sub-plan that materializes the inner store's
-/// value at the outer caller, anchored just-after a separately-resolved
-/// inner-writer-call. (Strategy D — chained loads.)
-struct LoadSubRecord {
-  mlir::Operation *loadOp = nullptr;       // the inner load in writer body
-  mlir::Operation *innerStoreOp = nullptr; // S_inner
-  mlir::Operation *innerGlobalOp = nullptr;// G_inner (the memref::GlobalOp)
-  mlir::FunctionOpInterface innerWriterFn{};
-  std::unique_ptr<CrossFnRematPlan> subPlan;
-
-  LoadSubRecord();
-  LoadSubRecord(LoadSubRecord &&) noexcept;
-  LoadSubRecord &operator=(LoadSubRecord &&) noexcept;
-  ~LoadSubRecord();
-};
-
-/// Loop-cloning materialization record (Strategy F — loop-bounded stores).
-/// When set, materialization clones a loop nest (writing to a scratch
-/// buffer at the caller) instead of cloning a straight-line expression
-/// tree. The reader's matching loads of the original global are redirected
-/// to load from the scratch buffer.
-struct LoopMatRecord {
-  mlir::Operation *outerLoopOp = nullptr;  // outermost scf.for/affine.for to clone
-  mlir::Operation *storeOp = nullptr;      // targeted store within the loop body
-  mlir::Operation *globalOp = nullptr;     // base memref::GlobalOp the store writes
-  mlir::Operation *getGlobalOp = nullptr;  // the get_global op inside the writer
-  bool boundsAreStatic = false;
-};
-
-struct CrossFnRematPlan {
-  /// Ops to clone, topologically ordered (defs before uses).
-  llvm::SmallVector<mlir::Operation *, 4> opsToClone;
-  /// Block-args of the writer function that the cloned expression depends on.
-  /// Each appears at the position they should be substituted at the caller.
-  llvm::SmallVector<mlir::BlockArgument, 4> writerArgs;
-  /// Globals read by hoisted memref.load ops in opsToClone. The caller must
-  /// have NO writers to these globals reachable in its static call subtree
-  /// between the materialization point and the writer call (verified by
-  /// the driver before accepting the plan for a given caller).
-  llvm::SmallVector<mlir::Operation *, 4> hoistedLoadGlobals;
-  /// Strategy D — per-load substitution records. The substituted load is
-  /// NOT cloned; its result is mapped to the sub-plan's materialized value.
-  llvm::SmallVector<LoadSubRecord, 2> loadSubs;
-  /// Strategy F — when set, materializeAtCaller clones a loop nest into a
-  /// scratch buffer and returns the scratch memref instead of a scalar.
-  std::optional<LoopMatRecord> loopMat;
-  /// The writer's original stored value (root of the operand tree). For
-  /// loop-mat plans this is the storeOp's stored value (used downstream
-  /// for type checks).
-  mlir::Value rootValue;
-};
-
-LoadSubRecord::LoadSubRecord() = default;
-LoadSubRecord::LoadSubRecord(LoadSubRecord &&) noexcept = default;
-LoadSubRecord &
-LoadSubRecord::operator=(LoadSubRecord &&) noexcept = default;
-LoadSubRecord::~LoadSubRecord() = default;
-
-/// Recursion cap for chained sub-plans (Strategy D).
-constexpr unsigned kMaxCrossFnChainDepth = 3;
-
-/// Trace memref operand back to a memref.get_global op, accepting only the
-/// trivial chain memref.get_global → load. Returns nullptr if not such a
-/// trivial chain (e.g. through subview, cast, function arg).
-static mlir::Operation *traceLoadToGlobal(mlir::Value memref) {
-  if (auto getGlobal =
-          mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(memref.getDefiningOp()))
-    return getGlobal.getOperation();
-  return nullptr;
-}
-
-/// Resolve a get_global op to its memref::GlobalOp definition.
-static mlir::Operation *
-resolveGetGlobal(mlir::Operation *getGlobalOp, mlir::ModuleOp moduleOp) {
-  auto gg = mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(getGlobalOp);
-  if (!gg) return nullptr;
-  return mlir::SymbolTable::lookupNearestSymbolFrom(moduleOp,
-                                                    gg.getNameAttr());
-}
-
-/// Helper: extract the memref operand of a load op (memref/affine).
-static mlir::Value getLoadMemref(mlir::Operation *def) {
-  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(def))
-    return l.getMemref();
-  if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(def))
-    return l.getMemref();
-  return nullptr;
-}
-
-/// Forward decl: the unified entry point. depth and seenStores guard
-/// recursion (Strategy D).
-static bool buildCrossFunctionRematPlan(
-    mlir::Operation *storeOp,
-    mlir::FunctionOpInterface writerFn,
-    AllocationRoots &allocRootFor,
-    LoadProvenanceMap &loadProv,
-    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-        fnWritesGlobal,
-    CrossFnRematPlan &plan,
-    unsigned depth,
-    llvm::SmallDenseSet<mlir::Operation *> seenStores);
-
-/// Find the outermost scf.for / affine.for ancestor of \p op that is
-/// nested inside \p funcOp. Returns nullptr if op is at the top level of
-/// funcOp or not under any supported loop.
-static mlir::Operation *
-findOutermostEnclosingLoop(mlir::Operation *op,
-                           mlir::FunctionOpInterface funcOp) {
-  mlir::Operation *outer = nullptr;
-  mlir::Operation *cur = op->getParentOp();
-  while (cur && cur != funcOp.getOperation()) {
-    if (mlir::isa<mlir::scf::ForOp, mlir::affine::AffineForOp>(cur))
-      outer = cur;
-    else if (!mlir::isa<mlir::scf::ParallelOp>(cur)) {
-      // Any other region op (scf.if, etc.) — unsupported.
-      // We don't reject here because the loop might still wrap it; only
-      // the eventual buildLoopPlan body-check enforces purity.
-    }
-    cur = cur->getParentOp();
-  }
-  return outer;
-}
-
-/// Verify that \p loop's bounds (lower, upper, step) reduce to entry-block
-/// args of \p writerFn or compile-time constants. Returns true and sets
-/// \p staticBounds=true if all three are constants.
-static bool loopBoundsAreEntryArgsOrConst(mlir::Operation *loop,
-                                          mlir::FunctionOpInterface writerFn,
-                                          bool &staticBounds) {
-  mlir::Region *body = writerFn.getCallableRegion();
-  if (!body || body->empty()) return false;
-  mlir::Block *entry = &body->front();
-
-  auto isAcceptable = [&](mlir::Value v) -> bool {
-    if (!v) return false;
-    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v))
-      return barg.getOwner() == entry;
-    auto *def = v.getDefiningOp();
-    return def && def->hasTrait<mlir::OpTrait::ConstantLike>();
-  };
-
-  if (auto sf = mlir::dyn_cast<mlir::scf::ForOp>(loop)) {
-    bool lbC = sf.getLowerBound().getDefiningOp() &&
-               sf.getLowerBound().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
-    bool ubC = sf.getUpperBound().getDefiningOp() &&
-               sf.getUpperBound().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
-    bool stC = sf.getStep().getDefiningOp() &&
-               sf.getStep().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
-    staticBounds = lbC && ubC && stC;
-    if (!isAcceptable(sf.getLowerBound())) return false;
-    if (!isAcceptable(sf.getUpperBound())) return false;
-    if (!isAcceptable(sf.getStep())) return false;
-    if (!sf.getInitArgs().empty()) return false; // no iter_args
-    return true;
-  }
-  if (auto af = mlir::dyn_cast<mlir::affine::AffineForOp>(loop)) {
-    // Affine bounds may be constants or affine_maps over entry-block args.
-    // Accept the constant lb/ub case + the case where map operands are
-    // entry-block args.
-    auto checkOperands = [&](mlir::OperandRange ops) {
-      for (mlir::Value v : ops)
-        if (!isAcceptable(v)) return false;
-      return true;
-    };
-    if (!checkOperands(af.getLowerBoundOperands())) return false;
-    if (!checkOperands(af.getUpperBoundOperands())) return false;
-    staticBounds = af.hasConstantLowerBound() && af.hasConstantUpperBound();
-    if (!af.getInits().empty()) return false; // no iter_args
-    return true;
-  }
-  return false;
-}
-
-/// Straight-line plan-builder: walks storeOp's stored-value operand tree
-/// at-the-top-level of writerFn (no enclosing loops). Same shape as the
-/// pre-D code, plus: (a) on inner-load hoist failure, attempt recursive
-/// sub-plan substitution via loadProv (Strategy D); (b) accepts loop-IV
-/// block-args when \p inLoopBody is the parent region under which IVs are
-/// legal (used by buildLoopPlan to share this walker).
-static bool walkStoredValueTree(
-    mlir::Value root,
-    mlir::FunctionOpInterface writerFn,
-    mlir::Region *loopRegion, // nullable; iv-args of blocks under this are accepted
-    AllocationRoots &allocRootFor,
-    LoadProvenanceMap &loadProv,
-    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-        fnWritesGlobal,
-    CrossFnRematPlan &plan,
-    unsigned depth,
-    llvm::SmallDenseSet<mlir::Operation *> &seenStores) {
-  mlir::Region *body = writerFn.getCallableRegion();
-  if (!body || body->empty()) return false;
-  mlir::Block *entryBlock = &body->front();
-  mlir::ModuleOp moduleOp = writerFn->getParentOfType<mlir::ModuleOp>();
-
-  llvm::SmallVector<mlir::Value, 8> worklist{root};
-  llvm::SmallDenseSet<mlir::Value> visited;
-  llvm::SmallDenseSet<mlir::Operation *> added;
-  llvm::SmallDenseSet<unsigned> seenArgIdx;
-
-  while (!worklist.empty()) {
-    mlir::Value cur = worklist.pop_back_val();
-    if (!visited.insert(cur).second) continue;
-
-    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
-      if (barg.getOwner() == entryBlock) {
-        if (seenArgIdx.insert(barg.getArgNumber()).second)
-          plan.writerArgs.push_back(barg);
-        continue;
-      }
-      // Loop-IV block-arg: accept only if its owner block lives under
-      // loopRegion (the loop we plan to clone). Otherwise unavailable
-      // at caller.
-      if (loopRegion && loopRegion->findAncestorBlockInRegion(
-                            *barg.getOwner()) == barg.getOwner())
-        continue; // IV reproduced via region clone at caller
-      return false;
-    }
-
-    mlir::Operation *def = cur.getDefiningOp();
-    if (!def) return false;
-
-    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(def)) {
-      mlir::Value memref = getLoadMemref(def);
-      mlir::Operation *getGlobalOp = traceLoadToGlobal(memref);
-      if (!getGlobalOp) return false;
-      mlir::Operation *globalOp = resolveGetGlobal(getGlobalOp, moduleOp);
-
-      // Strategy D — try a recursive sub-plan first when loadProv has a
-      // unique cross-fn store. Sub-plan is strictly more permissive at
-      // the per-caller stage (the global itself may be written elsewhere
-      // in caller's call subtree, as long as the inner-writer-call
-      // window is interference-free). Fall back to hoist when sub-plan
-      // is unavailable.
-      auto trySubPlan = [&]() -> bool {
-        if (depth + 1 >= kMaxCrossFnChainDepth) return false;
-        auto provIt = loadProv.find(def);
-        if (provIt == loadProv.end()) return false;
-        const auto &provSet = provIt->second;
-        if (provSet.size() != 1 || provSet.contains(nullptr)) return false;
-        mlir::Operation *innerStore = *provSet.begin();
-        if (!innerStore) return false;
-        if (seenStores.contains(innerStore)) return false;
-        auto innerWriterFn =
-            innerStore->getParentOfType<mlir::FunctionOpInterface>();
-        if (!innerWriterFn) return false;
-        if (innerWriterFn.getOperation() == writerFn.getOperation())
-          return false;
-        mlir::Value innerStoredVal = getStoredValue(innerStore);
-        if (!innerStoredVal) return false;
-        if (innerStoredVal.getType() != def->getResult(0).getType())
-          return false;
-        LoadSubRecord sub;
-        sub.loadOp = def;
-        sub.innerStoreOp = innerStore;
-        sub.innerWriterFn = innerWriterFn;
-        sub.subPlan = std::make_unique<CrossFnRematPlan>();
-        auto subSeen = seenStores;
-        subSeen.insert(innerStore);
-        if (!buildCrossFunctionRematPlan(innerStore, innerWriterFn,
-                                         allocRootFor, loadProv,
-                                         fnWritesGlobal, *sub.subPlan,
-                                         depth + 1, subSeen))
-          return false;
-        mlir::Value innerStoreMemref =
-            drcompiler::getLoadStoreMemref(innerStore);
-        sub.innerGlobalOp =
-            lookupAllocRoot(innerStoreMemref, allocRootFor);
-        if (!sub.innerGlobalOp ||
-            !mlir::isa<mlir::memref::GlobalOp>(sub.innerGlobalOp))
-          return false;
-        plan.loadSubs.push_back(std::move(sub));
-        return true;
-      };
-
-      if (trySubPlan()) {
-        // Don't add the load to opsToClone; don't walk its operands —
-        // substitution is total at this load result.
-        continue;
-      }
-      // Fall back to hoist path.
-      bool canHoist = globalOp &&
-                      !fnWritesGlobal(writerFn.getOperation(), globalOp);
-      if (!canHoist) return false;
-      plan.hoistedLoadGlobals.push_back(globalOp);
-      if (added.insert(def).second) {
-        plan.opsToClone.push_back(def);
-        if (plan.opsToClone.size() > kMaxRematOps) return false;
-      }
-      for (mlir::Value operand : def->getOperands())
-        worklist.push_back(operand);
-      continue;
-    }
-    if (mlir::isa<mlir::LLVM::LoadOp>(def)) {
-      return false; // LLVM dialect loads not yet supported
-    }
-    if (mlir::isa<mlir::CallOpInterface>(def)) {
-      if (!isPureRuntimeCall(def)) return false;
-    } else if (!mlir::isMemoryEffectFree(def)) {
-      return false;
-    }
-
-    if (added.insert(def).second) {
-      plan.opsToClone.push_back(def);
-      if (plan.opsToClone.size() > kMaxRematOps) return false;
-    }
-    for (mlir::Value operand : def->getOperands())
-      worklist.push_back(operand);
-  }
-  return true;
-}
-
-/// Top-level (no enclosing loop) plan-builder.
-static bool buildStraightLinePlan(
-    mlir::Operation *storeOp,
-    mlir::FunctionOpInterface writerFn,
-    AllocationRoots &allocRootFor,
-    LoadProvenanceMap &loadProv,
-    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-        fnWritesGlobal,
-    CrossFnRematPlan &plan,
-    unsigned depth,
-    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
-  mlir::Value root = getStoredValue(storeOp);
-  if (!root) return false;
-  plan.rootValue = root;
-  if (!walkStoredValueTree(root, writerFn, /*loopRegion=*/nullptr,
-                           allocRootFor, loadProv, fnWritesGlobal, plan,
-                           depth, seenStores))
-    return false;
-  std::reverse(plan.opsToClone.begin(), plan.opsToClone.end());
-  return true;
-}
-
-/// Loop-cloning plan-builder (Strategy F.2). The store is nested inside an
-/// scf.for / affine.for. We will clone the outermost enclosing loop into
-/// the caller, redirecting writes from the original global to a scratch
-/// buffer.
-static bool buildLoopPlan(
-    mlir::Operation *storeOp,
-    mlir::FunctionOpInterface writerFn,
-    mlir::Operation *outerLoop,
-    AllocationRoots &allocRootFor,
-    LoadProvenanceMap &loadProv,
-    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-        fnWritesGlobal,
-    CrossFnRematPlan &plan,
-    unsigned depth,
-    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
-  mlir::ModuleOp moduleOp = writerFn->getParentOfType<mlir::ModuleOp>();
-
-  // Bounds + iter_args check.
-  bool staticBounds = false;
-  if (!loopBoundsAreEntryArgsOrConst(outerLoop, writerFn, staticBounds))
-    return false;
-
-  // The store's memref must trace to a get_global directly (no
-  // reinterpret_cast / strided sub-region for v1).
-  mlir::Value storeMemref = drcompiler::getLoadStoreMemref(storeOp);
-  if (!storeMemref) return false;
-  mlir::Operation *getGlobalOp =
-      mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(
-          storeMemref.getDefiningOp());
-  if (!getGlobalOp) return false;
-  mlir::Operation *globalOp = resolveGetGlobal(getGlobalOp, moduleOp);
-  if (!globalOp || !mlir::isa<mlir::memref::GlobalOp>(globalOp))
-    return false;
-
-  // Body purity check — walk every op inside outerLoop and ensure each
-  // is one of: the targeted store, a pure arith/constant op, an scf.yield
-  // / affine.yield, a hoistable load, a pure runtime call, or a nested
-  // scf.for/affine.for satisfying the same recursive constraints. Reject
-  // any other store (we don't want extra side effects in cloned region).
-  bool bodyOk = true;
-  outerLoop->walk([&](mlir::Operation *op) {
-    if (op == outerLoop) return mlir::WalkResult::advance();
-    if (op == storeOp) return mlir::WalkResult::advance();
-    if (mlir::isa<mlir::scf::YieldOp, mlir::affine::AffineYieldOp,
-                  mlir::scf::ForOp, mlir::affine::AffineForOp>(op))
-      return mlir::WalkResult::advance();
-    if (drcompiler::isAnyStoreOp(op)) {
-      bodyOk = false;
-      return mlir::WalkResult::interrupt();
-    }
-    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(op))
-      return mlir::WalkResult::advance(); // hoist-checked when walking value tree
-    if (mlir::isa<mlir::CallOpInterface>(op)) {
-      if (!isPureRuntimeCall(op)) {
-        bodyOk = false;
-        return mlir::WalkResult::interrupt();
-      }
-      return mlir::WalkResult::advance();
-    }
-    if (!mlir::isMemoryEffectFree(op)) {
-      bodyOk = false;
-      return mlir::WalkResult::interrupt();
-    }
-    return mlir::WalkResult::advance();
-  });
-  if (!bodyOk) return false;
-
-  // Collect captures: values used inside outerLoop but defined outside.
-  // The region clone reproduces the loop body verbatim; only external
-  // dependencies need to be cloned/mapped at the caller. Skip the
-  // targeted get_global's result (we'll remap it to the scratch buffer).
-  mlir::Value globalRef = getGlobalOp->getResult(0);
-  llvm::SmallVector<mlir::Value, 8> captures;
-  llvm::SmallDenseSet<mlir::Value> capSeen;
-  outerLoop->walk([&](mlir::Operation *op) {
-    for (mlir::Value v : op->getOperands()) {
-      if (v == globalRef) continue;
-      // Defined outside the loop?
-      if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
-        if (outerLoop->isAncestor(barg.getOwner()->getParentOp()))
-          continue; // IV / nested block-arg owned by the loop region
-      } else if (auto *def = v.getDefiningOp()) {
-        if (outerLoop->isAncestor(def)) continue;
-      }
-      if (capSeen.insert(v).second) captures.push_back(v);
-    }
-  });
-
-  // Walk each capture as a tree root (treated as straight-line — they're
-  // external to the loop region).
-  for (mlir::Value cap : captures) {
-    if (!walkStoredValueTree(cap, writerFn, /*loopRegion=*/nullptr,
-                             allocRootFor, loadProv, fnWritesGlobal, plan,
-                             depth, seenStores))
-      return false;
-  }
-  std::reverse(plan.opsToClone.begin(), plan.opsToClone.end());
-
-  // rootValue retained for downstream type lookups (scalar element type
-  // matches the global's element type).
-  mlir::Value root = getStoredValue(storeOp);
-  if (!root) return false;
-  plan.rootValue = root;
-
-  LoopMatRecord rec;
-  rec.outerLoopOp = outerLoop;
-  rec.storeOp = storeOp;
-  rec.globalOp = globalOp;
-  rec.getGlobalOp = getGlobalOp;
-  rec.boundsAreStatic = staticBounds;
-  plan.loopMat = rec;
-  return true;
-}
-
-/// Walk \p storeOp's stored-value operand tree. Accept pure ops whose
-/// leaves are constants or block args of \p writerFn's entry block.
-/// Memref loads are accepted (a) as hoists when safe, or (b) via Strategy
-/// D recursive sub-plans. Stores nested inside an scf.for / affine.for are
-/// handled via Strategy F (loop materialization).
-static bool buildCrossFunctionRematPlan(
-    mlir::Operation *storeOp,
-    mlir::FunctionOpInterface writerFn,
-    AllocationRoots &allocRootFor,
-    LoadProvenanceMap &loadProv,
-    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-        fnWritesGlobal,
-    CrossFnRematPlan &plan,
-    unsigned depth,
-    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
-  plan.opsToClone.clear();
-  plan.writerArgs.clear();
-  plan.hoistedLoadGlobals.clear();
-  plan.loadSubs.clear();
-  plan.loopMat.reset();
-
-  mlir::Operation *outerLoop =
-      findOutermostEnclosingLoop(storeOp, writerFn);
-  if (!outerLoop) {
-    // Top-level store — straight-line.
-    return buildStraightLinePlan(storeOp, writerFn, allocRootFor, loadProv,
-                                 fnWritesGlobal, plan, depth, seenStores);
-  }
-  return buildLoopPlan(storeOp, writerFn, outerLoop, allocRootFor, loadProv,
-                       fnWritesGlobal, plan, depth, seenStores);
-}
-
-/// Find the latest call to \p writerFn in \p caller that strictly dominates
-/// \p readerCall and has no intervening writer to \p globalOp between them.
-/// Returns nullptr if no such call exists.
-static mlir::Operation *
-findEligibleWriterCall(mlir::FunctionOpInterface caller,
-                       mlir::Operation *readerCall,
-                       mlir::FunctionOpInterface writerFn,
-                       mlir::Operation *globalOp,
-                       mlir::DominanceInfo &domInfo,
-                       const ModuleGlobalWrites &moduleGlobalWrites,
-                       AllocationRoots &allocRootFor,
-                       const llvm::DenseSet<mlir::Operation *> &globalAllocOps,
-                       llvm::function_ref<bool(mlir::Operation *,
-                                               mlir::Operation *)>
-                           fnWritesGlobal) {
-  mlir::Region *body = caller.getCallableRegion();
-  if (!body || body->empty()) return nullptr;
-
-  // Collect candidate writer calls within caller.
-  llvm::SmallVector<mlir::Operation *, 4> candidates;
-  body->walk([&](mlir::CallOpInterface call) {
-    auto callableRef = call.getCallableForCallee();
-    auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(callableRef);
-    if (!sym) return;
-    auto rootName = sym.getRootReference().getValue();
-    if (rootName != writerFn.getName()) return;
-    if (!domInfo.properlyDominates(call.getOperation(), readerCall)) return;
-    candidates.push_back(call.getOperation());
-  });
-
-  if (candidates.empty()) return nullptr;
-
-  // Pick the latest (closest dominator). Sort by program order: the one
-  // that comes last and still dominates readerCall.
-  mlir::Operation *latest = nullptr;
-  for (mlir::Operation *c : candidates) {
-    if (!latest || domInfo.properlyDominates(latest, c))
-      latest = c;
-  }
-  if (!latest) return nullptr;
-
-  // Verify no intervening op between (latest, readerCall) writes to
-  // globalOp. We do a conservative scan:
-  //   - any direct store whose root is globalOp is a writer
-  //   - any call to a function (other than writerFn) that may write
-  //     globalOp is a writer
-  bool interfered = false;
-  body->walk([&](mlir::Operation *op) {
-    if (interfered) return mlir::WalkResult::skip();
-    if (!domInfo.properlyDominates(latest, op)) return mlir::WalkResult::advance();
-    if (!domInfo.properlyDominates(op, readerCall)) return mlir::WalkResult::advance();
-
-    // Direct store?
-    if (drcompiler::isAnyStoreOp(op)) {
-      mlir::Value memref = drcompiler::getLoadStoreMemref(op);
-      llvm::SmallVector<mlir::Value, 2> bases;
-      drcompiler::collectBaseMemrefs(memref, allocRootFor, bases);
-      for (mlir::Value base : bases) {
-        auto it = allocRootFor.find(base);
-        if (it != allocRootFor.end() && it->second == globalOp)
-          interfered = true;
-      }
-    }
-    // Call site?
-    if (auto call = mlir::dyn_cast<mlir::CallOpInterface>(op)) {
-      auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(call.getCallableForCallee());
-      if (!sym) {
-        interfered = true; // unknown callee
-        return mlir::WalkResult::advance();
-      }
-      // Skip the writer-call itself; we already accept it as the writer.
-      if (op == latest) return mlir::WalkResult::advance();
-      // Resolve.
-      auto *calleeOp = mlir::SymbolTable::lookupNearestSymbolFrom(
-          op, sym);
-      auto callee = mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(calleeOp);
-      if (!callee) {
-        interfered = true; return mlir::WalkResult::advance();
-      }
-      if (fnWritesGlobal(callee.getOperation(), globalOp))
-        interfered = true;
-    }
-    (void)moduleGlobalWrites;
-    (void)globalAllocOps;
-    return mlir::WalkResult::advance();
-  });
-
-  if (interfered) return nullptr;
-  return latest;
-}
-
-/// Materialization context — bundles caller-side analysis state needed
-/// for sub-plan resolution (Strategy D).
-struct MatCtx {
-  mlir::DominanceInfo *domInfo = nullptr;
-  const ModuleGlobalWrites *moduleGlobalWrites = nullptr;
-  AllocationRoots *allocRootFor = nullptr;
-  const llvm::DenseSet<mlir::Operation *> *globalAllocs = nullptr;
-  llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
-      fnWritesGlobal;
-};
-
-/// Materialize the writer's expression at the caller, just after
-/// \p writerCall. For straight-line plans, clones \p plan.opsToClone with
-/// the writer's entry-block args remapped to writerCall's operands. For
-/// loop-mat plans (Strategy F), allocates a scratch buffer and clones the
-/// outer loop into it. For sub-plans (Strategy D), recurses into each
-/// LoadSubRecord, anchored after a separately-resolved inner-writer-call
-/// in the same caller function.
-static mlir::Value materializeAtCaller(mlir::Operation *writerCall,
-                                       const CrossFnRematPlan &plan,
-                                       mlir::OpBuilder &builder,
-                                       const MatCtx &ctx);
-
-/// Resolve an inner-writer-call in the same caller function that
-/// dominates \p anchorCall and is interference-free for \p sub.
-static mlir::Operation *
-resolveInnerWriterCall(mlir::Operation *anchorCall, const LoadSubRecord &sub,
-                       const MatCtx &ctx) {
-  auto callerFn =
-      anchorCall->getParentOfType<mlir::FunctionOpInterface>();
-  if (!callerFn) return nullptr;
-  return findEligibleWriterCall(callerFn, anchorCall, sub.innerWriterFn,
-                                sub.innerGlobalOp, *ctx.domInfo,
-                                *ctx.moduleGlobalWrites, *ctx.allocRootFor,
-                                *ctx.globalAllocs, ctx.fnWritesGlobal);
-}
-
-/// Strategy F materializer: clones the writer's outer loop into a scratch
-/// buffer at the caller and returns the scratch memref.
-static mlir::Value materializeLoop(mlir::Operation *writerCall,
-                                   const CrossFnRematPlan &plan,
-                                   mlir::OpBuilder &builder) {
-  const auto &lm = *plan.loopMat;
-  auto globalOp = mlir::cast<mlir::memref::GlobalOp>(lm.globalOp);
-  auto memrefTy = mlir::cast<mlir::MemRefType>(globalOp.getType());
-
-  // 1. Allocate scratch (memref.alloca with the global's static type).
-  builder.setInsertionPointAfter(writerCall);
-  if (!memrefTy.hasStaticShape()) return {};
-  auto scratch = builder.create<mlir::memref::AllocaOp>(
-      writerCall->getLoc(), memrefTy);
-
-  // 2. Clone external dependencies (plan.opsToClone — captures of the loop
-  //    region that come from outside).
-  mlir::IRMapping mapping;
-  for (mlir::BlockArgument arg : plan.writerArgs) {
-    unsigned idx = arg.getArgNumber();
-    if (idx >= writerCall->getNumOperands()) return {};
-    mapping.map((mlir::Value)arg, writerCall->getOperand(idx));
-  }
-  // Map the writer's get_global result to the scratch memref so the cloned
-  // store writes to scratch instead of the original global.
-  mapping.map(lm.getGlobalOp->getResult(0), scratch.getResult());
-
-  for (mlir::Operation *op : plan.opsToClone) {
-    mlir::Operation *cloned = builder.clone(*op, mapping);
-    for (auto [oldRes, newRes] :
-         llvm::zip(op->getResults(), cloned->getResults()))
-      mapping.map(oldRes, newRes);
-  }
-  // 3. Clone the outer loop op via region clone (deep-clones body).
-  builder.clone(*lm.outerLoopOp, mapping);
-  return scratch.getResult();
-}
-
-static mlir::Value materializeAtCaller(mlir::Operation *writerCall,
-                                       const CrossFnRematPlan &plan,
-                                       mlir::OpBuilder &builder,
-                                       const MatCtx &ctx) {
-  if (plan.loopMat) return materializeLoop(writerCall, plan, builder);
-
-  mlir::IRMapping mapping;
-  // Strategy D — materialize each sub-plan at its own innerWC, then bind
-  // the outer load's result to the materialized sub-value via the mapping.
-  for (const LoadSubRecord &sub : plan.loadSubs) {
-    mlir::Operation *innerWC = resolveInnerWriterCall(writerCall, sub, ctx);
-    if (!innerWC) return {};
-    mlir::OpBuilder subBuilder(innerWC);
-    mlir::Value subVal =
-        materializeAtCaller(innerWC, *sub.subPlan, subBuilder, ctx);
-    if (!subVal) return {};
-    mapping.map(sub.loadOp->getResult(0), subVal);
-  }
-
-  // Map writer's entry-block args to the caller's call operands.
-  for (mlir::BlockArgument arg : plan.writerArgs) {
-    unsigned idx = arg.getArgNumber();
-    if (idx >= writerCall->getNumOperands()) return {};
-    mapping.map((mlir::Value)arg, writerCall->getOperand(idx));
-  }
-  // Clone ops in topological order at the caller's insertion point.
-  builder.setInsertionPointAfter(writerCall);
-  for (mlir::Operation *op : plan.opsToClone) {
-    mlir::Operation *cloned = builder.clone(*op, mapping);
-    for (auto [oldRes, newRes] :
-         llvm::zip(op->getResults(), cloned->getResults()))
-      mapping.map(oldRes, newRes);
-  }
-  return mapping.lookupOrNull(plan.rootValue);
-}
-
-/// Add an extra entry-block argument of \p extraType to \p funcOp and
-/// replace every op in \p loadOps with that argument. Mutates the function
-/// signature in place. Returns the new argument.
-static mlir::BlockArgument
-addParamAndReplaceLoads(mlir::FunctionOpInterface funcOp,
-                        mlir::Type extraType,
-                        llvm::ArrayRef<mlir::Operation *> loadOps) {
-  mlir::Region *body = funcOp.getCallableRegion();
-  mlir::Block *entry = &body->front();
-  unsigned newArgIdx = entry->getNumArguments();
-  mlir::BlockArgument newArg =
-      entry->addArgument(extraType, funcOp.getLoc());
-
-  // Update the function type.
-  llvm::SmallVector<mlir::Type> newInputs(funcOp.getArgumentTypes().begin(),
-                                          funcOp.getArgumentTypes().end());
-  newInputs.push_back(extraType);
-  auto newFnTy = mlir::FunctionType::get(funcOp.getContext(), newInputs,
-                                         funcOp.getResultTypes());
-  funcOp.setType(newFnTy);
-  (void)newArgIdx;
-
-  // Replace each load with the new arg, then erase.
-  for (mlir::Operation *l : loadOps) {
-    l->getResult(0).replaceAllUsesWith(newArg);
-    l->erase();
-  }
-  return newArg;
-}
-
-/// Strategy F.2 reader-side rewrite: add an extra memref entry-block arg
-/// and rewrite each load in \p loadOps to load from the new arg at the
-/// same indices (instead of the original global). Returns the new arg.
-static mlir::BlockArgument
-addMemrefParamAndRewriteLoads(mlir::FunctionOpInterface funcOp,
-                              mlir::Type memrefTy,
-                              llvm::ArrayRef<mlir::Operation *> loadOps) {
-  mlir::Region *body = funcOp.getCallableRegion();
-  mlir::Block *entry = &body->front();
-  mlir::BlockArgument newArg =
-      entry->addArgument(memrefTy, funcOp.getLoc());
-
-  llvm::SmallVector<mlir::Type> newInputs(funcOp.getArgumentTypes().begin(),
-                                           funcOp.getArgumentTypes().end());
-  newInputs.push_back(memrefTy);
-  auto newFnTy = mlir::FunctionType::get(funcOp.getContext(), newInputs,
-                                         funcOp.getResultTypes());
-  funcOp.setType(newFnTy);
-
-  for (mlir::Operation *l : loadOps) {
-    mlir::OpBuilder b(l);
-    mlir::Value newRes;
-    if (auto ml = mlir::dyn_cast<mlir::memref::LoadOp>(l)) {
-      newRes = b.create<mlir::memref::LoadOp>(l->getLoc(), newArg,
-                                               ml.getIndices())
-                   .getResult();
-    } else if (auto al = mlir::dyn_cast<mlir::affine::AffineLoadOp>(l)) {
-      newRes = b.create<mlir::affine::AffineLoadOp>(
-                    l->getLoc(), newArg, al.getAffineMap(), al.getIndices())
-                   .getResult();
-    } else {
-      continue;
-    }
-    l->getResult(0).replaceAllUsesWith(newRes);
-    l->erase();
-  }
-  return newArg;
-}
-
-/// Clone \p reader into a new private function with a "_dr_spec" suffix.
-/// Caller must rewrite call sites to use the clone.
-static mlir::FunctionOpInterface
-cloneReaderForSpec(mlir::FunctionOpInterface reader) {
-  mlir::OpBuilder builder(reader.getOperation()->getContext());
-  builder.setInsertionPointAfter(reader.getOperation());
-  auto cloned = mlir::cast<mlir::FunctionOpInterface>(
-      builder.clone(*reader.getOperation()));
-  // Make it private + give a unique name.
-  if (auto symOp = mlir::dyn_cast<mlir::SymbolOpInterface>(cloned.getOperation()))
-    symOp.setVisibility(mlir::SymbolTable::Visibility::Private);
-  static unsigned counter = 0;
-  std::string newName =
-      (reader.getName() + "__dr_spec_" + llvm::Twine(counter++)).str();
-  if (auto symOp = mlir::dyn_cast<mlir::SymbolOpInterface>(cloned.getOperation()))
-    symOp.setName(newName);
-  return cloned;
-}
-
-/// Rewrite \p oldCall to \p newCallee, appending \p extraOperands.
-static void rewriteCallSite(mlir::Operation *oldCall,
-                            mlir::FunctionOpInterface newCallee,
-                            llvm::ArrayRef<mlir::Value> extraOperands) {
-  mlir::OpBuilder builder(oldCall);
-  llvm::SmallVector<mlir::Value> newOperands(oldCall->getOperands().begin(),
-                                              oldCall->getOperands().end());
-  newOperands.append(extraOperands.begin(), extraOperands.end());
-
-  // Create a new call op of the same kind. We assume func.call.
-  if (auto fc = mlir::dyn_cast<mlir::func::CallOp>(oldCall)) {
-    auto newCall = builder.create<mlir::func::CallOp>(
-        oldCall->getLoc(), newCallee.getName(),
-        newCallee.getResultTypes(), newOperands);
-    for (auto [oldRes, newRes] :
-         llvm::zip(oldCall->getResults(), newCall->getResults()))
-      oldRes.replaceAllUsesWith(newRes);
-    oldCall->erase();
-    return;
-  }
-  // Other call ops not supported in v1.
-}
-
-} // namespace
+// Strategy 4 (cross-function ordered recomputation) helpers, plan
+// builder, materializer, and reader-rewrite all live in
+// drcompiler/Transforms/DataRecomputation/Strategies/CrossFnOrdered.h.
 
 void DataRecomputationPass::runOnOperation() {
+  using namespace dr::strategies;
   moduleOp = this->getOperation();
+
+  // Bind module-static debug/summary gates from pass options.
+  drDebugEnabled = drDebug;
+  drSummaryEnabled = drSummary;
 
   // Load CPU cost model (from file or built-in defaults).
   drcompiler::CpuCostModel costModel =
@@ -3420,64 +1338,9 @@ void DataRecomputationPass::runOnOperation() {
 
   DRPassContext passCtx{context, symTabCollection, moduleOp};
 
-  // Strategy 0: constant-global direct-forward. memref.global with
-  // `constant` set never gets written, so any load can be replaced by
-  // the global's initial value. We only handle splat-dense / scalar
-  // initializers here; non-splat tables fall through to the dataflow
-  // strategies (where they classify KILLED and are left alone).
-  {
-    llvm::SmallVector<mlir::Operation *, 8> toErase;
-    moduleOp.walk([&](mlir::Operation *op) {
-      mlir::Value memref;
-      mlir::ValueRange rawIndices;
-      if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(op)) {
-        memref = load.getMemref();
-        rawIndices = load.getIndices();
-      } else if (auto load =
-                     mlir::dyn_cast<mlir::affine::AffineLoadOp>(op)) {
-        memref = load.getMemref();
-        rawIndices = load.getIndices();
-      } else {
-        return;
-      }
-      auto gg = memref.getDefiningOp<mlir::memref::GetGlobalOp>();
-      if (!gg) return;
-      auto *symOp = symTabCollection.lookupNearestSymbolFrom(
-          moduleOp, gg.getNameAttr());
-      auto globalOp =
-          mlir::dyn_cast_or_null<mlir::memref::GlobalOp>(symOp);
-      if (!globalOp || !globalOp.getConstant()) return;
-      auto initAttrOpt = globalOp.getInitialValue();
-      if (!initAttrOpt) return;
-      auto memrefTy =
-          mlir::cast<mlir::MemRefType>(globalOp.getType());
-      mlir::Type elemTy = memrefTy.getElementType();
-      mlir::Attribute valAttr;
-      if (auto dense =
-              mlir::dyn_cast<mlir::DenseElementsAttr>(*initAttrOpt)) {
-        if (!dense.isSplat()) return; // skip indexed lookup for now
-        if (auto fp = mlir::dyn_cast<mlir::DenseFPElementsAttr>(dense)) {
-          valAttr = mlir::FloatAttr::get(elemTy, fp.getSplatValue<llvm::APFloat>());
-        } else if (auto i =
-                       mlir::dyn_cast<mlir::DenseIntElementsAttr>(dense)) {
-          valAttr = mlir::IntegerAttr::get(elemTy, i.getSplatValue<llvm::APInt>());
-        } else {
-          return;
-        }
-      } else {
-        return;
-      }
-      mlir::OpBuilder builder(op);
-      auto cst = builder.create<mlir::arith::ConstantOp>(
-          op->getLoc(), elemTy, mlir::cast<mlir::TypedAttr>(valAttr));
-      op->getResult(0).replaceAllUsesWith(cst);
-      if (drTestDiagnostics)
-        op->emitRemark() << "constant-global-fold: ACCEPT";
-      toErase.push_back(op);
-      (void)rawIndices;
-    });
-    for (mlir::Operation *op : toErase) op->erase();
-  }
+  // Strategy 0: constant-global fold (pre-analysis peephole).
+  dr::strategies::runConstantGlobalFold(moduleOp, symTabCollection,
+                                        drTestDiagnostics, drSummary);
 
   auto globalAllocs = collectGlobalStaticAllocations(passCtx);
 
@@ -4007,6 +1870,22 @@ void DataRecomputationPass::runOnOperation() {
         DRDBG() << "  decision: "
                 << (decision.recompute ? "RECOMPUTE" : "KEEP BUFFER") << "\n";
 
+        if (drSummaryEnabled) {
+          DRSUM() << "buffer ";
+          allocRoot->getLoc().print(llvm::errs());
+          llvm::errs() << ": "
+                       << (decision.recompute ? "RECOMPUTE" : "KEEP")
+                       << " (compute=" << computeCost
+                       << ", load=" << decision.loadLatency
+                       << ", consumers=" << numConsumers
+                       << ", size="
+                       << (bufSize ? std::to_string(*bufSize) : "dynamic");
+          if (drFootprintAnalysis)
+            llvm::errs() << ", storeToLoadFP=" << storeToLoadFP
+                         << ", operandPenalty=" << opPenalty;
+          llvm::errs() << ")\n";
+        }
+
         if (drTestDiagnostics) {
           auto diag = allocRoot->emitRemark()
               << "cost-model: "
@@ -4026,245 +1905,59 @@ void DataRecomputationPass::runOnOperation() {
       }
     }
 
+    // Per-load strategy pipeline. Strategies fire in order, first match
+    // wins; each strategy decides whether it consumes the candidate.
+    dr::strategies::StrategyEnv env{
+        domInfo,
+        loadProv,
+        interproceduralOrigins,
+        allocRootFor,
+        rootWrites,
+        cache,
+        costModel,
+        partialRematEnabled,
+        drPartialMaxLeaves,
+        (bool)drTestDiagnostics,
+        (bool)drSummary};
+
+    dr::strategies::DirectForward directForward;
+    dr::strategies::FullRemat fullRemat;
+    dr::strategies::PartialRemat partialIntra(
+        dr::strategies::PartialRemat::Mode::Intraprocedural);
+    dr::strategies::InterprocRemat interprocRemat;
+
     for (auto &entry : toProcess) {
       mlir::Operation *loadOp = entry.loadOp;
       mlir::Operation *storeOp = entry.storeOp;
       mlir::Value storedVal = getStoredValue(storeOp);
 
-      // If cost model says keep this buffer, skip rematerialization.
+      // Cost model: skip loads whose buffer the cost model decided to keep.
       if (drCostModel && !skipBuffers.empty()) {
         mlir::Operation *root = findAllocRoot(loadOp);
         if (root && skipBuffers.contains(root)) {
           if (drTestDiagnostics)
             loadOp->emitRemark() << "cost-model: SKIP_LOAD (buffer kept)";
+          if (drSummaryEnabled) {
+            DRSUM() << "load ";
+            loadOp->getLoc().print(llvm::errs());
+            llvm::errs() << ": SKIP_COST (buffer kept)\n";
+          }
           continue;
         }
       }
 
+      dr::strategies::LoadCandidate cand{loadOp, storeOp, storedVal};
       auto loadFn = loadOp->getParentOfType<mlir::FunctionOpInterface>();
       auto storeFn = storeOp->getParentOfType<mlir::FunctionOpInterface>();
 
       if (loadFn == storeFn) {
-        // --- Intraprocedural ---
-
-        // Strategy 1: Direct value forwarding (store dominates load).
-        if (isSafeToForward(storeOp, loadOp, domInfo)) {
-          if (storedVal.getType() != loadOp->getResult(0).getType()) {
-            if (drTestDiagnostics)
-              loadOp->emitRemark() << "direct-forward: REJECT_TYPE";
-            continue;
-          }
-          if (drTestDiagnostics)
-            loadOp->emitRemark() << "direct-forward: ACCEPT";
-          loadOp->getResult(0).replaceAllUsesWith(storedVal);
-          loadOp->erase();
-          continue;
-        }
-
-        // Strategy 2: Rematerialization (with load chaining).
-        llvm::SmallVector<mlir::Operation *> opsToClone;
-        llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> loadSubs;
-        if (isRematerializable(storedVal, loadOp, domInfo,
-                               opsToClone, /*argMapping=*/nullptr,
-                               &loadProv, &loadSubs)) {
-          mlir::Value clonedVal = rematerializeAt(
-              storedVal, loadOp, opsToClone,
-              /*argMapping=*/nullptr, loadSubs);
-          if (clonedVal.getType() != loadOp->getResult(0).getType()) {
-            if (drTestDiagnostics)
-              loadOp->emitRemark() << "full-remat: REJECT_TYPE";
-            continue;
-          }
-          if (drTestDiagnostics)
-            loadOp->emitRemark() << "full-remat: ACCEPT";
-          loadOp->getResult(0).replaceAllUsesWith(clonedVal);
-          loadOp->erase();
-          continue;
-        } else if (drTestDiagnostics) {
-          loadOp->emitRemark() << "full-remat: REJECT_UNSAFE";
-        }
-
-        // Strategy 2b: Partial rematerialization.
-        if (partialRematEnabled) {
-          llvm::SmallVector<mlir::Operation *> partialOps;
-          llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> partialSubs;
-          llvm::SmallVector<mlir::Operation *> partialLeaves;
-          PartialRematOpts partial;
-          partial.allow = true;
-          partial.maxLeaves = drPartialMaxLeaves;
-          partial.allocRootFor = &allocRootFor;
-          partial.rootWrites = &rootWrites;
-          partial.leaves = &partialLeaves;
-          if (isRematerializable(storedVal, loadOp, domInfo, partialOps,
-                                 /*argMapping=*/nullptr, &loadProv,
-                                 &partialSubs, &partial)) {
-            unsigned alu = estimateComputeCost(storedVal, costModel);
-            unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
-                                                  cache, allocRootFor);
-            mlir::Value loadMemref =
-                drcompiler::getLoadStoreMemref(loadOp);
-            mlir::Operation *loadRoot =
-                lookupAllocRoot(loadMemref, allocRootFor);
-            int64_t sizeBytes = cache.l2Size + 1;
-            if (loadRoot)
-              if (auto bs = estimateBufferSizeBytes(loadRoot))
-                sizeBytes = *bs;
-            unsigned loadLat =
-                estimateAccessLatency(loadOp, loadOp, sizeBytes, cache);
-            // Partial remat replaces one original load with a cloned
-            // expression of equal or greater memory traffic. Gate strictly:
-            // only fire if re-execution is cheaper than the original load.
-            if (alu + leaf >= loadLat) {
-              if (drTestDiagnostics)
-                loadOp->emitRemark()
-                    << "partial-remat: REJECT_COST (alu=" << alu
-                    << ", leaves=" << leaf << ", keep=" << loadLat << ")";
-              continue;
-            }
-            mlir::Value clonedVal = rematerializeAt(storedVal, loadOp,
-                                                    partialOps, nullptr,
-                                                    partialSubs);
-            if (clonedVal.getType() != loadOp->getResult(0).getType()) {
-              if (drTestDiagnostics)
-                loadOp->emitRemark() << "partial-remat: REJECT_TYPE";
-              continue;
-            }
-            if (drTestDiagnostics)
-              loadOp->emitRemark()
-                  << "partial-remat: ACCEPT (alu=" << alu << ", leaves=" << leaf
-                  << ", load=" << loadLat << ")";
-            loadOp->getResult(0).replaceAllUsesWith(clonedVal);
-            loadOp->erase();
-            continue;
-          } else if (drTestDiagnostics &&
-                     partial.lastReject != PartialLeafReject::None) {
-            const char *reason = "unknown";
-            switch (partial.lastReject) {
-            case PartialLeafReject::None: reason = "none"; break;
-            case PartialLeafReject::NoAllocRoot: reason = "no-alloc-root"; break;
-            case PartialLeafReject::AllocaOutOfScope:
-              reason = "alloca-out-of-scope"; break;
-            case PartialLeafReject::Escapes: reason = "escapes-to-call"; break;
-            case PartialLeafReject::MultiWrite:
-              reason = "intervening-write"; break;
-            case PartialLeafReject::WriterDoesNotDominate:
-              reason = "writer-does-not-dominate"; break;
-            case PartialLeafReject::OperandNotLive:
-              reason = "index-not-live"; break;
-            }
-            loadOp->emitRemark()
-                << "partial-remat: REJECT_UNSAFE (reason=" << reason << ")";
-          }
-        }
+        if (directForward.tryApply(cand, env) ==
+            dr::strategies::Outcome::Accepted) continue;
+        if (fullRemat.tryApply(cand, env) ==
+            dr::strategies::Outcome::Accepted) continue;
+        partialIntra.tryApply(cand, env);
       } else {
-        // --- Interprocedural (Strategy 3) ---
-        auto origIt = interproceduralOrigins.find(storeOp);
-        if (origIt == interproceduralOrigins.end())
-          continue;
-
-        if (origIt->second.size() > 1) {
-          if (drTestDiagnostics)
-            loadOp->emitRemark() << "interproc: SKIP_AMBIGUOUS_ORIGIN";
-          continue;
-        }
-
-        bool replaced = false;
-        for (auto &origin : origIt->second) {
-          if (!domInfo.dominates(origin.callSiteOp, loadOp))
-            continue;
-
-          mlir::Region *calleeBody = origin.callee.getCallableRegion();
-          if (!calleeBody || calleeBody->empty())
-            continue;
-
-          // Build argument mapping: callee entry args → call operands.
-          mlir::IRMapping argMapping;
-          for (auto [calleeArg, callOperand] :
-               llvm::zip(calleeBody->getArguments(),
-                         origin.callSiteOp->getOperands()))
-            argMapping.map(calleeArg, callOperand);
-
-          llvm::SmallVector<mlir::Operation *> opsToClone;
-          llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> loadSubs;
-          if (isRematerializable(storedVal, loadOp, domInfo,
-                                 opsToClone, &argMapping,
-                                 &loadProv, &loadSubs)) {
-            mlir::Value clonedVal = rematerializeAt(
-                storedVal, loadOp, opsToClone, &argMapping,
-                loadSubs);
-            if (clonedVal.getType() != loadOp->getResult(0).getType()) {
-              if (drTestDiagnostics)
-                loadOp->emitRemark() << "interproc-remat: REJECT_TYPE";
-              continue;
-            }
-            if (drTestDiagnostics)
-              loadOp->emitRemark() << "interproc-remat: ACCEPT";
-            loadOp->getResult(0).replaceAllUsesWith(clonedVal);
-            loadOp->erase();
-
-            replaced = true;
-            break;
-          } else if (drTestDiagnostics) {
-            loadOp->emitRemark() << "interproc-remat: REJECT_UNSAFE";
-          }
-
-          // Strategy 2b (interprocedural): partial rematerialization.
-          if (partialRematEnabled) {
-            llvm::SmallVector<mlir::Operation *> partialOps;
-            llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> partialSubs;
-            llvm::SmallVector<mlir::Operation *> partialLeaves;
-            PartialRematOpts partial;
-            partial.allow = true;
-            partial.maxLeaves = drPartialMaxLeaves;
-            partial.allocRootFor = &allocRootFor;
-            partial.rootWrites = &rootWrites;
-            partial.leaves = &partialLeaves;
-            if (isRematerializable(storedVal, loadOp, domInfo, partialOps,
-                                   &argMapping, &loadProv, &partialSubs,
-                                   &partial)) {
-              unsigned alu = estimateComputeCost(storedVal, costModel);
-              unsigned leaf = estimateLeafLoadsCost(partialLeaves, loadOp,
-                                                    cache, allocRootFor);
-              mlir::Value loadMemref =
-                  drcompiler::getLoadStoreMemref(loadOp);
-              mlir::Operation *loadRoot =
-                  lookupAllocRoot(loadMemref, allocRootFor);
-              int64_t sizeBytes = cache.l2Size + 1;
-              if (loadRoot)
-                if (auto bs = estimateBufferSizeBytes(loadRoot))
-                  sizeBytes = *bs;
-              unsigned loadLat =
-                  estimateAccessLatency(loadOp, loadOp, sizeBytes, cache);
-              auto dec = decideBufferStrategy(alu, leaf, loadLat,
-                                              /*numConsumers=*/1, sizeBytes,
-                                              /*storeToLoadFootprint=*/0,
-                                              /*operandPenalty=*/0, cache);
-              if (!dec.recompute) {
-                if (drTestDiagnostics)
-                  loadOp->emitRemark()
-                      << "partial-remat: REJECT_COST (alu=" << alu
-                      << ", leaves=" << leaf << ", keep=" << loadLat << ")";
-                continue;
-              }
-              mlir::Value clonedVal = rematerializeAt(
-                  storedVal, loadOp, partialOps, &argMapping, partialSubs);
-              if (clonedVal.getType() != loadOp->getResult(0).getType()) {
-                if (drTestDiagnostics)
-                  loadOp->emitRemark() << "partial-remat: REJECT_TYPE";
-                continue;
-              }
-              if (drTestDiagnostics)
-                loadOp->emitRemark()
-                    << "partial-remat: ACCEPT (alu=" << alu
-                    << ", leaves=" << leaf << ", load=" << loadLat << ")";
-              loadOp->getResult(0).replaceAllUsesWith(clonedVal);
-              loadOp->erase();
-              replaced = true;
-              break;
-            }
-          }
-        }
-        (void)replaced;
+        interprocRemat.tryApply(cand, env);
       }
     }
 
@@ -4506,29 +2199,100 @@ void DataRecomputationPass::runOnOperation() {
 
       // Plan kind drives the extra-arg type and reader-side rewrite path.
       // Straight-line / D plans pass a scalar; F.2 plans pass a memref
-      // (the scratch buffer) and rewrite reader's loads via memref swap.
+      // (the scratch buffer); F.1 (single-iteration extraction) passes a
+      // scalar but materializes per-call-site by cloning the loop body
+      // with IV→reader-index substitution.
       bool isLoopMat = plan.loopMat.has_value();
+      bool useF1 = false;
+      // Per-load-index ref: either a reader entry-block-arg index, or a
+      // constant op cloned at the caller. Computed only for F.1.
+      struct IdxRef {
+        bool isReaderArg = false;
+        unsigned readerArgIdx = 0;
+        mlir::Operation *constOp = nullptr;
+      };
+      llvm::SmallVector<IdxRef, 4> f1IdxRefs;
+      if (isLoopMat && plan.loopMat->extractionViable &&
+          loadOps.size() == 1) {
+        // Resolve the single load's indices against the reader's entry
+        // block. If every index is either an entry-block arg or a
+        // constant-defining op inside the reader, F.1 is viable.
+        mlir::Operation *load = loadOps.front();
+        llvm::SmallVector<mlir::Value, 4> loadIdxOps;
+        if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(load))
+          for (mlir::Value v : l.getIndices()) loadIdxOps.push_back(v);
+        else if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(load))
+          for (mlir::Value v : l.getIndices()) loadIdxOps.push_back(v);
+        mlir::Block *readerEntry =
+            &readerFn.getCallableRegion()->front();
+        bool ok = (loadIdxOps.size() == plan.loopMat->storeIVs.size());
+        for (mlir::Value v : loadIdxOps) {
+          if (!ok) break;
+          IdxRef ref;
+          if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+            if (barg.getOwner() != readerEntry) { ok = false; break; }
+            ref.isReaderArg = true;
+            ref.readerArgIdx = barg.getArgNumber();
+          } else if (auto *def = v.getDefiningOp()) {
+            if (!def->hasTrait<mlir::OpTrait::ConstantLike>()) {
+              ok = false; break;
+            }
+            ref.constOp = def;
+          } else {
+            ok = false; break;
+          }
+          f1IdxRefs.push_back(ref);
+        }
+        useF1 = ok;
+      }
       mlir::Type extraTy =
-          isLoopMat ? mlir::cast<mlir::memref::GlobalOp>(plan.loopMat->globalOp)
-                          .getType()
-                    : plan.rootValue.getType();
+          isLoopMat && !useF1
+              ? mlir::cast<mlir::memref::GlobalOp>(plan.loopMat->globalOp)
+                    .getType()
+              : plan.rootValue.getType();
 
       MatCtx matCtx{&domInfoTop, &moduleGlobalWrites, &allocRootFor,
                     &globalAllocs, fnTransitivelyWritesGlobal};
 
+      // Helper to materialize for a given site, dispatching by plan kind.
+      auto materializeForSite = [&](mlir::Operation *writerCall,
+                                    mlir::Operation *readerCall,
+                                    mlir::OpBuilder &b) -> mlir::Value {
+        if (!useF1) return materializeAtCaller(writerCall, plan, b, matCtx);
+        // F.1: build idxValues for this site.
+        llvm::SmallVector<mlir::Value, 4> idxValues;
+        b.setInsertionPointAfter(writerCall);
+        for (const IdxRef &ref : f1IdxRefs) {
+          if (ref.isReaderArg) {
+            if (ref.readerArgIdx >= readerCall->getNumOperands()) return {};
+            idxValues.push_back(readerCall->getOperand(ref.readerArgIdx));
+          } else {
+            mlir::Operation *cloned = b.clone(*ref.constOp);
+            idxValues.push_back(cloned->getResult(0));
+          }
+        }
+        return materializeExtraction(writerCall, plan, b, idxValues);
+      };
+
       if (inPlace) {
-        // Mutate readerFn in place.
-        if (isLoopMat)
+        // Mutate readerFn in place. F.1 uses scalar arg (loop body
+        // extracts a single value); F.2 uses memref arg (scratch buffer).
+        if (isLoopMat && !useF1)
           addMemrefParamAndRewriteLoads(readerFn, extraTy, loadOps);
         else
           addParamAndReplaceLoads(readerFn, extraTy, loadOps);
         auto &site = conforming.front();
         mlir::OpBuilder builder(site.writerCall);
         mlir::Value matVal =
-            materializeAtCaller(site.writerCall, plan, builder, matCtx);
+            materializeForSite(site.writerCall, site.readerCall, builder);
         if (!matVal) continue;
         if (drTestDiagnostics)
           site.readerCall->emitRemark() << "interproc-cross: ACCEPT_INPLACE";
+        if (drSummaryEnabled) {
+          DRSUM() << "cross-fn ";
+          site.readerCall->getLoc().print(llvm::errs());
+          llvm::errs() << ": ACCEPT_INPLACE (loads=" << loadOps.size() << ")\n";
+        }
         rewriteCallSite(site.readerCall, readerFn, {matVal});
       } else {
         // Specialize.
@@ -4556,28 +2320,36 @@ void DataRecomputationPass::runOnOperation() {
               clonedLoads.push_back(clonedLoadOrder[it->second]);
           }
         }
-        if (isLoopMat)
+        if (isLoopMat && !useF1)
           addMemrefParamAndRewriteLoads(spec, extraTy, clonedLoads);
         else
           addParamAndReplaceLoads(spec, extraTy, clonedLoads);
 
-        // Cache one materialization per writerCall.
+        // F.2 / D / straight-line plans cache materialization per
+        // writerCall; F.1 must not cache (each call site has its own
+        // index values).
         llvm::DenseMap<mlir::Operation *, mlir::Value> matCache;
         for (auto &site : conforming) {
           mlir::Value matVal;
-          auto cIt = matCache.find(site.writerCall);
+          auto cIt = useF1 ? matCache.end() : matCache.find(site.writerCall);
           if (cIt != matCache.end()) {
             matVal = cIt->second;
           } else {
             mlir::OpBuilder builder(site.writerCall);
             matVal =
-                materializeAtCaller(site.writerCall, plan, builder, matCtx);
+                materializeForSite(site.writerCall, site.readerCall, builder);
             if (!matVal) continue;
-            matCache[site.writerCall] = matVal;
+            if (!useF1) matCache[site.writerCall] = matVal;
           }
           if (drTestDiagnostics)
             site.readerCall->emitRemark()
                 << "interproc-cross: ACCEPT_SPECIALIZED";
+          if (drSummaryEnabled) {
+            DRSUM() << "cross-fn ";
+            site.readerCall->getLoc().print(llvm::errs());
+            llvm::errs() << ": ACCEPT_SPECIALIZED (loads="
+                         << loadOps.size() << ")\n";
+          }
           rewriteCallSite(site.readerCall, spec, {matVal});
         }
       }

@@ -29,7 +29,14 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
-#define DRDBG() llvm::dbgs() << "DRCOMP-FISSION: "
+// Gated by pass option 'debug'; default OFF (silent). Set by runOnOperation.
+namespace {
+static bool mfDebugEnabled = false;
+} // namespace
+#define DRDBG()                                                                \
+  (mfDebugEnabled ? llvm::dbgs()                                               \
+                  : static_cast<llvm::raw_ostream &>(llvm::nulls()))           \
+      << "DRCOMP-FISSION: "
 
 namespace mlir {
 #define GEN_PASS_DEF_MEMORYFISSIONPASS
@@ -229,6 +236,8 @@ public:
 
 void MemoryFissionPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
+
+  mfDebugEnabled = debug;
 
   // Load CPU cost model (from file or built-in defaults).
   drcompiler::CpuCostModel costModel =

@@ -7,11 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/CpuCostModel.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
-#define DRDBG() llvm::dbgs() << "DRCOMP-COST: "
+#define DEBUG_TYPE "drcomp-cost"
 
 using namespace drcompiler;
 
@@ -147,8 +148,8 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
   }
 
   m.fromFile = true;
-  DRDBG() << "Loaded CPU cost model from '" << path << "' ("
-          << m.table.size() << " ops)\n";
+  LLVM_DEBUG(llvm::dbgs() << "DRCOMP-COST: Loaded CPU cost model from '"
+                          << path << "' (" << m.table.size() << " ops)\n");
   return m;
 }
 

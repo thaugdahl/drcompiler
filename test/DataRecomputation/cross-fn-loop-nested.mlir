@@ -42,9 +42,13 @@ module {
 }
 
 // CHECK-LABEL: func.func @run
+// Nested-loop F.1: both store indices are IVs, both load indices are
+// reader args. The inner-body ops are extracted with both IVs replaced.
+// CHECK-NOT:     memref.alloca
+// CHECK-NOT:     scf.for
 // CHECK:         call @writer
-// CHECK:         %[[SCRATCH:.*]] = memref.alloca() : memref<2x3xi32>
-// CHECK:         scf.for
-// CHECK:           scf.for
-// CHECK:             memref.store {{.*}}, %[[SCRATCH]]
-// CHECK:         call @reader{{.*}}, %[[SCRATCH]]
+// CHECK:         arith.index_cast
+// CHECK:         arith.index_cast
+// CHECK:         arith.addi
+// CHECK:         arith.addi
+// CHECK:         call @reader
