@@ -2608,6 +2608,38 @@ private:
 
 namespace {
 
+struct CrossFnRematPlan;
+
+/// Recursive sub-plan record: an inner memref.load whose hoist-path failed
+/// is substituted with a sub-plan that materializes the inner store's
+/// value at the outer caller, anchored just-after a separately-resolved
+/// inner-writer-call. (Strategy D — chained loads.)
+struct LoadSubRecord {
+  mlir::Operation *loadOp = nullptr;       // the inner load in writer body
+  mlir::Operation *innerStoreOp = nullptr; // S_inner
+  mlir::Operation *innerGlobalOp = nullptr;// G_inner (the memref::GlobalOp)
+  mlir::FunctionOpInterface innerWriterFn{};
+  std::unique_ptr<CrossFnRematPlan> subPlan;
+
+  LoadSubRecord();
+  LoadSubRecord(LoadSubRecord &&) noexcept;
+  LoadSubRecord &operator=(LoadSubRecord &&) noexcept;
+  ~LoadSubRecord();
+};
+
+/// Loop-cloning materialization record (Strategy F — loop-bounded stores).
+/// When set, materialization clones a loop nest (writing to a scratch
+/// buffer at the caller) instead of cloning a straight-line expression
+/// tree. The reader's matching loads of the original global are redirected
+/// to load from the scratch buffer.
+struct LoopMatRecord {
+  mlir::Operation *outerLoopOp = nullptr;  // outermost scf.for/affine.for to clone
+  mlir::Operation *storeOp = nullptr;      // targeted store within the loop body
+  mlir::Operation *globalOp = nullptr;     // base memref::GlobalOp the store writes
+  mlir::Operation *getGlobalOp = nullptr;  // the get_global op inside the writer
+  bool boundsAreStatic = false;
+};
+
 struct CrossFnRematPlan {
   /// Ops to clone, topologically ordered (defs before uses).
   llvm::SmallVector<mlir::Operation *, 4> opsToClone;
@@ -2619,11 +2651,28 @@ struct CrossFnRematPlan {
   /// between the materialization point and the writer call (verified by
   /// the driver before accepting the plan for a given caller).
   llvm::SmallVector<mlir::Operation *, 4> hoistedLoadGlobals;
-  /// The writer's original stored value (root of the operand tree).
+  /// Strategy D — per-load substitution records. The substituted load is
+  /// NOT cloned; its result is mapped to the sub-plan's materialized value.
+  llvm::SmallVector<LoadSubRecord, 2> loadSubs;
+  /// Strategy F — when set, materializeAtCaller clones a loop nest into a
+  /// scratch buffer and returns the scratch memref instead of a scalar.
+  std::optional<LoopMatRecord> loopMat;
+  /// The writer's original stored value (root of the operand tree). For
+  /// loop-mat plans this is the storeOp's stored value (used downstream
+  /// for type checks).
   mlir::Value rootValue;
 };
 
-/// Trace memref operand back to a memref.global op, accepting only the
+LoadSubRecord::LoadSubRecord() = default;
+LoadSubRecord::LoadSubRecord(LoadSubRecord &&) noexcept = default;
+LoadSubRecord &
+LoadSubRecord::operator=(LoadSubRecord &&) noexcept = default;
+LoadSubRecord::~LoadSubRecord() = default;
+
+/// Recursion cap for chained sub-plans (Strategy D).
+constexpr unsigned kMaxCrossFnChainDepth = 3;
+
+/// Trace memref operand back to a memref.get_global op, accepting only the
 /// trivial chain memref.get_global → load. Returns nullptr if not such a
 /// trivial chain (e.g. through subview, cast, function arg).
 static mlir::Operation *traceLoadToGlobal(mlir::Value memref) {
@@ -2633,30 +2682,129 @@ static mlir::Operation *traceLoadToGlobal(mlir::Value memref) {
   return nullptr;
 }
 
-/// Walk \p storeOp's stored-value operand tree. Accept pure ops whose leaves
-/// are constants or block args of \p writerFn's entry block. Memref loads
-/// are accepted (and recorded as hoistable) only when the load's memref
-/// traces to a memref.get_global and the writer's static call-tree contains
-/// no transitive write to that global (\p fnWritesGlobal). Caller-side
-/// phase-disjoint check happens later. Pure runtime calls accepted.
+/// Resolve a get_global op to its memref::GlobalOp definition.
+static mlir::Operation *
+resolveGetGlobal(mlir::Operation *getGlobalOp, mlir::ModuleOp moduleOp) {
+  auto gg = mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(getGlobalOp);
+  if (!gg) return nullptr;
+  return mlir::SymbolTable::lookupNearestSymbolFrom(moduleOp,
+                                                    gg.getNameAttr());
+}
+
+/// Helper: extract the memref operand of a load op (memref/affine).
+static mlir::Value getLoadMemref(mlir::Operation *def) {
+  if (auto l = mlir::dyn_cast<mlir::memref::LoadOp>(def))
+    return l.getMemref();
+  if (auto l = mlir::dyn_cast<mlir::affine::AffineLoadOp>(def))
+    return l.getMemref();
+  return nullptr;
+}
+
+/// Forward decl: the unified entry point. depth and seenStores guard
+/// recursion (Strategy D).
 static bool buildCrossFunctionRematPlan(
     mlir::Operation *storeOp,
     mlir::FunctionOpInterface writerFn,
     AllocationRoots &allocRootFor,
+    LoadProvenanceMap &loadProv,
     llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
         fnWritesGlobal,
-    CrossFnRematPlan &plan) {
-  plan.opsToClone.clear();
-  plan.writerArgs.clear();
-  plan.hoistedLoadGlobals.clear();
+    CrossFnRematPlan &plan,
+    unsigned depth,
+    llvm::SmallDenseSet<mlir::Operation *> seenStores);
 
-  mlir::Value root = getStoredValue(storeOp);
-  if (!root) return false;
-  plan.rootValue = root;
+/// Find the outermost scf.for / affine.for ancestor of \p op that is
+/// nested inside \p funcOp. Returns nullptr if op is at the top level of
+/// funcOp or not under any supported loop.
+static mlir::Operation *
+findOutermostEnclosingLoop(mlir::Operation *op,
+                           mlir::FunctionOpInterface funcOp) {
+  mlir::Operation *outer = nullptr;
+  mlir::Operation *cur = op->getParentOp();
+  while (cur && cur != funcOp.getOperation()) {
+    if (mlir::isa<mlir::scf::ForOp, mlir::affine::AffineForOp>(cur))
+      outer = cur;
+    else if (!mlir::isa<mlir::scf::ParallelOp>(cur)) {
+      // Any other region op (scf.if, etc.) — unsupported.
+      // We don't reject here because the loop might still wrap it; only
+      // the eventual buildLoopPlan body-check enforces purity.
+    }
+    cur = cur->getParentOp();
+  }
+  return outer;
+}
 
+/// Verify that \p loop's bounds (lower, upper, step) reduce to entry-block
+/// args of \p writerFn or compile-time constants. Returns true and sets
+/// \p staticBounds=true if all three are constants.
+static bool loopBoundsAreEntryArgsOrConst(mlir::Operation *loop,
+                                          mlir::FunctionOpInterface writerFn,
+                                          bool &staticBounds) {
+  mlir::Region *body = writerFn.getCallableRegion();
+  if (!body || body->empty()) return false;
+  mlir::Block *entry = &body->front();
+
+  auto isAcceptable = [&](mlir::Value v) -> bool {
+    if (!v) return false;
+    if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v))
+      return barg.getOwner() == entry;
+    auto *def = v.getDefiningOp();
+    return def && def->hasTrait<mlir::OpTrait::ConstantLike>();
+  };
+
+  if (auto sf = mlir::dyn_cast<mlir::scf::ForOp>(loop)) {
+    bool lbC = sf.getLowerBound().getDefiningOp() &&
+               sf.getLowerBound().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
+    bool ubC = sf.getUpperBound().getDefiningOp() &&
+               sf.getUpperBound().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
+    bool stC = sf.getStep().getDefiningOp() &&
+               sf.getStep().getDefiningOp()->hasTrait<mlir::OpTrait::ConstantLike>();
+    staticBounds = lbC && ubC && stC;
+    if (!isAcceptable(sf.getLowerBound())) return false;
+    if (!isAcceptable(sf.getUpperBound())) return false;
+    if (!isAcceptable(sf.getStep())) return false;
+    if (!sf.getInitArgs().empty()) return false; // no iter_args
+    return true;
+  }
+  if (auto af = mlir::dyn_cast<mlir::affine::AffineForOp>(loop)) {
+    // Affine bounds may be constants or affine_maps over entry-block args.
+    // Accept the constant lb/ub case + the case where map operands are
+    // entry-block args.
+    auto checkOperands = [&](mlir::OperandRange ops) {
+      for (mlir::Value v : ops)
+        if (!isAcceptable(v)) return false;
+      return true;
+    };
+    if (!checkOperands(af.getLowerBoundOperands())) return false;
+    if (!checkOperands(af.getUpperBoundOperands())) return false;
+    staticBounds = af.hasConstantLowerBound() && af.hasConstantUpperBound();
+    if (!af.getInits().empty()) return false; // no iter_args
+    return true;
+  }
+  return false;
+}
+
+/// Straight-line plan-builder: walks storeOp's stored-value operand tree
+/// at-the-top-level of writerFn (no enclosing loops). Same shape as the
+/// pre-D code, plus: (a) on inner-load hoist failure, attempt recursive
+/// sub-plan substitution via loadProv (Strategy D); (b) accepts loop-IV
+/// block-args when \p inLoopBody is the parent region under which IVs are
+/// legal (used by buildLoopPlan to share this walker).
+static bool walkStoredValueTree(
+    mlir::Value root,
+    mlir::FunctionOpInterface writerFn,
+    mlir::Region *loopRegion, // nullable; iv-args of blocks under this are accepted
+    AllocationRoots &allocRootFor,
+    LoadProvenanceMap &loadProv,
+    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+        fnWritesGlobal,
+    CrossFnRematPlan &plan,
+    unsigned depth,
+    llvm::SmallDenseSet<mlir::Operation *> &seenStores) {
   mlir::Region *body = writerFn.getCallableRegion();
   if (!body || body->empty()) return false;
   mlir::Block *entryBlock = &body->front();
+  mlir::ModuleOp moduleOp = writerFn->getParentOfType<mlir::ModuleOp>();
 
   llvm::SmallVector<mlir::Value, 8> worklist{root};
   llvm::SmallDenseSet<mlir::Value> visited;
@@ -2668,37 +2816,101 @@ static bool buildCrossFunctionRematPlan(
     if (!visited.insert(cur).second) continue;
 
     if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(cur)) {
-      if (barg.getOwner() != entryBlock)
-        return false; // loop IV / nested block — not available at caller
-      if (seenArgIdx.insert(barg.getArgNumber()).second)
-        plan.writerArgs.push_back(barg);
-      continue;
+      if (barg.getOwner() == entryBlock) {
+        if (seenArgIdx.insert(barg.getArgNumber()).second)
+          plan.writerArgs.push_back(barg);
+        continue;
+      }
+      // Loop-IV block-arg: accept only if its owner block lives under
+      // loopRegion (the loop we plan to clone). Otherwise unavailable
+      // at caller.
+      if (loopRegion && loopRegion->findAncestorBlockInRegion(
+                            *barg.getOwner()) == barg.getOwner())
+        continue; // IV reproduced via region clone at caller
+      return false;
     }
 
     mlir::Operation *def = cur.getDefiningOp();
     if (!def) return false;
 
-    bool isHoistableLoad = false;
     if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(def)) {
-      mlir::Value memref =
-          mlir::isa<mlir::memref::LoadOp>(def)
-              ? mlir::cast<mlir::memref::LoadOp>(def).getMemref()
-              : mlir::cast<mlir::affine::AffineLoadOp>(def).getMemref();
-      mlir::Operation *globalOp = traceLoadToGlobal(memref);
-      if (!globalOp) return false;
-      if (fnWritesGlobal(writerFn.getOperation(), globalOp))
-        return false;
-      (void)allocRootFor;
+      mlir::Value memref = getLoadMemref(def);
+      mlir::Operation *getGlobalOp = traceLoadToGlobal(memref);
+      if (!getGlobalOp) return false;
+      mlir::Operation *globalOp = resolveGetGlobal(getGlobalOp, moduleOp);
+
+      // Strategy D — try a recursive sub-plan first when loadProv has a
+      // unique cross-fn store. Sub-plan is strictly more permissive at
+      // the per-caller stage (the global itself may be written elsewhere
+      // in caller's call subtree, as long as the inner-writer-call
+      // window is interference-free). Fall back to hoist when sub-plan
+      // is unavailable.
+      auto trySubPlan = [&]() -> bool {
+        if (depth + 1 >= kMaxCrossFnChainDepth) return false;
+        auto provIt = loadProv.find(def);
+        if (provIt == loadProv.end()) return false;
+        const auto &provSet = provIt->second;
+        if (provSet.size() != 1 || provSet.contains(nullptr)) return false;
+        mlir::Operation *innerStore = *provSet.begin();
+        if (!innerStore) return false;
+        if (seenStores.contains(innerStore)) return false;
+        auto innerWriterFn =
+            innerStore->getParentOfType<mlir::FunctionOpInterface>();
+        if (!innerWriterFn) return false;
+        if (innerWriterFn.getOperation() == writerFn.getOperation())
+          return false;
+        mlir::Value innerStoredVal = getStoredValue(innerStore);
+        if (!innerStoredVal) return false;
+        if (innerStoredVal.getType() != def->getResult(0).getType())
+          return false;
+        LoadSubRecord sub;
+        sub.loadOp = def;
+        sub.innerStoreOp = innerStore;
+        sub.innerWriterFn = innerWriterFn;
+        sub.subPlan = std::make_unique<CrossFnRematPlan>();
+        auto subSeen = seenStores;
+        subSeen.insert(innerStore);
+        if (!buildCrossFunctionRematPlan(innerStore, innerWriterFn,
+                                         allocRootFor, loadProv,
+                                         fnWritesGlobal, *sub.subPlan,
+                                         depth + 1, subSeen))
+          return false;
+        mlir::Value innerStoreMemref =
+            drcompiler::getLoadStoreMemref(innerStore);
+        sub.innerGlobalOp =
+            lookupAllocRoot(innerStoreMemref, allocRootFor);
+        if (!sub.innerGlobalOp ||
+            !mlir::isa<mlir::memref::GlobalOp>(sub.innerGlobalOp))
+          return false;
+        plan.loadSubs.push_back(std::move(sub));
+        return true;
+      };
+
+      if (trySubPlan()) {
+        // Don't add the load to opsToClone; don't walk its operands —
+        // substitution is total at this load result.
+        continue;
+      }
+      // Fall back to hoist path.
+      bool canHoist = globalOp &&
+                      !fnWritesGlobal(writerFn.getOperation(), globalOp);
+      if (!canHoist) return false;
       plan.hoistedLoadGlobals.push_back(globalOp);
-      isHoistableLoad = true;
-    } else if (mlir::isa<mlir::LLVM::LoadOp>(def)) {
+      if (added.insert(def).second) {
+        plan.opsToClone.push_back(def);
+        if (plan.opsToClone.size() > kMaxRematOps) return false;
+      }
+      for (mlir::Value operand : def->getOperands())
+        worklist.push_back(operand);
+      continue;
+    }
+    if (mlir::isa<mlir::LLVM::LoadOp>(def)) {
       return false; // LLVM dialect loads not yet supported
-    } else if (mlir::isa<mlir::CallOpInterface>(def)) {
+    }
+    if (mlir::isa<mlir::CallOpInterface>(def)) {
       if (!isPureRuntimeCall(def)) return false;
-      // Pure runtime calls: accept (treated as effect-free for cloning).
-    } else {
-      // Non-load, non-call op: must be memory-effect-free.
-      if (!mlir::isMemoryEffectFree(def)) return false;
+    } else if (!mlir::isMemoryEffectFree(def)) {
+      return false;
     }
 
     if (added.insert(def).second) {
@@ -2707,11 +2919,176 @@ static bool buildCrossFunctionRematPlan(
     }
     for (mlir::Value operand : def->getOperands())
       worklist.push_back(operand);
-    (void)isHoistableLoad;
   }
+  return true;
+}
 
+/// Top-level (no enclosing loop) plan-builder.
+static bool buildStraightLinePlan(
+    mlir::Operation *storeOp,
+    mlir::FunctionOpInterface writerFn,
+    AllocationRoots &allocRootFor,
+    LoadProvenanceMap &loadProv,
+    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+        fnWritesGlobal,
+    CrossFnRematPlan &plan,
+    unsigned depth,
+    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
+  mlir::Value root = getStoredValue(storeOp);
+  if (!root) return false;
+  plan.rootValue = root;
+  if (!walkStoredValueTree(root, writerFn, /*loopRegion=*/nullptr,
+                           allocRootFor, loadProv, fnWritesGlobal, plan,
+                           depth, seenStores))
+    return false;
   std::reverse(plan.opsToClone.begin(), plan.opsToClone.end());
   return true;
+}
+
+/// Loop-cloning plan-builder (Strategy F.2). The store is nested inside an
+/// scf.for / affine.for. We will clone the outermost enclosing loop into
+/// the caller, redirecting writes from the original global to a scratch
+/// buffer.
+static bool buildLoopPlan(
+    mlir::Operation *storeOp,
+    mlir::FunctionOpInterface writerFn,
+    mlir::Operation *outerLoop,
+    AllocationRoots &allocRootFor,
+    LoadProvenanceMap &loadProv,
+    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+        fnWritesGlobal,
+    CrossFnRematPlan &plan,
+    unsigned depth,
+    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
+  mlir::ModuleOp moduleOp = writerFn->getParentOfType<mlir::ModuleOp>();
+
+  // Bounds + iter_args check.
+  bool staticBounds = false;
+  if (!loopBoundsAreEntryArgsOrConst(outerLoop, writerFn, staticBounds))
+    return false;
+
+  // The store's memref must trace to a get_global directly (no
+  // reinterpret_cast / strided sub-region for v1).
+  mlir::Value storeMemref = drcompiler::getLoadStoreMemref(storeOp);
+  if (!storeMemref) return false;
+  mlir::Operation *getGlobalOp =
+      mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(
+          storeMemref.getDefiningOp());
+  if (!getGlobalOp) return false;
+  mlir::Operation *globalOp = resolveGetGlobal(getGlobalOp, moduleOp);
+  if (!globalOp || !mlir::isa<mlir::memref::GlobalOp>(globalOp))
+    return false;
+
+  // Body purity check — walk every op inside outerLoop and ensure each
+  // is one of: the targeted store, a pure arith/constant op, an scf.yield
+  // / affine.yield, a hoistable load, a pure runtime call, or a nested
+  // scf.for/affine.for satisfying the same recursive constraints. Reject
+  // any other store (we don't want extra side effects in cloned region).
+  bool bodyOk = true;
+  outerLoop->walk([&](mlir::Operation *op) {
+    if (op == outerLoop) return mlir::WalkResult::advance();
+    if (op == storeOp) return mlir::WalkResult::advance();
+    if (mlir::isa<mlir::scf::YieldOp, mlir::affine::AffineYieldOp,
+                  mlir::scf::ForOp, mlir::affine::AffineForOp>(op))
+      return mlir::WalkResult::advance();
+    if (drcompiler::isAnyStoreOp(op)) {
+      bodyOk = false;
+      return mlir::WalkResult::interrupt();
+    }
+    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp>(op))
+      return mlir::WalkResult::advance(); // hoist-checked when walking value tree
+    if (mlir::isa<mlir::CallOpInterface>(op)) {
+      if (!isPureRuntimeCall(op)) {
+        bodyOk = false;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    }
+    if (!mlir::isMemoryEffectFree(op)) {
+      bodyOk = false;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (!bodyOk) return false;
+
+  // Collect captures: values used inside outerLoop but defined outside.
+  // The region clone reproduces the loop body verbatim; only external
+  // dependencies need to be cloned/mapped at the caller. Skip the
+  // targeted get_global's result (we'll remap it to the scratch buffer).
+  mlir::Value globalRef = getGlobalOp->getResult(0);
+  llvm::SmallVector<mlir::Value, 8> captures;
+  llvm::SmallDenseSet<mlir::Value> capSeen;
+  outerLoop->walk([&](mlir::Operation *op) {
+    for (mlir::Value v : op->getOperands()) {
+      if (v == globalRef) continue;
+      // Defined outside the loop?
+      if (auto barg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+        if (outerLoop->isAncestor(barg.getOwner()->getParentOp()))
+          continue; // IV / nested block-arg owned by the loop region
+      } else if (auto *def = v.getDefiningOp()) {
+        if (outerLoop->isAncestor(def)) continue;
+      }
+      if (capSeen.insert(v).second) captures.push_back(v);
+    }
+  });
+
+  // Walk each capture as a tree root (treated as straight-line — they're
+  // external to the loop region).
+  for (mlir::Value cap : captures) {
+    if (!walkStoredValueTree(cap, writerFn, /*loopRegion=*/nullptr,
+                             allocRootFor, loadProv, fnWritesGlobal, plan,
+                             depth, seenStores))
+      return false;
+  }
+  std::reverse(plan.opsToClone.begin(), plan.opsToClone.end());
+
+  // rootValue retained for downstream type lookups (scalar element type
+  // matches the global's element type).
+  mlir::Value root = getStoredValue(storeOp);
+  if (!root) return false;
+  plan.rootValue = root;
+
+  LoopMatRecord rec;
+  rec.outerLoopOp = outerLoop;
+  rec.storeOp = storeOp;
+  rec.globalOp = globalOp;
+  rec.getGlobalOp = getGlobalOp;
+  rec.boundsAreStatic = staticBounds;
+  plan.loopMat = rec;
+  return true;
+}
+
+/// Walk \p storeOp's stored-value operand tree. Accept pure ops whose
+/// leaves are constants or block args of \p writerFn's entry block.
+/// Memref loads are accepted (a) as hoists when safe, or (b) via Strategy
+/// D recursive sub-plans. Stores nested inside an scf.for / affine.for are
+/// handled via Strategy F (loop materialization).
+static bool buildCrossFunctionRematPlan(
+    mlir::Operation *storeOp,
+    mlir::FunctionOpInterface writerFn,
+    AllocationRoots &allocRootFor,
+    LoadProvenanceMap &loadProv,
+    llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+        fnWritesGlobal,
+    CrossFnRematPlan &plan,
+    unsigned depth,
+    llvm::SmallDenseSet<mlir::Operation *> seenStores) {
+  plan.opsToClone.clear();
+  plan.writerArgs.clear();
+  plan.hoistedLoadGlobals.clear();
+  plan.loadSubs.clear();
+  plan.loopMat.reset();
+
+  mlir::Operation *outerLoop =
+      findOutermostEnclosingLoop(storeOp, writerFn);
+  if (!outerLoop) {
+    // Top-level store — straight-line.
+    return buildStraightLinePlan(storeOp, writerFn, allocRootFor, loadProv,
+                                 fnWritesGlobal, plan, depth, seenStores);
+  }
+  return buildLoopPlan(storeOp, writerFn, outerLoop, allocRootFor, loadProv,
+                       fnWritesGlobal, plan, depth, seenStores);
 }
 
 /// Find the latest call to \p writerFn in \p caller that strictly dominates
@@ -2805,14 +3182,100 @@ findEligibleWriterCall(mlir::FunctionOpInterface caller,
   return latest;
 }
 
-/// Materialize the writer's expression at the caller, just before
-/// \p writerCall, by cloning \p plan.opsToClone with the writer's
-/// block-args remapped to \p writerCall's call operands. Returns the
-/// materialized value (the equivalent of \p plan.rootValue).
+/// Materialization context — bundles caller-side analysis state needed
+/// for sub-plan resolution (Strategy D).
+struct MatCtx {
+  mlir::DominanceInfo *domInfo = nullptr;
+  const ModuleGlobalWrites *moduleGlobalWrites = nullptr;
+  AllocationRoots *allocRootFor = nullptr;
+  const llvm::DenseSet<mlir::Operation *> *globalAllocs = nullptr;
+  llvm::function_ref<bool(mlir::Operation *, mlir::Operation *)>
+      fnWritesGlobal;
+};
+
+/// Materialize the writer's expression at the caller, just after
+/// \p writerCall. For straight-line plans, clones \p plan.opsToClone with
+/// the writer's entry-block args remapped to writerCall's operands. For
+/// loop-mat plans (Strategy F), allocates a scratch buffer and clones the
+/// outer loop into it. For sub-plans (Strategy D), recurses into each
+/// LoadSubRecord, anchored after a separately-resolved inner-writer-call
+/// in the same caller function.
 static mlir::Value materializeAtCaller(mlir::Operation *writerCall,
                                        const CrossFnRematPlan &plan,
-                                       mlir::OpBuilder &builder) {
+                                       mlir::OpBuilder &builder,
+                                       const MatCtx &ctx);
+
+/// Resolve an inner-writer-call in the same caller function that
+/// dominates \p anchorCall and is interference-free for \p sub.
+static mlir::Operation *
+resolveInnerWriterCall(mlir::Operation *anchorCall, const LoadSubRecord &sub,
+                       const MatCtx &ctx) {
+  auto callerFn =
+      anchorCall->getParentOfType<mlir::FunctionOpInterface>();
+  if (!callerFn) return nullptr;
+  return findEligibleWriterCall(callerFn, anchorCall, sub.innerWriterFn,
+                                sub.innerGlobalOp, *ctx.domInfo,
+                                *ctx.moduleGlobalWrites, *ctx.allocRootFor,
+                                *ctx.globalAllocs, ctx.fnWritesGlobal);
+}
+
+/// Strategy F materializer: clones the writer's outer loop into a scratch
+/// buffer at the caller and returns the scratch memref.
+static mlir::Value materializeLoop(mlir::Operation *writerCall,
+                                   const CrossFnRematPlan &plan,
+                                   mlir::OpBuilder &builder) {
+  const auto &lm = *plan.loopMat;
+  auto globalOp = mlir::cast<mlir::memref::GlobalOp>(lm.globalOp);
+  auto memrefTy = mlir::cast<mlir::MemRefType>(globalOp.getType());
+
+  // 1. Allocate scratch (memref.alloca with the global's static type).
+  builder.setInsertionPointAfter(writerCall);
+  if (!memrefTy.hasStaticShape()) return {};
+  auto scratch = builder.create<mlir::memref::AllocaOp>(
+      writerCall->getLoc(), memrefTy);
+
+  // 2. Clone external dependencies (plan.opsToClone — captures of the loop
+  //    region that come from outside).
   mlir::IRMapping mapping;
+  for (mlir::BlockArgument arg : plan.writerArgs) {
+    unsigned idx = arg.getArgNumber();
+    if (idx >= writerCall->getNumOperands()) return {};
+    mapping.map((mlir::Value)arg, writerCall->getOperand(idx));
+  }
+  // Map the writer's get_global result to the scratch memref so the cloned
+  // store writes to scratch instead of the original global.
+  mapping.map(lm.getGlobalOp->getResult(0), scratch.getResult());
+
+  for (mlir::Operation *op : plan.opsToClone) {
+    mlir::Operation *cloned = builder.clone(*op, mapping);
+    for (auto [oldRes, newRes] :
+         llvm::zip(op->getResults(), cloned->getResults()))
+      mapping.map(oldRes, newRes);
+  }
+  // 3. Clone the outer loop op via region clone (deep-clones body).
+  builder.clone(*lm.outerLoopOp, mapping);
+  return scratch.getResult();
+}
+
+static mlir::Value materializeAtCaller(mlir::Operation *writerCall,
+                                       const CrossFnRematPlan &plan,
+                                       mlir::OpBuilder &builder,
+                                       const MatCtx &ctx) {
+  if (plan.loopMat) return materializeLoop(writerCall, plan, builder);
+
+  mlir::IRMapping mapping;
+  // Strategy D — materialize each sub-plan at its own innerWC, then bind
+  // the outer load's result to the materialized sub-value via the mapping.
+  for (const LoadSubRecord &sub : plan.loadSubs) {
+    mlir::Operation *innerWC = resolveInnerWriterCall(writerCall, sub, ctx);
+    if (!innerWC) return {};
+    mlir::OpBuilder subBuilder(innerWC);
+    mlir::Value subVal =
+        materializeAtCaller(innerWC, *sub.subPlan, subBuilder, ctx);
+    if (!subVal) return {};
+    mapping.map(sub.loadOp->getResult(0), subVal);
+  }
+
   // Map writer's entry-block args to the caller's call operands.
   for (mlir::BlockArgument arg : plan.writerArgs) {
     unsigned idx = arg.getArgNumber();
@@ -2855,6 +3318,45 @@ addParamAndReplaceLoads(mlir::FunctionOpInterface funcOp,
   // Replace each load with the new arg, then erase.
   for (mlir::Operation *l : loadOps) {
     l->getResult(0).replaceAllUsesWith(newArg);
+    l->erase();
+  }
+  return newArg;
+}
+
+/// Strategy F.2 reader-side rewrite: add an extra memref entry-block arg
+/// and rewrite each load in \p loadOps to load from the new arg at the
+/// same indices (instead of the original global). Returns the new arg.
+static mlir::BlockArgument
+addMemrefParamAndRewriteLoads(mlir::FunctionOpInterface funcOp,
+                              mlir::Type memrefTy,
+                              llvm::ArrayRef<mlir::Operation *> loadOps) {
+  mlir::Region *body = funcOp.getCallableRegion();
+  mlir::Block *entry = &body->front();
+  mlir::BlockArgument newArg =
+      entry->addArgument(memrefTy, funcOp.getLoc());
+
+  llvm::SmallVector<mlir::Type> newInputs(funcOp.getArgumentTypes().begin(),
+                                           funcOp.getArgumentTypes().end());
+  newInputs.push_back(memrefTy);
+  auto newFnTy = mlir::FunctionType::get(funcOp.getContext(), newInputs,
+                                         funcOp.getResultTypes());
+  funcOp.setType(newFnTy);
+
+  for (mlir::Operation *l : loadOps) {
+    mlir::OpBuilder b(l);
+    mlir::Value newRes;
+    if (auto ml = mlir::dyn_cast<mlir::memref::LoadOp>(l)) {
+      newRes = b.create<mlir::memref::LoadOp>(l->getLoc(), newArg,
+                                               ml.getIndices())
+                   .getResult();
+    } else if (auto al = mlir::dyn_cast<mlir::affine::AffineLoadOp>(l)) {
+      newRes = b.create<mlir::affine::AffineLoadOp>(
+                    l->getLoc(), newArg, al.getAffineMap(), al.getIndices())
+                   .getResult();
+    } else {
+      continue;
+    }
+    l->getResult(0).replaceAllUsesWith(newRes);
     l->erase();
   }
   return newArg;
@@ -3852,8 +4354,11 @@ void DataRecomputationPass::runOnOperation() {
 
       // Build remat plan from the writer's stored value.
       CrossFnRematPlan plan;
+      llvm::SmallDenseSet<mlir::Operation *> seenStores{storeOp};
       if (!buildCrossFunctionRematPlan(storeOp, writerFn, allocRootFor,
-                                       fnTransitivelyWritesGlobal, plan)) {
+                                       loadProv,
+                                       fnTransitivelyWritesGlobal, plan,
+                                       /*depth=*/0, seenStores)) {
         if (drTestDiagnostics)
           for (auto *l : loadOps)
             l->emitRemark() << "interproc-cross: REJECT_PLAN";
@@ -3912,11 +4417,15 @@ void DataRecomputationPass::runOnOperation() {
       };
 
       // Hoisted-load safety per caller: writers of any hoisted global must
-      // not be reachable from the caller's static call subtree.
-      auto hoistedLoadsSafeAt = [&](mlir::Operation *callerOp) -> bool {
-        if (plan.hoistedLoadGlobals.empty()) return true;
+      // not be reachable from the caller's static call subtree. Recurses
+      // through sub-plans (Strategy D) so that chained inner plans are
+      // also checked.
+      std::function<bool(mlir::Operation *, const CrossFnRematPlan &)>
+          hoistedLoadsSafeAt =
+              [&](mlir::Operation *callerOp,
+                  const CrossFnRematPlan &p) -> bool {
         auto &callees = computeTransClos(callerOp);
-        for (mlir::Operation *gOp : plan.hoistedLoadGlobals) {
+        for (mlir::Operation *gOp : p.hoistedLoadGlobals) {
           auto wIt = moduleGlobalWrites.find(gOp);
           if (wIt == moduleGlobalWrites.end()) continue;
           for (auto &e : wIt->second) {
@@ -3927,6 +4436,31 @@ void DataRecomputationPass::runOnOperation() {
             if (callees.count(wFn.getOperation())) return false;
           }
         }
+        for (const LoadSubRecord &sub : p.loadSubs) {
+          if (!hoistedLoadsSafeAt(callerOp, *sub.subPlan)) return false;
+        }
+        return true;
+      };
+
+      // Strategy D — verify each sub-plan resolves to an eligible
+      // inner-writer-call inside this caller, anchored before
+      // \p anchorCall (the next-outer materialization point).
+      std::function<bool(mlir::FunctionOpInterface,
+                         mlir::Operation *,
+                         const CrossFnRematPlan &)>
+          chainedSubsValidAt =
+              [&](mlir::FunctionOpInterface callerFn,
+                  mlir::Operation *anchorCall,
+                  const CrossFnRematPlan &p) -> bool {
+        for (const LoadSubRecord &sub : p.loadSubs) {
+          mlir::Operation *innerWC = findEligibleWriterCall(
+              callerFn, anchorCall, sub.innerWriterFn, sub.innerGlobalOp,
+              domInfoTop, moduleGlobalWrites, allocRootFor, globalAllocs,
+              fnTransitivelyWritesGlobal);
+          if (!innerWC) return false;
+          if (!chainedSubsValidAt(callerFn, innerWC, *sub.subPlan))
+            return false;
+        }
         return true;
       };
 
@@ -3934,7 +4468,7 @@ void DataRecomputationPass::runOnOperation() {
         auto callerFn = edge.callSiteOp
                             ->getParentOfType<mlir::FunctionOpInterface>();
         if (!callerFn) { nonConforming.push_back(edge.callSiteOp); continue; }
-        if (!hoistedLoadsSafeAt(callerFn.getOperation())) {
+        if (!hoistedLoadsSafeAt(callerFn.getOperation(), plan)) {
           nonConforming.push_back(edge.callSiteOp);
           continue;
         }
@@ -3943,6 +4477,12 @@ void DataRecomputationPass::runOnOperation() {
             moduleGlobalWrites, allocRootFor, globalAllocs,
             fnTransitivelyWritesGlobal);
         if (!writerCall) {
+          nonConforming.push_back(edge.callSiteOp);
+          continue;
+        }
+        // Strategy D — verify all sub-plans resolve at this caller.
+        if (!plan.loadSubs.empty() &&
+            !chainedSubsValidAt(callerFn, writerCall, plan)) {
           nonConforming.push_back(edge.callSiteOp);
           continue;
         }
@@ -3964,15 +4504,28 @@ void DataRecomputationPass::runOnOperation() {
                      cgIt->second.size() == conforming.size() &&
                      conforming.size() == 1;
 
-      mlir::Type extraTy = plan.rootValue.getType();
+      // Plan kind drives the extra-arg type and reader-side rewrite path.
+      // Straight-line / D plans pass a scalar; F.2 plans pass a memref
+      // (the scratch buffer) and rewrite reader's loads via memref swap.
+      bool isLoopMat = plan.loopMat.has_value();
+      mlir::Type extraTy =
+          isLoopMat ? mlir::cast<mlir::memref::GlobalOp>(plan.loopMat->globalOp)
+                          .getType()
+                    : plan.rootValue.getType();
+
+      MatCtx matCtx{&domInfoTop, &moduleGlobalWrites, &allocRootFor,
+                    &globalAllocs, fnTransitivelyWritesGlobal};
 
       if (inPlace) {
-        // Mutate readerFn in place. Replace all matching loads with the
-        // new arg.
-        addParamAndReplaceLoads(readerFn, extraTy, loadOps);
+        // Mutate readerFn in place.
+        if (isLoopMat)
+          addMemrefParamAndRewriteLoads(readerFn, extraTy, loadOps);
+        else
+          addParamAndReplaceLoads(readerFn, extraTy, loadOps);
         auto &site = conforming.front();
         mlir::OpBuilder builder(site.writerCall);
-        mlir::Value matVal = materializeAtCaller(site.writerCall, plan, builder);
+        mlir::Value matVal =
+            materializeAtCaller(site.writerCall, plan, builder, matCtx);
         if (!matVal) continue;
         if (drTestDiagnostics)
           site.readerCall->emitRemark() << "interproc-cross: ACCEPT_INPLACE";
@@ -3985,9 +4538,6 @@ void DataRecomputationPass::runOnOperation() {
         {
           mlir::Region *origBody = readerFn.getCallableRegion();
           mlir::Region *specBody = spec.getCallableRegion();
-          // Build a position-index map: for each original loadOp, the
-          // (linear walk index) in origBody. Then pick the same index in
-          // specBody.
           llvm::DenseMap<mlir::Operation *, unsigned> idxOfLoad;
           unsigned i = 0;
           origBody->walk([&](mlir::Operation *op) {
@@ -4006,12 +4556,12 @@ void DataRecomputationPass::runOnOperation() {
               clonedLoads.push_back(clonedLoadOrder[it->second]);
           }
         }
-        addParamAndReplaceLoads(spec, extraTy, clonedLoads);
+        if (isLoopMat)
+          addMemrefParamAndRewriteLoads(spec, extraTy, clonedLoads);
+        else
+          addParamAndReplaceLoads(spec, extraTy, clonedLoads);
 
-        // Cache one materialization per writerCall: multiple readers in
-        // the same caller may share the same writer-call as their latest
-        // dominator. Cloning the plan once and reusing the materialized
-        // value avoids duplicate IR + redundant compute at runtime.
+        // Cache one materialization per writerCall.
         llvm::DenseMap<mlir::Operation *, mlir::Value> matCache;
         for (auto &site : conforming) {
           mlir::Value matVal;
@@ -4020,7 +4570,8 @@ void DataRecomputationPass::runOnOperation() {
             matVal = cIt->second;
           } else {
             mlir::OpBuilder builder(site.writerCall);
-            matVal = materializeAtCaller(site.writerCall, plan, builder);
+            matVal =
+                materializeAtCaller(site.writerCall, plan, builder, matCtx);
             if (!matVal) continue;
             matCache[site.writerCall] = matVal;
           }
