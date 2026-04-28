@@ -83,6 +83,57 @@ add_subdirectory(lib/Transforms)
 add_subdirectory(tools)
 
 #===----------------------------------------------------------------------===//
+# Install / export for out-of-tree consumers (e.g. marco)
+#===----------------------------------------------------------------------===//
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+target_include_directories(DRCompTransforms
+  INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+install(TARGETS DRCompTransforms
+  EXPORT DRCompilerTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(DIRECTORY include/drcompiler
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  FILES_MATCHING
+    PATTERN "*.h"
+    PATTERN "*.td"
+    PATTERN "*.inc")
+
+# Tablegen'd Passes.h.inc lives in build tree.
+install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/drcompiler
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  FILES_MATCHING
+    PATTERN "*.inc"
+    PATTERN "CMakeFiles" EXCLUDE)
+
+install(EXPORT DRCompilerTargets
+  FILE DRCompilerTargets.cmake
+  NAMESPACE drcompiler::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DRCompiler)
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/DRCompilerConfig.cmake.in
+"@PACKAGE_INIT@
+include(\"\${CMAKE_CURRENT_LIST_DIR}/DRCompilerTargets.cmake\")
+")
+
+configure_package_config_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/DRCompilerConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/DRCompilerConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DRCompiler)
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/DRCompilerConfig.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/DRCompiler)
+
+#===----------------------------------------------------------------------===//
 # Testing (LLVM lit)
 #===----------------------------------------------------------------------===//
 
