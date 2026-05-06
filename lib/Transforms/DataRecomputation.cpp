@@ -192,6 +192,18 @@ static AllocationRoots collectAllocationRoots(DRPassContext &passCtx,
         }
       }
     }
+
+    // krnl.global is an unregistered op (we don't link the krnl dialect)
+    // produced by onnx-mlir for constant tensors. Each instance produces a
+    // memref result that behaves as a static, never-written global. Treat
+    // the op itself as the allocation root, analogous to memref::GlobalOp.
+    if (op->getName().getStringRef() == "krnl.global") {
+      for (mlir::Value res : op->getResults()) {
+        if (mlir::isa<mlir::MemRefType>(res.getType())) {
+          allocRootFor.try_emplace(res, op);
+        }
+      }
+    }
   });
 
   return allocRootFor;
@@ -458,22 +470,6 @@ static void killDependentStores(
   }
 }
 
-/// Try to extract concrete constant indices from a store/load's index operands.
-/// Returns a PointSet containing the single accessed point, or nullopt if
-/// any index is non-constant.
-static std::optional<PointSet> computeAccessIndices(
-    mlir::Operation::operand_range indices) {
-  llvm::SmallVector<int64_t> coords;
-  for (mlir::Value idx : indices) {
-    auto constOp = idx.getDefiningOp<mlir::arith::ConstantOp>();
-    if (!constOp) return std::nullopt;
-    auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue());
-    if (!intAttr) return std::nullopt;
-    coords.push_back(intAttr.getInt());
-  }
-  return PointSet::fromCoords(coords);
-}
-
 /// Try to fold an SSA value reaching an affine.store/load index into a
 /// constant. Handles arith.constant, statically trip-1 affine.for IVs (the
 /// IV must equal the constant lower bound on its single iteration), and
@@ -515,10 +511,64 @@ static std::optional<int64_t> tryFoldAffineValue(mlir::Value v) {
   return std::nullopt;
 }
 
-/// Like computeAccessIndices but for affine.store/load: applies the op's
-/// AffineMap to its operands after folding each operand to a constant.
-static std::optional<PointSet> computeAffineAccessIndices(
-    mlir::AffineMap map, mlir::Operation::operand_range mapOperands) {
+/// Linearize integer coords on memref `v` into a single base-relative
+/// element offset using `v`'s strided layout. Works uniformly through
+/// view chains because MLIR's memref type carries the absolute strides
+/// and offset from the underlying buffer's element 0. Returns nullopt on
+/// dynamic strides/offset, rank mismatch, or non-MemRef type.
+static std::optional<int64_t>
+linearizeCoords(mlir::Value v, llvm::ArrayRef<int64_t> coords) {
+  auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(v.getType());
+  if (!memrefTy)
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 4> strides;
+  int64_t offset;
+  if (mlir::failed(memrefTy.getStridesAndOffset(strides, offset)))
+    return std::nullopt;
+  if (mlir::ShapedType::isDynamic(offset))
+    return std::nullopt;
+  if (strides.size() != coords.size())
+    return std::nullopt;
+  int64_t lin = offset;
+  for (size_t i = 0; i < coords.size(); ++i) {
+    if (mlir::ShapedType::isDynamic(strides[i]))
+      return std::nullopt;
+    lin += strides[i] * coords[i];
+  }
+  return lin;
+}
+
+/// Coverage for a memref.load/store, expressed as a base-linear single
+/// point set. Uniform across direct accesses and accesses through any
+/// chain of static-strided view-like ops. Returns nullopt if any index
+/// is non-constant or the strided layout is dynamic.
+static std::optional<PointSet> computeBaseLinearMemrefAccess(
+    mlir::Value memref, mlir::Operation::operand_range indices) {
+  llvm::SmallVector<int64_t, 4> coords;
+  for (mlir::Value idx : indices) {
+    auto constOp = idx.getDefiningOp<mlir::arith::ConstantOp>();
+    if (!constOp)
+      return std::nullopt;
+    auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue());
+    if (!intAttr)
+      return std::nullopt;
+    coords.push_back(intAttr.getInt());
+  }
+  auto lin = linearizeCoords(memref, coords);
+  if (!lin)
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 1> linCoords{*lin};
+  return PointSet::fromCoords(linCoords);
+}
+
+/// Coverage for an affine.load/store, expressed as a base-linear single
+/// point set. Folds the affine map with `tryFoldAffineValue` to obtain
+/// concrete multi-dim coords, then linearizes via the memref's strided
+/// layout. Returns nullopt if any operand fails to fold or the layout is
+/// dynamic.
+static std::optional<PointSet> computeBaseLinearAffineAccess(
+    mlir::Value memref, mlir::AffineMap map,
+    mlir::Operation::operand_range mapOperands) {
   if (map.getNumInputs() !=
       static_cast<unsigned>(llvm::range_size(mapOperands)))
     return std::nullopt;
@@ -526,7 +576,8 @@ static std::optional<PointSet> computeAffineAccessIndices(
   llvm::SmallVector<mlir::Attribute, 4> operandAttrs;
   for (mlir::Value v : mapOperands) {
     auto folded = tryFoldAffineValue(v);
-    if (!folded) return std::nullopt;
+    if (!folded)
+      return std::nullopt;
     operandAttrs.push_back(mlir::IntegerAttr::get(idxTy, *folded));
   }
   llvm::SmallVector<mlir::Attribute, 4> results;
@@ -535,10 +586,15 @@ static std::optional<PointSet> computeAffineAccessIndices(
   llvm::SmallVector<int64_t, 4> coords;
   for (mlir::Attribute a : results) {
     auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(a);
-    if (!intAttr) return std::nullopt;
+    if (!intAttr)
+      return std::nullopt;
     coords.push_back(intAttr.getInt());
   }
-  return PointSet::fromCoords(coords);
+  auto lin = linearizeCoords(memref, coords);
+  if (!lin)
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 1> linCoords{*lin};
+  return PointSet::fromCoords(linCoords);
 }
 
 /// Update state to reflect a memref.store.
@@ -567,12 +623,12 @@ void applyStore(
       // Rank-0 store: kill all prior entries and replace.
       state[it->second] = {{storeOp.getOperation(), std::nullopt}};
     } else {
-      // Determine coverage: concrete if all indices are constant and the
-      // store is not through a ViewLike op; nullopt otherwise.
-      bool throughView = (base != storeOp.getMemRef());
-      auto coverage = throughView
-                          ? std::nullopt
-                          : computeAccessIndices(storeOp.getIndices());
+      // Determine coverage as a base-linear point set. Works through any
+      // chain of static-strided view-like ops (subview, reinterpret_cast,
+      // cast, view) — falls back to nullopt only on dynamic indices or
+      // dynamic strides/offset.
+      auto coverage = computeBaseLinearMemrefAccess(
+          storeOp.getMemRef(), storeOp.getIndices());
 
       if (coverage) {
         // Concrete coverage: subtract from prior entries, remove dead ones.
@@ -1012,12 +1068,9 @@ static void analyzeStoreOp(mlir::Operation *op, StoreMap &state,
       auto it = allocRootFor.find(base);
       if (it == allocRootFor.end()) continue;
       killDependentStores(it->second, state, ctx.storeValueDeps);
-      bool throughView = (base != affStore.getMemRef());
-      auto coverage =
-          throughView
-              ? std::nullopt
-              : computeAffineAccessIndices(affStore.getAffineMap(),
-                                           affStore.getMapOperands());
+      auto coverage = computeBaseLinearAffineAccess(
+          affStore.getMemRef(), affStore.getAffineMap(),
+          affStore.getMapOperands());
       if (coverage) {
         llvm::erase_if(state[it->second], [&](IndexedStore &entry) {
           if (!entry.coverage) return false;
@@ -1059,17 +1112,15 @@ static void recordLoadProvenance(mlir::Operation *loadOp, mlir::Value memref,
     std::optional<PointSet> loadCoverage;
     if (isMemrefLoad) {
       auto load = mlir::cast<mlir::memref::LoadOp>(loadOp);
-      bool throughView = (base != load.getMemRef());
-      loadCoverage = (load.getIndices().empty() || throughView)
+      loadCoverage = load.getIndices().empty()
                          ? std::nullopt
-                         : computeAccessIndices(load.getIndices());
+                         : computeBaseLinearMemrefAccess(load.getMemRef(),
+                                                         load.getIndices());
     } else if (auto affLoad =
                    mlir::dyn_cast<mlir::affine::AffineLoadOp>(loadOp)) {
-      bool throughView = (base != affLoad.getMemRef());
-      loadCoverage = throughView
-                         ? std::nullopt
-                         : computeAffineAccessIndices(
-                               affLoad.getAffineMap(), affLoad.getMapOperands());
+      loadCoverage = computeBaseLinearAffineAccess(
+          affLoad.getMemRef(), affLoad.getAffineMap(),
+          affLoad.getMapOperands());
     }
 
     for (const auto &entry : rootIt->second) {
@@ -2070,9 +2121,18 @@ void DataRecomputationPass::runOnOperation() {
         continue;
       }
 
-      // Collect call sites of readerFn from the call graph.
-      auto cgIt = callGraph.find(readerFn.getOperation());
-      if (cgIt == callGraph.end() || cgIt->second.empty()) {
+      // Collect live call sites via a fresh module walk. The callGraph is
+      // built before any IR rewrites; prior rewriteCallSite() calls erase
+      // and replace call-site ops, leaving callGraph entries stale. A walk
+      // over the live IR finds only the ops that are currently in scope.
+      llvm::SmallVector<mlir::Operation *, 4> liveCallSites;
+      moduleOp.walk([&](mlir::func::CallOp call) {
+        auto sym =
+            mlir::dyn_cast<mlir::SymbolRefAttr>(call.getCallableForCallee());
+        if (sym && sym.getRootReference().getValue() == readerFn.getName())
+          liveCallSites.push_back(call.getOperation());
+      });
+      if (liveCallSites.empty()) {
         if (drTestDiagnostics)
           for (auto *l : loadOps)
             l->emitRemark() << "interproc-cross: REJECT_NOCALLERS";
@@ -2157,29 +2217,28 @@ void DataRecomputationPass::runOnOperation() {
         return true;
       };
 
-      for (auto &edge : cgIt->second) {
-        auto callerFn = edge.callSiteOp
-                            ->getParentOfType<mlir::FunctionOpInterface>();
-        if (!callerFn) { nonConforming.push_back(edge.callSiteOp); continue; }
+      for (mlir::Operation *siteOp : liveCallSites) {
+        auto callerFn = siteOp->getParentOfType<mlir::FunctionOpInterface>();
+        if (!callerFn) { nonConforming.push_back(siteOp); continue; }
         if (!hoistedLoadsSafeAt(callerFn.getOperation(), plan)) {
-          nonConforming.push_back(edge.callSiteOp);
+          nonConforming.push_back(siteOp);
           continue;
         }
         auto *writerCall = findEligibleWriterCall(
-            callerFn, edge.callSiteOp, writerFn, globalOp, domInfoTop,
+            callerFn, siteOp, writerFn, globalOp, domInfoTop,
             moduleGlobalWrites, allocRootFor, globalAllocs,
             fnTransitivelyWritesGlobal);
         if (!writerCall) {
-          nonConforming.push_back(edge.callSiteOp);
+          nonConforming.push_back(siteOp);
           continue;
         }
         // Strategy D — verify all sub-plans resolve at this caller.
         if (!plan.loadSubs.empty() &&
             !chainedSubsValidAt(callerFn, writerCall, plan)) {
-          nonConforming.push_back(edge.callSiteOp);
+          nonConforming.push_back(siteOp);
           continue;
         }
-        conforming.push_back({edge.callSiteOp, writerCall});
+        conforming.push_back({siteOp, writerCall});
       }
       if (conforming.empty()) {
         if (drTestDiagnostics)
@@ -2194,7 +2253,7 @@ void DataRecomputationPass::runOnOperation() {
         isPrivate = symOp.getVisibility() ==
                     mlir::SymbolTable::Visibility::Private;
       bool inPlace = isPrivate && nonConforming.empty() &&
-                     cgIt->second.size() == conforming.size() &&
+                     liveCallSites.size() == conforming.size() &&
                      conforming.size() == 1;
 
       // Plan kind drives the extra-arg type and reader-side rewrite path.

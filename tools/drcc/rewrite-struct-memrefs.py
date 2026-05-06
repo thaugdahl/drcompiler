@@ -263,6 +263,16 @@ def rewrite_llvm_memrefs(text):
                 i = close_pos + 1
                 continue
 
+        # Also rewrite memref<?xi8> and memref<Nxi8> (C char* represented as
+        # byte-array memrefs by cgeist for argv and string literals).
+        # Two-pass iteration in rewrite() promotes memref<?xmemref<?xi8>>
+        # first to memref<?x!llvm.ptr> then to !llvm.ptr.
+        if re.match(r'^([0-9]+|\?)\s*x\s*i8$', inner):
+            out.append(text[i:idx])
+            out.append("!llvm.ptr")
+            i = close_pos + 1
+            continue
+
         # Not an LLVM-typed memref -- emit "memref<" and keep scanning inside.
         out.append(text[i : idx + 7])
         i = idx + 7
@@ -280,16 +290,42 @@ def rewrite(text):
     # Phase 2: Rewrite memref.dealloc with LLVM types to llvm.call @free.
     # Must also happen before Phase 3 for the same reason.
     text = rewrite_llvm_dealloc(text)
-    # Phase 3: Replace all remaining memref<...x!llvm.XXX> with !llvm.ptr.
-    # Run to fixpoint: nested types like memref<?x memref<?x !llvm.struct<...>>>
-    # require multiple passes — inner layers get replaced first, producing
-    # memref<?x !llvm.ptr> which is caught on the next pass.
+    # Phase 3: Replace all remaining memref<...x!llvm.XXX> and memref<?xi8>
+    # with !llvm.ptr.  Run to fixpoint: nested types require multiple passes.
     for _ in range(10):  # generous bound; typically 2 passes suffice
         prev = text
         text = rewrite_llvm_memrefs(text)
         if text == prev:
             break
+    # Phase 4: Eliminate polygeist identity ops — after Phase 3 all struct/i8
+    # memref types become !llvm.ptr, making many polygeist.memref2pointer and
+    # polygeist.pointer2memref ops trivially (!llvm.ptr) -> !llvm.ptr.
+    # These prevent convert-func-to-llvm from processing the containing function.
+    # Remove them by substituting all uses of the result with the input SSA value.
+    text = rewrite_polygeist_identity_ops(text)
     return text
+
+
+def rewrite_polygeist_identity_ops(text):
+    """Replace polygeist identity ops with builtin.unrealized_conversion_cast.
+
+    After type rewrites, polygeist.memref2pointer and polygeist.pointer2memref
+    ops whose input and output are both !llvm.ptr are semantic no-ops.
+    Renaming them to builtin.unrealized_conversion_cast (a registered op)
+    lets convert-func-to-llvm process the containing function, and
+    --reconcile-unrealized-casts removes same-type casts at the end.
+
+    Avoids SSA-value substitution so region-scoped name shadowing is safe.
+    """
+    return re.sub(
+        r'(%\S+)\s*=\s*"polygeist\.[^"]*"\((%[^)]+)\)'
+        r'\s*:\s*\(!llvm\.ptr\)\s*->\s*!llvm\.ptr',
+        lambda m: (
+            f'{m.group(1)} = builtin.unrealized_conversion_cast'
+            f' {m.group(2).strip()} : !llvm.ptr to !llvm.ptr'
+        ),
+        text,
+    )
 
 
 def main():
