@@ -2,19 +2,19 @@
 # drcc-base: LLVM 22 + cgeist base image.
 #
 # Assembles pre-built artifacts from the two builder images.
-# Build the builders first (each caches independently):
+# Use build.sh to build with the correct arch tag:
 #
-#   docker build -f docker/cgeist-builder.Dockerfile -t drcc-cgeist-builder .
-#   docker build -f docker/llvm-builder.Dockerfile   -t drcc-llvm-builder .
-#   docker build -f docker/base.Dockerfile            -t drcc-base .
-#
-# Then build drcc on top:
-#   docker build -f docker/drcc.Dockerfile -t drcc .
+#   docker/build.sh --arch x86_64   # or aarch64
 # ==========================================================================
 
-FROM drcc-llvm-builder AS llvm-builder
-FROM drcc-cgeist-builder AS cgeist-builder
+ARG ARCH_TAG=x86_64
 
+# Builder images always carry build-host binaries (cross-compiled or native).
+# $BUILDPLATFORM = host arch; tells Docker not to reject them for arch mismatch.
+FROM --platform=$BUILDPLATFORM drcc-llvm-builder:${ARCH_TAG} AS llvm-builder
+FROM --platform=$BUILDPLATFORM drcc-cgeist-builder:${ARCH_TAG} AS cgeist-builder
+
+# Final image: respects --platform passed to docker buildx build
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
