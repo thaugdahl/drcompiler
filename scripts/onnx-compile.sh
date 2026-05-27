@@ -22,9 +22,14 @@
 #   --no-recompute          Disable dr-recompute (default: on)
 #   --cost-model            Enable dr-cost-model (cache-aware gating)
 #   --partial-remat         Enable dr-partial-remat (implies --cost-model)
+#   --buffer-elim           Enable dr-buffer-elim (whole-buffer feasibility)
+#   --erase-buffers         Enable dr-erase-eliminated-buffers (implies --buffer-elim)
+#   --drives-strategies     Enable dr-buffer-elim-drives-strategies (M4 override;
+#                           implies --buffer-elim)
 #   --full                  Preset: enable all input-less DR bool flags
 #                           (recompute, cost-model, partial-remat,
-#                            footprint-analysis, diagnostics)
+#                            footprint-analysis, buffer-elim, erase-buffers,
+#                            diagnostics)
 #   --partial-max-leaves N  Cap on partial remat leaves (default 4)
 #   --footprint-analysis    Enable dr-footprint-analysis
 #   --diagnostics           Add dr-test-diagnostics
@@ -68,6 +73,9 @@ DR_COST_MODEL=0
 DR_PARTIAL_REMAT=0
 DR_PARTIAL_MAX_LEAVES=""
 DR_FOOTPRINT=0
+DR_BUFFER_ELIM=0
+DR_ERASE_BUFFERS=0
+DR_DRIVES_STRATEGIES=0
 DR_CPU_COST_FILE=""
 DR_L1_SIZE=""; DR_L2_SIZE=""; DR_L3_SIZE=""
 DR_L1_LAT="";  DR_L2_LAT="";  DR_L3_LAT="";  DR_MEM_LAT=""
@@ -81,8 +89,13 @@ while [[ $# -gt 0 ]]; do
     --no-recompute)        DR_RECOMPUTE=0;           shift   ;;
     --cost-model)          DR_COST_MODEL=1;          shift   ;;
     --partial-remat)       DR_PARTIAL_REMAT=1; DR_COST_MODEL=1; shift ;;
+    --buffer-elim)         DR_BUFFER_ELIM=1;         shift   ;;
+    --erase-buffers)       DR_ERASE_BUFFERS=1; DR_BUFFER_ELIM=1; shift ;;
+    --drives-strategies)   DR_DRIVES_STRATEGIES=1; DR_BUFFER_ELIM=1; shift ;;
     --full)                DR_RECOMPUTE=1; DR_COST_MODEL=1; DR_PARTIAL_REMAT=1
-                           DR_FOOTPRINT=1; DIAGNOSTICS=1;       shift ;;
+                           DR_FOOTPRINT=1; DR_BUFFER_ELIM=1; DR_ERASE_BUFFERS=1
+                           DR_DRIVES_STRATEGIES=1;
+                           DIAGNOSTICS=1;                       shift ;;
     --partial-max-leaves)  DR_PARTIAL_MAX_LEAVES="$2"; shift 2 ;;
     --footprint-analysis)  DR_FOOTPRINT=1;           shift   ;;
     --cpu-cost-model)      DR_CPU_COST_FILE="$2";    shift 2 ;;
@@ -132,6 +145,9 @@ else
   [[ "$DR_COST_MODEL"    -eq 1 ]] && DR_OPTS+=("dr-cost-model")
   [[ "$DR_PARTIAL_REMAT" -eq 1 ]] && DR_OPTS+=("dr-partial-remat")
   [[ "$DR_FOOTPRINT"     -eq 1 ]] && DR_OPTS+=("dr-footprint-analysis")
+  [[ "$DR_BUFFER_ELIM"   -eq 1 ]] && DR_OPTS+=("dr-buffer-elim")
+  [[ "$DR_ERASE_BUFFERS" -eq 1 ]] && DR_OPTS+=("dr-erase-eliminated-buffers")
+  [[ "$DR_DRIVES_STRATEGIES" -eq 1 ]] && DR_OPTS+=("dr-buffer-elim-drives-strategies")
   [[ "$DIAGNOSTICS"      -eq 1 ]] && DR_OPTS+=("dr-test-diagnostics")
   [[ -n "$DOT_ABS"             ]] && DR_OPTS+=("dr-dot-file=$DOT_ABS")
   [[ -n "$CPU_COST_ABS"        ]] && DR_OPTS+=("cpu-cost-model-file=$CPU_COST_ABS")

@@ -120,6 +120,40 @@ MaterializationDecision decideBufferStrategy(unsigned aluCost,
                                              unsigned operandPenalty,
                                              const CacheParams &cache);
 
+/// Inputs to the whole-buffer elimination cost rollup. Treats the alloc
+/// as the cost unit (vs the per-load `decideBufferStrategy`).
+struct BufferElimCostInputs {
+  int64_t bufferSizeBytes = 0;    // 0 = dynamic → use l2Size+1 pessimistically
+  unsigned numLoads = 0;
+  unsigned numStores = 0;
+  unsigned loadLatency = 0;       // cycles per load (caller resolves vs cache)
+  unsigned storeLatency = 0;      // cycles per store
+  unsigned allocOverheadCycles = 0;   // amortized malloc/free cost; 0 for alloca
+  unsigned capacityPenaltyCycles = 0; // pressure cost from this buffer
+  unsigned perElemComputeCost = 0;    // ALU cycles to recompute one element
+  unsigned numDistinctComputes = 0;   // distinct (parentFn, structHash) groups
+                                      // across loads; ≤ numLoads. Optimal-CSE
+                                      // assumption: per group, only one compute
+                                      // pays; the rest are folded away.
+  unsigned codeBloatPenalty = 0;      // icache pressure penalty
+  unsigned regPressurePenalty = 0;    // spill penalty
+};
+
+struct BufferElimCostDecision {
+  bool eliminate = false;
+  unsigned keepCost = 0;
+  unsigned elimCost = 0;
+};
+
+/// Cost rollup for whole-buffer elimination.
+///   keepCost = numLoads*loadLatency + numStores*storeLatency
+///              + allocOverhead + capacityPenalty
+///   elimCost = max(0, totalRematCompute - sharedSubexprDiscount)
+///              + codeBloatPenalty + regPressurePenalty
+/// Decision is `elimCost <= keepCost`.
+BufferElimCostDecision
+decideBufferElimination(const BufferElimCostInputs &inputs);
+
 } // namespace dr
 
 #endif // DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_CACHECOSTMODEL_H

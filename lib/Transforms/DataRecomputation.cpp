@@ -27,6 +27,7 @@
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
+#include "drcompiler/Transforms/DataRecomputation/BufferElim.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/DotEmitter.h"
 #include "drcompiler/Transforms/DataRecomputation/RematKernel.h"
@@ -1348,6 +1349,8 @@ using dr::lookupAllocRoot;
 using dr::buildRootWriteMap;
 using dr::RootWriteMap;
 using dr::estimateComputeCost;
+using dr::computeBufferElimVerdicts;
+using dr::BufferElimVerdict;
 
 
 // ===== Pass Class =====
@@ -1638,6 +1641,110 @@ void DataRecomputationPass::runOnOperation() {
       multiLoads.push_back({loadOp, &stores});
     }
   }
+
+  // Trace a memref value to its alloc-op roots, walking through view-like
+  // ops AND one level of call-site argument binding (so a store inside a
+  // callee through a block-arg memref attributes to the caller's alloc).
+  std::function<void(mlir::Value,
+                     llvm::SmallDenseSet<mlir::Operation *, 2> &, unsigned)>
+      collectAllocRootsCrossFn;
+  collectAllocRootsCrossFn =
+      [&](mlir::Value v,
+          llvm::SmallDenseSet<mlir::Operation *, 2> &outRoots,
+          unsigned depth) {
+        if (depth > 3) return;
+        llvm::SmallVector<mlir::Value, 2> bases;
+        drcompiler::collectBaseMemrefs(v, allocRootFor, bases);
+        for (mlir::Value base : bases) {
+          auto it = allocRootFor.find(base);
+          if (it != allocRootFor.end()) {
+            outRoots.insert(it->second);
+            continue;
+          }
+          // If still a block arg, follow callers.
+          auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(base);
+          if (!blockArg) continue;
+          auto fn = blockArg.getOwner()
+                        ->getParentOp()
+                        ? mlir::dyn_cast_or_null<mlir::FunctionOpInterface>(
+                              blockArg.getOwner()->getParentOp())
+                        : nullptr;
+          if (!fn) continue;
+          unsigned argIdx = blockArg.getArgNumber();
+          mlir::StringRef name = fn.getName();
+          moduleOp.walk([&](mlir::CallOpInterface call) {
+            auto sym = mlir::dyn_cast<mlir::SymbolRefAttr>(
+                call.getCallableForCallee());
+            if (!sym || sym.getRootReference().getValue() != name) return;
+            if (argIdx >= call->getNumOperands()) return;
+            collectAllocRootsCrossFn(call->getOperand(argIdx), outRoots,
+                                     depth + 1);
+          });
+        }
+      };
+
+  // Per-allocation-root snapshot for the buffer-elimination gate. Built
+  // here, before transformations, because strategies will erase loads and
+  // invalidate the (Operation *) keys in loadProv.
+  //
+  // For each load we attribute the buffer it consumes via the provenance
+  // stores (not the load's own base): a SINGLE/MULTI load in a callee that
+  // reads through a block-arg memref must roll up to the caller's alloc.
+  llvm::DenseMap<mlir::Operation *, dr::PreElimRootStats> preElimStats;
+  if (drBufferElim) {
+    auto rootsFromStores = [&](const StoreSet &ss) {
+      llvm::SmallDenseSet<mlir::Operation *, 2> roots;
+      for (mlir::Operation *storeOp : ss) {
+        if (!storeOp) continue;
+        mlir::Value storeMemref = drcompiler::getLoadStoreMemref(storeOp);
+        if (!storeMemref) continue;
+        collectAllocRootsCrossFn(storeMemref, roots, 0);
+      }
+      return roots;
+    };
+
+    auto bumpForLoad = [&](mlir::Operation *loadOp, const StoreSet &ss,
+                            void (*pick)(dr::PreElimRootStats &)) {
+      auto roots = rootsFromStores(ss);
+      // Fallback: trace the load's own memref through view-like ops and
+      // call-arg binding when no provenance store resolves to a root.
+      if (roots.empty()) {
+        mlir::Value memref = drcompiler::getLoadStoreMemref(loadOp);
+        if (memref) collectAllocRootsCrossFn(memref, roots, 0);
+      }
+      for (mlir::Operation *root : roots) {
+        auto &s = preElimStats[root];
+        s.loads++;
+        pick(s);
+      }
+    };
+
+    for (auto &kv : singleLoads)
+      bumpForLoad(kv.first, *kv.second, [](dr::PreElimRootStats &) {});
+    for (auto &kv : multiLoads)
+      bumpForLoad(kv.first, *kv.second,
+                  [](dr::PreElimRootStats &s) { s.multi++; });
+    for (auto &kv : leakedLoads)
+      bumpForLoad(kv.first, *kv.second,
+                  [](dr::PreElimRootStats &s) { s.leaked++; });
+    for (auto &kv : killedLoads)
+      bumpForLoad(kv.first, *kv.second,
+                  [](dr::PreElimRootStats &s) { s.killed++; });
+
+    moduleOp.walk([&](mlir::Operation *op) {
+      if (!drcompiler::isAnyStoreOp(op)) return;
+      mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+      if (!memref) return;
+      llvm::SmallDenseSet<mlir::Operation *, 2> roots;
+      collectAllocRootsCrossFn(memref, roots, 0);
+      for (mlir::Operation *root : roots)
+        preElimStats[root].stores++;
+    });
+  }
+
+  // NB: bufferStoredValues is built AFTER per-load strategies run, because
+  // a stored value may be a load result that DirectForward or other
+  // strategies erase. See the buffer-elim block at the end of the pass.
 
   // Emit MLIR remarks for test diagnostics (used with -verify-diagnostics).
   if (drTestDiagnostics) {
@@ -1954,6 +2061,58 @@ void DataRecomputationPass::runOnOperation() {
         if (!decision.recompute)
           skipBuffers.insert(allocRoot);
       }
+    }
+
+    // ===== M4: rollup-driven override of per-load veto =====
+    //
+    // When dr-buffer-elim-drives-strategies is on, the whole-buffer rollup
+    // can override skipBuffers for buffers it judges net-positive to
+    // eliminate. Strategies will then fire on those buffers' loads.
+    // Stored values are collected here (pre-strategies) so SSA handles
+    // are guaranteed live for the rollup's structural hash.
+    if (drBufferElim && drBufferElimDrivesStrategies) {
+      dr::BufferStoredValues preStrategyStoredVals;
+      moduleOp.walk([&](mlir::Operation *op) {
+        if (!drcompiler::isAnyStoreOp(op)) return;
+        mlir::Value stored = drcompiler::getStoredValue(op);
+        mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+        if (!stored || !memref) return;
+        llvm::SmallDenseSet<mlir::Operation *, 2> roots;
+        collectAllocRootsCrossFn(memref, roots, 0);
+        for (mlir::Operation *root : roots)
+          preStrategyStoredVals[root].push_back(stored);
+      });
+
+      dr::BufferElimTuning tuning{drRegBudget, drSpillCycles,
+                                  drIcacheSoftBudget};
+
+      llvm::SmallVector<mlir::Operation *, 4> overrides;
+      for (mlir::Operation *root : skipBuffers) {
+        auto sIt = preElimStats.find(root);
+        if (sIt == preElimStats.end()) continue;
+        const auto &ps = sIt->second;
+        // No point overriding when classification already rules out
+        // replacement.
+        if (ps.multi > 0 || ps.leaked > 0) continue;
+
+        llvm::ArrayRef<mlir::Value> svs;
+        auto svIt = preStrategyStoredVals.find(root);
+        if (svIt != preStrategyStoredVals.end()) svs = svIt->second;
+
+        auto dec =
+            dr::computeBufferElimCost(root, ps, svs, cache, costModel, tuning);
+        if (dec.eliminate) {
+          overrides.push_back(root);
+          if (drSummaryEnabled) {
+            DRSUM() << "buffer-elim-override ";
+            root->getLoc().print(llvm::errs());
+            llvm::errs() << ": keep=" << dec.keepCost
+                         << " elim=" << dec.elimCost << "\n";
+          }
+        }
+      }
+      for (mlir::Operation *root : overrides)
+        skipBuffers.erase(root);
     }
 
     // Per-load strategy pipeline. Strategies fire in order, first match
@@ -2413,11 +2572,187 @@ void DataRecomputationPass::runOnOperation() {
         }
       }
     }
+
+    // ===== Buffer-elimination feasibility gate =====
+    //
+    // After all per-load strategies have fired, decide per-allocation-root
+    // whether the buffer as a whole can be removed. Diagnostic-only here;
+    // the actual erase happens in a follow-up phase gated on
+    // dr-erase-eliminated-buffers.
+    if (drBufferElim) {
+      // Rebuild liveLoads after Strategy 4 (which can erase loads it
+      // specialized inside a clone). The set built at line ~2018 only
+      // covers strategies 1-3.
+      llvm::SmallDenseSet<mlir::Operation *> liveLoadsPostS4;
+      moduleOp.walk([&](mlir::Operation *op) {
+        if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
+                      mlir::LLVM::LoadOp>(op))
+          liveLoadsPostS4.insert(op);
+      });
+
+      // Build bufferStoredValues NOW (post-strategies) by walking live IR.
+      // Pre-strategy capture is unsafe: strategies erase load ops, and a
+      // stored value may have been such a load.
+      dr::BufferStoredValues bufferStoredValues;
+      moduleOp.walk([&](mlir::Operation *op) {
+        if (!drcompiler::isAnyStoreOp(op)) return;
+        mlir::Value stored = drcompiler::getStoredValue(op);
+        mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+        if (!stored || !memref) return;
+        llvm::SmallDenseSet<mlir::Operation *, 2> roots;
+        collectAllocRootsCrossFn(memref, roots, 0);
+        for (mlir::Operation *root : roots)
+          bufferStoredValues[root].push_back(stored);
+      });
+
+      dr::BufferElimTuning tuning{drRegBudget, drSpillCycles,
+                                  drIcacheSoftBudget};
+      auto verdicts = computeBufferElimVerdicts(
+          moduleOp, allocRootFor, skipBuffers, preElimStats,
+          bufferStoredValues, liveLoadsPostS4, symTabCollection, cache,
+          costModel, tuning);
+
+      auto escapeKindStr = [](drcompiler::EscapeKind k) {
+        using K = drcompiler::EscapeKind;
+        switch (k) {
+        case K::NoEscape: return "no-escape";
+        case K::EscapesToCall: return "escapes-call";
+        case K::EscapesViaReturn: return "escapes-return";
+        case K::EscapesAsPtrValue: return "escapes-ptr-value";
+        case K::EscapesUnknown: return "escapes-unknown";
+        }
+        return "?";
+      };
+
+      for (auto &v : verdicts) {
+        DRDBG() << "=== Buffer elim for " << *v.allocRoot << " ===\n";
+        DRDBG() << "  escape=" << escapeKindStr(v.escape.kind)
+                << " loads=" << v.loadCount
+                << " stores=" << v.storeCount
+                << " remaining=" << v.remainingLoads
+                << " multi=" << v.multiLoadCount
+                << " leaked=" << v.leakedLoadCount
+                << " killed=" << v.killedLoadCount
+                << " keep=" << v.keepCost
+                << " elim=" << v.elimCost
+                << " feasible=" << (v.feasible ? "YES" : "NO")
+                << "\n";
+
+        auto printSummary = [&](llvm::raw_ostream &os) {
+          os << (v.feasible ? "FEASIBLE" : "INFEASIBLE")
+             << " (escape=" << escapeKindStr(v.escape.kind)
+             << ", loads=" << v.loadCount
+             << ", remaining=" << v.remainingLoads
+             << ", multi=" << v.multiLoadCount
+             << ", leaked=" << v.leakedLoadCount
+             << ", keep=" << v.keepCost
+             << ", elim=" << v.elimCost << ")";
+        };
+
+        if (drSummaryEnabled) {
+          DRSUM() << "buffer-elim ";
+          v.allocRoot->getLoc().print(llvm::errs());
+          llvm::errs() << ": ";
+          printSummary(llvm::errs());
+          llvm::errs() << "\n";
+        }
+
+        if (drTestDiagnostics) {
+          auto diag = v.allocRoot->emitRemark() << "buffer-elim: ";
+          std::string buf;
+          llvm::raw_string_ostream ss(buf);
+          printSummary(ss);
+          diag << ss.str();
+        }
+      }
+
+      // ===== Explicit erase phase =====
+      // Gated by dr-erase-eliminated-buffers. Walks each FEASIBLE verdict,
+      // collects the alloc's transitive uses (stores, deallocs, views) and
+      // erases them. Escape analysis already proved no other consumers.
+      if (drEraseElimBuffers) {
+        for (auto &v : verdicts) {
+          if (!v.feasible) continue;
+
+          // Collect all tracked memref/ptr values reachable from the alloc
+          // through view-like ops.
+          llvm::SmallDenseSet<mlir::Value> tracked;
+          llvm::SmallVector<mlir::Value, 4> wl;
+          for (mlir::Value r : v.allocRoot->getResults()) {
+            if (mlir::isa<mlir::MemRefType, mlir::LLVM::LLVMPointerType>(
+                    r.getType())) {
+              tracked.insert(r);
+              wl.push_back(r);
+            }
+          }
+
+          llvm::SmallVector<mlir::Operation *, 8> viewOps;
+          llvm::SmallVector<mlir::Operation *, 8> storeOps;
+          llvm::SmallVector<mlir::Operation *, 4> deallocOps;
+
+          while (!wl.empty()) {
+            mlir::Value cur = wl.pop_back_val();
+            for (mlir::OpOperand &use : cur.getUses()) {
+              mlir::Operation *user = use.getOwner();
+              if (drcompiler::isViewLikeOp(user)) {
+                viewOps.push_back(user);
+                for (mlir::Value r : user->getResults()) {
+                  if (mlir::isa<mlir::MemRefType,
+                                mlir::LLVM::LLVMPointerType>(r.getType()) &&
+                      tracked.insert(r).second)
+                    wl.push_back(r);
+                }
+                continue;
+              }
+              if (drcompiler::isAnyStoreOp(user)) {
+                storeOps.push_back(user);
+                continue;
+              }
+              if (mlir::isa<mlir::memref::DeallocOp>(user)) {
+                deallocOps.push_back(user);
+                continue;
+              }
+              // Loads should already be gone (allLoadsReplaced); guard
+              // against accidentally erasing a buffer whose load survived
+              // — bail out for this buffer.
+              if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
+                            mlir::LLVM::LoadOp>(user)) {
+                viewOps.clear();
+                storeOps.clear();
+                deallocOps.clear();
+                break;
+              }
+            }
+          }
+
+          // Erase stores first (they reference the views/alloc), then
+          // deallocs, then views, then alloc itself.
+          for (mlir::Operation *op : storeOps) op->erase();
+          for (mlir::Operation *op : deallocOps) op->erase();
+          // View ops in reverse-collection order so chained views erase
+          // their consumers before themselves.
+          std::reverse(viewOps.begin(), viewOps.end());
+          for (mlir::Operation *op : viewOps) op->erase();
+          v.allocRoot->erase();
+
+          if (drSummaryEnabled) {
+            DRSUM() << "buffer-erased "
+                    << "(" << storeOps.size() << " stores, "
+                    << viewOps.size() << " views, "
+                    << deallocOps.size() << " deallocs)\n";
+          }
+        }
+      }
+    }
   }
 }
 
 namespace mlir {
 std::unique_ptr<Pass> createDataRecomputationPass() {
   return std::make_unique<DataRecomputationPass>();
+}
+std::unique_ptr<Pass>
+createDataRecomputationPass(const DataRecomputationPassOptions &options) {
+  return std::make_unique<DataRecomputationPass>(options);
 }
 } // namespace mlir

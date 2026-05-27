@@ -1,6 +1,7 @@
 add_mlir_library(DRCompTransforms
   CpuCostModel.cpp
   DataRecomputation.cpp
+  DataRecomputation/BufferElim.cpp
   DataRecomputation/CacheCostModel.cpp
   DataRecomputation/RematKernel.cpp
   DataRecomputation/Strategies/ConstantGlobalFold.cpp
@@ -13,6 +14,7 @@ add_mlir_library(DRCompTransforms
   RaiseMallocToMemRef.cpp
   Utils/OpDispatchUtils.cpp
   Utils/MemrefBaseAnalysis.cpp
+  Utils/AllocEscapeAnalysis.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/drcompiler/Transforms

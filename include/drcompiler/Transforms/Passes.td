@@ -68,7 +68,30 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "Enable verbose DRDBG (DRCOMP:) trace output to llvm::dbgs()">,
     Option<"drSummary", "dr-summary", "bool", "false",
            "Print compact decision summary (buffer cost-model + per-load "
-           "remat outcomes with reasons) to stderr as DRSUM: lines">
+           "remat outcomes with reasons) to stderr as DRSUM: lines">,
+    Option<"drBufferElim", "dr-buffer-elim", "bool", "false",
+           "Run whole-buffer elimination feasibility analysis (escape + "
+           "remaining-loads + classification rollup). Diagnostic-only "
+           "unless dr-erase-eliminated-buffers is also set.">,
+    Option<"drEraseElimBuffers", "dr-erase-eliminated-buffers", "bool",
+           "false",
+           "When a buffer is deemed eliminable by dr-buffer-elim, erase its "
+           "alloc/stores/dealloc/view chain explicitly instead of relying "
+           "on downstream DCE.">,
+    Option<"drBufferElimDrivesStrategies",
+           "dr-buffer-elim-drives-strategies", "bool", "false",
+           "Let the whole-buffer rollup override the per-load cost-model "
+           "veto. When the rollup says eliminate < keep, the per-load "
+           "strategies are allowed to fire on that buffer's loads even if "
+           "dr-cost-model would have kept them. Requires dr-buffer-elim.">,
+    Option<"drRegBudget", "dr-reg-budget", "unsigned", "32",
+           "Architectural register budget (GP+vec). Cloned trees exceeding "
+           "this incur a per-excess-op spill penalty in the elim cost.">,
+    Option<"drSpillCycles", "dr-spill-cycles", "unsigned", "4",
+           "Cycles per spilled value when a remat tree exceeds reg-budget.">,
+    Option<"drIcacheSoftBudget", "dr-icache-soft-budget", "unsigned", "128",
+           "Per-buffer soft budget on cloned op count; excess ops contribute "
+           "to the elim cost as code-bloat penalty (1 cycle per excess op).">
   ];
 
   let dependentDialects = [

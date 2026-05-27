@@ -602,4 +602,22 @@ MaterializationDecision decideBufferStrategy(unsigned aluCost,
                                  storeToLoadFootprint, operandPenalty};
 }
 
+BufferElimCostDecision decideBufferElimination(const BufferElimCostInputs &i) {
+  unsigned keep = i.numLoads * i.loadLatency
+                + i.numStores * i.storeLatency
+                + i.allocOverheadCycles
+                + i.capacityPenaltyCycles;
+
+  // Effective number of computes the program will actually run, assuming
+  // optimal CSE within each parent function. Falls back to numLoads when
+  // the caller did not provide a distinct-group count.
+  unsigned effectiveComputes =
+      (i.numDistinctComputes > 0) ? i.numDistinctComputes : i.numLoads;
+  unsigned compute = effectiveComputes * i.perElemComputeCost;
+
+  unsigned elim = compute + i.codeBloatPenalty + i.regPressurePenalty;
+
+  return BufferElimCostDecision{/*eliminate=*/elim <= keep, keep, elim};
+}
+
 } // namespace dr

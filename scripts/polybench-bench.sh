@@ -11,6 +11,11 @@
 #   dr-greedy   — cgeist → data-recomputation{dr-recompute=true} → lower → clang
 #   dr-cost     — cgeist → DR{recompute, cost-model} → lower → clang
 #   dr-partial  — cgeist → DR{recompute, cost-model, partial-remat} → lower → clang
+#   dr-bufelim  — DR{recompute, cost-model, buffer-elim, erase} → lower → clang
+#   dr-bufelim-m4 — same + buffer-elim-drives-strategies (rollup overrides
+#                   per-load veto)
+#   dr-bufelim-nogate — same but without per-load cost-model gate (lets the
+#                       buffer-elim rollup decide on its own)
 #
 # Requirements:
 #   - docker with drcc image (all compilation and linking runs inside the container)
@@ -23,7 +28,7 @@
 #   --iters N              runs per kernel          (default: 3)
 #   --dataset SIZE         MINI|SMALL|STANDARD|LARGE|EXTRALARGE  (default: LARGE)
 #   --kernel PATTERN       filter kernels by name substring
-#   --configs LIST         comma-separated subset of: clang,cgeist-base,dr-greedy,dr-cost,dr-partial
+#   --configs LIST         comma-separated subset of: clang,cgeist-base,dr-greedy,dr-cost,dr-partial,dr-bufelim,dr-bufelim-m4,dr-bufelim-nogate
 #   --cost-model FILE      JSON cost model (from probe-cost-model.sh) for dr-cost and dr-partial configs
 #   --ref-cfg NAME         config to use as speedup reference (default: cgeist-base if present, else clang)
 #   --csv FILE             write results to CSV in addition to stdout
@@ -118,6 +123,9 @@ CFG_PIPELINE["cgeist-base"]="--pass-pipeline=builtin.module(raise-malloc-to-memr
 CFG_PIPELINE["dr-greedy"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true})"
 CFG_PIPELINE["dr-cost"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-cost-model=true})"
 CFG_PIPELINE["dr-partial"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-cost-model=true dr-partial-remat=true})"
+CFG_PIPELINE["dr-bufelim"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-cost-model=true dr-buffer-elim=true dr-erase-eliminated-buffers=true})"
+CFG_PIPELINE["dr-bufelim-m4"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-cost-model=true dr-buffer-elim=true dr-buffer-elim-drives-strategies=true dr-erase-eliminated-buffers=true})"
+CFG_PIPELINE["dr-bufelim-nogate"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-buffer-elim=true dr-erase-eliminated-buffers=true})"
 
 IFS=',' read -ra ACTIVE_CFGS <<< "$CONFIGS"
 for cfg in "${ACTIVE_CFGS[@]}"; do

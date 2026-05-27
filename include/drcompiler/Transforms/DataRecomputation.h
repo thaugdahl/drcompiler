@@ -8,6 +8,8 @@ namespace mlir {
 #include "drcompiler/Transforms/Passes.h.inc"
 
 std::unique_ptr<mlir::Pass> createDataRecomputationPass();
+std::unique_ptr<mlir::Pass>
+createDataRecomputationPass(const DataRecomputationPassOptions &options);
 
 } // namespace mlir
 
