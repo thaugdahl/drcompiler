@@ -236,6 +236,50 @@ def DrAffineLoopFusionPass : Pass<"dr-affine-loop-fusion"> {
   let constructor = "mlir::createDrAffineLoopFusionPass()";
 }
 
+def DrAffineLoopTilePass
+    : Pass<"dr-affine-loop-tile", "mlir::func::FuncOp"> {
+  let summary = "Tile affine loop nests under the unified cost model";
+
+  let description = [{
+    Fork of upstream `--affine-loop-tile` (see
+    `lib/Transforms/AffineLoopTilingCostModel/UPSTREAM.md`).  Identical
+    behaviour to upstream *except* the tile-size selection placeholder
+    (`getTileSizes`) is driven by drcompiler's unified cost model: a small
+    grid search over candidate sizes, scored via ArchHandler::combineCosts
+    (memory + register pressure + ALU) and vetoed by RegisterPressure
+    over-budget constraints.
+
+    See REGISTER_PRESSURE_PLAN.md §16.
+  }];
+
+  let options = [
+    Option<"cacheSizeInKiB", "cache-size", "uint64_t", /*default=*/"512",
+           "Set size of cache to tile for in KiB (default: 512)">,
+    Option<"separate", "separate", "bool", /*default=*/"false",
+           "Separate full and partial tiles (default: false)">,
+    Option<"tileSize", "tile-size", "unsigned", /*default=*/"",
+           "Use this tile size for all loops">,
+    ListOption<"tileSizes", "tile-sizes", "unsigned",
+               "List of tile sizes for each perfect nest "
+               "(overridden by -tile-size)">,
+    Option<"useUnifiedCostModel", "use-unified-cost-model", "bool",
+           /*default=*/"true",
+           "Drive getTileSizes via the unified cost model when no explicit "
+           "tile size is set.  When false, falls back to upstream's "
+           "nth_root(footprint/cache) placeholder.">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON cost-model file (arch + registers + cache + ops).">,
+    Option<"drArchHandler", "arch-handler", "std::string", /*default=*/"",
+           "ArchHandler name (generic | x86-64-avx2 | x86-64-avx512 | arm-neon).">,
+    Option<"drSpillStrategy", "spill-strategy", "std::string",
+           /*default=*/"\"excess-hot\"",
+           "Spill aggregation: excess-hot | sum-excess | graph-color">
+  ];
+
+  let constructor = "mlir::createDrAffineLoopTilePass()";
+}
+
 def PrintRegisterPressurePass
     : Pass<"print-register-pressure", "mlir::ModuleOp">
 {
