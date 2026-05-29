@@ -127,6 +127,23 @@ CFG_PIPELINE["dr-bufelim"]="--pass-pipeline=builtin.module(raise-malloc-to-memre
 CFG_PIPELINE["dr-bufelim-m4"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-cost-model=true dr-buffer-elim=true dr-buffer-elim-drives-strategies=true dr-erase-eliminated-buffers=true})"
 CFG_PIPELINE["dr-bufelim-nogate"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,data-recomputation{dr-recompute=true dr-buffer-elim=true dr-erase-eliminated-buffers=true})"
 
+# === Phase 5 (REGISTER_PRESSURE_PLAN.md §8) — fusion + tiling configs ===
+# `none`              : MLIR roundtrip without any fusion/tiling
+# `upstream-fuse`     : stock --affine-loop-fusion (placeholder cost model)
+# `drcomp-fuse`       : our --dr-affine-loop-fusion with the unified cost model
+# `drcomp-maxfuse`    : drcomp-fuse with compute-tolerance loosened
+#                       (aggressive baseline for H4 ablation)
+# `upstream-tile`     : stock --affine-loop-tile
+# `drcomp-tile`       : our --dr-affine-loop-tile with the unified cost model
+# `drcomp-tile-fuse`  : both drcomp passes in sequence (pipeline story)
+CFG_PIPELINE["none"]="--pass-pipeline=builtin.module(raise-malloc-to-memref)"
+CFG_PIPELINE["upstream-fuse"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,affine-loop-fusion)"
+CFG_PIPELINE["drcomp-fuse"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,dr-affine-loop-fusion)"
+CFG_PIPELINE["drcomp-maxfuse"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,dr-affine-loop-fusion{compute-tolerance=2.0})"
+CFG_PIPELINE["upstream-tile"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,func.func(affine-loop-tile))"
+CFG_PIPELINE["drcomp-tile"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,func.func(dr-affine-loop-tile))"
+CFG_PIPELINE["drcomp-tile-fuse"]="--pass-pipeline=builtin.module(raise-malloc-to-memref,dr-affine-loop-fusion,func.func(dr-affine-loop-tile))"
+
 IFS=',' read -ra ACTIVE_CFGS <<< "$CONFIGS"
 for cfg in "${ACTIVE_CFGS[@]}"; do
   [[ -v CFG_PIPELINE["$cfg"] ]] || die "Unknown config: $cfg. Available: ${!CFG_PIPELINE[*]}"
