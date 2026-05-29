@@ -1,0 +1,14 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "handler": "generic"
+  },
+  "registers": {
+    "gp_budget": 2,
+    "fp_budget": 2,
+    "vec_budget": 2,
+    "pred_budget": 0,
+    "spill_reload_cycles": 5,
+    "spill_store_cycles": 1
+  }
+}

@@ -12,6 +12,7 @@ add_mlir_library(DRCompTransforms
   DataRecomputation/Strategies/PartialRemat.cpp
   MemoryFission.cpp
   PrintArchHandler.cpp
+  PrintRegisterPressure.cpp
   RaiseMallocToMemRef.cpp
   Utils/OpDispatchUtils.cpp
   Utils/MemrefBaseAnalysis.cpp

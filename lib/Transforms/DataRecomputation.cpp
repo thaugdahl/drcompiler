@@ -25,6 +25,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/DataRecomputation.h"
+#include "drcompiler/Analysis/ArchHandler.h"
+#include "drcompiler/Analysis/RegisterPressureAnalysis.h"
+#include "drcompiler/Analysis/SpillStrategy.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/BufferElim.h"
@@ -1387,6 +1390,70 @@ void DataRecomputationPass::runOnOperation() {
           ? drcompiler::CpuCostModel::getDefault()
           : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
 
+  // Resolve the unified cost-model arch/register configuration.  Precedence
+  // (highest first): CLI options > JSON file fields > handler defaults.
+  std::unique_ptr<drcompiler::ArchHandler> archHandler;
+  drcompiler::ArchParams archParams;
+  drcompiler::RegisterParams regParams;
+  drcompiler::SpillStrategy spillStrategy = drcompiler::SpillStrategy::ExcessHot;
+  {
+    const auto &archJson = costModel.archParams();
+    const auto &regsJson = costModel.registerParams();
+    std::string handlerName;
+    if (!drArchHandler.empty())
+      handlerName = drArchHandler;
+    else if (archJson.handler)
+      handlerName = *archJson.handler;
+    else if (archJson.triplet)
+      handlerName = drcompiler::ArchHandler::pickHandlerForTriple(
+                        llvm::Triple(*archJson.triplet))
+                        .str();
+    else
+      handlerName = "generic";
+
+    archHandler = drcompiler::ArchHandler::create(handlerName);
+    archParams = archHandler->defaultParams();
+    regParams = archHandler->defaultRegisters();
+
+    if (archJson.triplet)
+      archParams.triple = llvm::Triple(*archJson.triplet);
+    if (archJson.vectorWidthBits)
+      archParams.vectorWidthBits = *archJson.vectorWidthBits;
+    if (archJson.alphaMem)
+      archParams.alphaMem = *archJson.alphaMem;
+    if (archJson.betaReg)
+      archParams.betaReg = *archJson.betaReg;
+    if (archJson.gammaAlu)
+      archParams.gammaAlu = *archJson.gammaAlu;
+    // CLI weight overrides win over JSON.
+    archParams.alphaMem = drCostWeightMem;
+    archParams.betaReg = drCostWeightReg;
+    archParams.gammaAlu = drCostWeightAlu;
+
+    auto setIfHas = [](std::optional<unsigned> j, unsigned &dst,
+                       unsigned cliDefault, unsigned cliValue) {
+      if (j)
+        dst = *j;
+      // CLI override applies iff the user changed it from the default.
+      if (cliValue != cliDefault)
+        dst = cliValue;
+    };
+    setIfHas(regsJson.gpBudget, regParams.gpBudget, 16, drRegBudgetGp);
+    setIfHas(regsJson.fpBudget, regParams.fpBudget, 16, drRegBudgetFp);
+    setIfHas(regsJson.vecBudget, regParams.vecBudget, 16, drRegBudgetVec);
+    setIfHas(regsJson.predBudget, regParams.predBudget, 0, drRegBudgetPred);
+    setIfHas(regsJson.spillReloadCycles, regParams.spillReloadCycles, 5,
+             drSpillReload);
+    setIfHas(regsJson.spillStoreCycles, regParams.spillStoreCycles, 1,
+             drSpillStore);
+
+    if (!drSpillStrategy.empty())
+      spillStrategy = drcompiler::parseSpillStrategy(drSpillStrategy);
+    else if (archJson.spillStrategy)
+      spillStrategy =
+          drcompiler::parseSpillStrategy(*archJson.spillStrategy);
+  }
+
   mlir::MLIRContext *context = &getContext();
   mlir::SymbolTableCollection symTabCollection{};
 
@@ -2009,9 +2076,24 @@ void DataRecomputationPass::runOnOperation() {
         int64_t storeToLoadFP = bufferStoreToLoadFP.lookup(allocRoot);
         unsigned opPenalty = bufferOperandPenalty.lookup(allocRoot);
 
-        auto decision = decideBufferStrategy(
-            computeCost, /*leafLoadCost=*/0, loadLat, numConsumers, sizeBytes,
-            storeToLoadFP, opPenalty, cache);
+        // Build per-aspect inputs.  regCyclesKeep approximates "buffer
+        // stays live across the consumer region"; regCyclesRecompute
+        // approximates the additional live values introduced by cloning
+        // the stored-value tree at each consumer.
+        dr::MaterializationInputs mInputs;
+        mInputs.aluCost = computeCost;
+        mInputs.leafLoadCost = 0;
+        mInputs.loadLatency = loadLat;
+        mInputs.numConsumers = numConsumers;
+        mInputs.bufferSizeBytes = sizeBytes;
+        mInputs.storeToLoadFootprint = storeToLoadFP;
+        mInputs.operandPenalty = opPenalty;
+        // Register pressure (currently approximated; refined per-region in
+        // a follow-up — see REGISTER_PRESSURE_PLAN §6.2).
+        mInputs.regCyclesKeep = 0;
+        mInputs.regCyclesRecompute = 0;
+        auto decision = decideBufferStrategy(mInputs, cache, *archHandler,
+                                              archParams);
 
         DRDBG() << "=== Cost model for " << *allocRoot << " ===\n";
         DRDBG() << "  buffer size: "
@@ -2083,8 +2165,12 @@ void DataRecomputationPass::runOnOperation() {
           preStrategyStoredVals[root].push_back(stored);
       });
 
-      dr::BufferElimTuning tuning{drRegBudget, drSpillCycles,
-                                  drIcacheSoftBudget};
+      dr::BufferElimTuning tuning;
+      tuning.icacheSoftBudget = drIcacheSoftBudget;
+      tuning.arch = archHandler.get();
+      tuning.archParams = archParams;
+      tuning.regParams = regParams;
+      tuning.spillStrategy = spillStrategy;
 
       llvm::SmallVector<mlir::Operation *, 4> overrides;
       for (mlir::Operation *root : skipBuffers) {
@@ -2125,6 +2211,10 @@ void DataRecomputationPass::runOnOperation() {
         rootWrites,
         cache,
         costModel,
+        *archHandler,
+        archParams,
+        regParams,
+        spillStrategy,
         partialRematEnabled,
         drPartialMaxLeaves,
         (bool)drTestDiagnostics,
@@ -2605,8 +2695,12 @@ void DataRecomputationPass::runOnOperation() {
           bufferStoredValues[root].push_back(stored);
       });
 
-      dr::BufferElimTuning tuning{drRegBudget, drSpillCycles,
-                                  drIcacheSoftBudget};
+      dr::BufferElimTuning tuning;
+      tuning.icacheSoftBudget = drIcacheSoftBudget;
+      tuning.arch = archHandler.get();
+      tuning.archParams = archParams;
+      tuning.regParams = regParams;
+      tuning.spillStrategy = spillStrategy;
       auto verdicts = computeBufferElimVerdicts(
           moduleOp, allocRootFor, skipBuffers, preElimStats,
           bufferStoredValues, liveLoadsPostS4, symTabCollection, cache,

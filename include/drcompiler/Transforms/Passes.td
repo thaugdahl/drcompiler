@@ -84,14 +84,36 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "veto. When the rollup says eliminate < keep, the per-load "
            "strategies are allowed to fire on that buffer's loads even if "
            "dr-cost-model would have kept them. Requires dr-buffer-elim.">,
-    Option<"drRegBudget", "dr-reg-budget", "unsigned", "32",
-           "Architectural register budget (GP+vec). Cloned trees exceeding "
-           "this incur a per-excess-op spill penalty in the elim cost.">,
-    Option<"drSpillCycles", "dr-spill-cycles", "unsigned", "4",
-           "Cycles per spilled value when a remat tree exceeds reg-budget.">,
     Option<"drIcacheSoftBudget", "dr-icache-soft-budget", "unsigned", "128",
            "Per-buffer soft budget on cloned op count; excess ops contribute "
-           "to the elim cost as code-bloat penalty (1 cycle per excess op).">
+           "to the elim cost as code-bloat penalty (1 cycle per excess op).">,
+    // Unified cost-model — register-pressure parameters (Phase 3 of
+    // REGISTER_PRESSURE_PLAN.md).  JSON file (`cpu-cost-model-file`)
+    // overrides any of these when present.
+    Option<"drArchHandler", "dr-arch-handler", "std::string", /*default=*/"",
+           "ArchHandler name (generic | x86-64-avx2 | x86-64-avx512 | arm-neon). "
+           "Empty = inferred from cost-model JSON or 'generic'.">,
+    Option<"drSpillStrategy", "dr-spill-strategy", "std::string",
+           /*default=*/"\"excess-hot\"",
+           "Spill aggregation: excess-hot | sum-excess | graph-color">,
+    Option<"drRegBudgetGp", "dr-reg-budget-gp", "unsigned", "16",
+           "General-purpose register budget (overridden by JSON/handler).">,
+    Option<"drRegBudgetFp", "dr-reg-budget-fp", "unsigned", "16",
+           "Scalar FP register budget (overridden by JSON/handler).">,
+    Option<"drRegBudgetVec", "dr-reg-budget-vec", "unsigned", "16",
+           "Vector register budget (overridden by JSON/handler).">,
+    Option<"drRegBudgetPred", "dr-reg-budget-pred", "unsigned", "0",
+           "Predicate/mask register budget (overridden by JSON/handler).">,
+    Option<"drSpillReload", "dr-spill-reload", "unsigned", "5",
+           "Cycles per spill reload (overridden by JSON/handler).">,
+    Option<"drSpillStore", "dr-spill-store", "unsigned", "1",
+           "Cycles per spill store (overridden by JSON/handler).">,
+    Option<"drCostWeightMem", "dr-cost-weight-mem", "double", "1.0",
+           "Memory cycle weight (alpha) in unified cost combiner.">,
+    Option<"drCostWeightReg", "dr-cost-weight-reg", "double", "1.0",
+           "Register cycle weight (beta) in unified cost combiner.">,
+    Option<"drCostWeightAlu", "dr-cost-weight-alu", "double", "1.0",
+           "ALU cycle weight (gamma) in unified cost combiner.">
   ];
 
   let dependentDialects = [
@@ -160,6 +182,40 @@ def PrintArchHandlerPass : Pass<"print-arch-handler", "mlir::ModuleOp">
   ];
 
   let constructor = "mlir::createPrintArchHandlerPass()";
+}
+
+def PrintRegisterPressurePass
+    : Pass<"print-register-pressure", "mlir::ModuleOp">
+{
+  let summary = "Emit per-function register pressure summary";
+
+  let description = [{
+    Diagnostic pass for the RegisterPressureAnalysis.  For every
+    func::FuncOp in the module, runs the analysis on the function body and
+    emits a single-line remark with per-class peak live counts, per-class
+    excess sums, and the total spill-cycle estimate under the chosen
+    SpillStrategy.
+
+    Used to validate the analysis against hand-crafted MLIR programs in
+    Phase 2 of the register-pressure plan.
+  }];
+
+  let options = [
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON file with cost-model and arch/registers blocks">,
+    Option<"handlerOverride", "handler", "std::string", /*default=*/"",
+           "Override the JSON handler name (use this handler instead)">,
+    Option<"spillStrategyOpt", "strategy", "std::string",
+           /*default=*/"\"excess-hot\"",
+           "Spill aggregation strategy: excess-hot | sum-excess | graph-color">,
+    Option<"tripCount", "trip-count", "uint64_t", "1",
+           "Trip count multiplier for ExcessHot strategy">,
+    Option<"showPerOp", "show-per-op", "bool", "false",
+           "Emit one remark per op in addition to the per-function summary">
+  ];
+
+  let constructor = "mlir::createPrintRegisterPressurePass()";
 }
 
 def MemoryFissionPass

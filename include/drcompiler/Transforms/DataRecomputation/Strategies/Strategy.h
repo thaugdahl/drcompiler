@@ -12,6 +12,8 @@
 #ifndef DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_STRATEGIES_STRATEGY_H
 #define DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_STRATEGIES_STRATEGY_H
 
+#include "drcompiler/Analysis/ArchHandler.h"
+#include "drcompiler/Analysis/SpillStrategy.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
@@ -40,6 +42,10 @@ struct StrategyEnv {
   const RootWriteMap &rootWrites;
   const CacheParams &cache;
   const drcompiler::CpuCostModel &costModel;
+  const drcompiler::ArchHandler &archHandler;
+  drcompiler::ArchParams archParams;
+  drcompiler::RegisterParams regParams;
+  drcompiler::SpillStrategy spillStrategy;
   bool partialRematEnabled;
   unsigned partialMaxLeaves;
   bool emitDiagnostics;

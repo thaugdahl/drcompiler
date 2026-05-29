@@ -13,6 +13,7 @@
 #ifndef DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_CACHECOSTMODEL_H
 #define DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_CACHECOSTMODEL_H
 
+#include "drcompiler/Analysis/ArchHandler.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "mlir/IR/Operation.h"
@@ -95,30 +96,58 @@ unsigned estimateOperandReloadPenalty(mlir::Value storedVal,
                                       int64_t storeToLoadFootprint,
                                       const CacheParams &cache);
 
-/// Per-buffer materialization decision.
-struct MaterializationDecision {
-  bool recompute;               // true = eliminate buffer, false = keep it
-  unsigned aluCost;             // ALU cost to recompute one element
-  unsigned leafLoadCost;        // per-element cost of cloned partial leaf loads
-  unsigned loadLatency;         // estimated load latency (effective)
-  unsigned numConsumers;        // number of SINGLE loads from this buffer
-  int64_t bufferSizeBytes;
-  int64_t storeToLoadFootprint; // intervening bytes between store and load
-  unsigned operandPenalty;      // per-element operand reload penalty (cycles)
+/// Inputs to per-buffer materialization decision.  The register-pressure
+/// component (`regCyclesKeep`/`regCyclesRecompute`) is supplied by the
+/// caller from a RegisterPressureAnalysis query; this struct intentionally
+/// does not reach into MLIR IR.
+struct MaterializationInputs {
+  unsigned aluCost = 0;
+  unsigned leafLoadCost = 0;
+  unsigned loadLatency = 0;
+  unsigned numConsumers = 0;
+  int64_t bufferSizeBytes = 0;
+  int64_t storeToLoadFootprint = 0;
+  unsigned operandPenalty = 0;
+  unsigned regCyclesKeep = 0;
+  unsigned regCyclesRecompute = 0;
 };
 
-/// Decide whether to recompute or keep a buffer. With leafLoadCost = 0
-/// and footprint analysis disabled this reduces to:
-///   keepCost      = aluCost + 1 + numConsumers * loadLatency
-///   recomputeCost = numConsumers * aluCost
-MaterializationDecision decideBufferStrategy(unsigned aluCost,
-                                             unsigned leafLoadCost,
-                                             unsigned loadLatency,
-                                             unsigned numConsumers,
-                                             int64_t bufferSizeBytes,
-                                             int64_t storeToLoadFootprint,
-                                             unsigned operandPenalty,
-                                             const CacheParams &cache);
+/// Per-buffer materialization decision.  Carries the per-aspect breakdown
+/// so diagnostics can show why the cost model went one way or the other.
+struct MaterializationDecision {
+  bool recompute = false;       // true = eliminate buffer, false = keep it
+  // Echo of the inputs, kept for diagnostic back-compat.
+  unsigned aluCost = 0;
+  unsigned leafLoadCost = 0;
+  unsigned loadLatency = 0;
+  unsigned numConsumers = 0;
+  int64_t bufferSizeBytes = 0;
+  int64_t storeToLoadFootprint = 0;
+  unsigned operandPenalty = 0;
+  // Per-aspect cycle breakdown.
+  unsigned memCyclesKeep = 0, memCyclesRecompute = 0;
+  unsigned regCyclesKeep = 0, regCyclesRecompute = 0;
+  unsigned aluCyclesKeep = 0, aluCyclesRecompute = 0;
+  // Combined totals via ArchHandler::combineCosts.
+  unsigned totalKeep = 0, totalRecompute = 0;
+};
+
+/// Decide whether to recompute or keep a buffer using the unified cost
+/// model (memory + register pressure + ALU, combined per-arch).
+///
+///   memKeep      = numConsumers * effectiveLoadLatency
+///   aluKeep      = aluCost + 1                              // store once
+///   regKeep      = inputs.regCyclesKeep
+///   memRecompute = numConsumers * (leafLoadCost + operandPenalty)
+///   aluRecompute = numConsumers * aluCost
+///   regRecompute = inputs.regCyclesRecompute
+///
+/// The keep / recompute totals are produced by `arch.combineCosts(...)`.
+MaterializationDecision
+decideBufferStrategy(const MaterializationInputs &inputs,
+                     const CacheParams &cache,
+                     const drcompiler::ArchHandler &arch,
+                     const drcompiler::ArchParams &archParams);
 
 /// Inputs to the whole-buffer elimination cost rollup. Treats the alloc
 /// as the cost unit (vs the per-load `decideBufferStrategy`).

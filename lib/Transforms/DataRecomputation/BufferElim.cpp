@@ -1,6 +1,7 @@
 //===- BufferElim.cpp - Per-allocation buffer-elimination verdicts -------===//
 
 #include "drcompiler/Transforms/DataRecomputation/BufferElim.h"
+#include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "drcompiler/Transforms/Utils/MemrefBaseAnalysis.h"
 #include "drcompiler/Transforms/Utils/OpDispatchUtils.h"
@@ -210,10 +211,34 @@ computeBufferElimCost(mlir::Operation *allocRoot,
                             ? bloatOps - tuning.icacheSoftBudget
                             : 0;
 
-  if (maxTreeSize > tuning.regBudget) {
-    unsigned excess = maxTreeSize - tuning.regBudget;
-    in.regPressurePenalty =
-        excess * tuning.spillCycles * in.numDistinctComputes;
+  // Register-pressure penalty via RegisterPressureAnalysis.  The hypothetical
+  // is: cloning each stored value's def-use closure into the function body
+  // (representative consumer context).  When no ArchHandler is configured,
+  // the penalty is zero — preserving the original (cost-model-off) behaviour.
+  if (tuning.arch && !storedVals.empty()) {
+    llvm::SmallVector<mlir::Operation *, 8> rematOps;
+    for (mlir::Value sv : storedVals) {
+      if (auto *def = sv.getDefiningOp())
+        rematOps.push_back(def);
+    }
+    mlir::Value first = storedVals.front();
+    mlir::Region *parentRegion = first.getParentRegion();
+    while (parentRegion) {
+      auto fn = parentRegion->getParentOfType<mlir::FunctionOpInterface>();
+      if (fn && !fn.empty()) {
+        drcompiler::PressureQuery q;
+        q.params = tuning.regParams;
+        q.strategy = tuning.spillStrategy;
+        q.tripCount = std::max<uint64_t>(in.numDistinctComputes, 1);
+        auto res = drcompiler::RegisterPressureAnalysis::
+            analyzeHypotheticalStatic(fn.getFunctionBody(), rematOps,
+                                       *tuning.arch, tuning.archParams, q);
+        in.regPressurePenalty = static_cast<unsigned>(res.totalSpillCycles);
+        break;
+      }
+      mlir::Operation *parentOp = parentRegion->getParentOp();
+      parentRegion = parentOp ? parentOp->getParentRegion() : nullptr;
+    }
   }
 
   return decideBufferElimination(in);

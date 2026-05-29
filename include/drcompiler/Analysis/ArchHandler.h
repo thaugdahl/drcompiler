@@ -39,7 +39,7 @@ struct ArchParams {
   double gammaAlu = 1.0;
 };
 
-class PressureResult;
+struct PressureResult;
 
 class ArchHandler {
 public:

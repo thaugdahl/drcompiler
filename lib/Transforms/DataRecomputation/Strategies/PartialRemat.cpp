@@ -97,10 +97,14 @@ Outcome PartialRemat::tryApply(LoadCandidate &c, StrategyEnv &env) {
     // Strict gate: only fire if re-execution is cheaper than the original load.
     reject = (alu + leaf >= loadLat);
   } else {
-    auto dec = decideBufferStrategy(alu, leaf, loadLat,
-                                    /*numConsumers=*/1, sizeBytes,
-                                    /*storeToLoadFootprint=*/0,
-                                    /*operandPenalty=*/0, env.cache);
+    dr::MaterializationInputs mInputs;
+    mInputs.aluCost = alu;
+    mInputs.leafLoadCost = leaf;
+    mInputs.loadLatency = loadLat;
+    mInputs.numConsumers = 1;
+    mInputs.bufferSizeBytes = sizeBytes;
+    auto dec = decideBufferStrategy(mInputs, env.cache, env.archHandler,
+                                     env.archParams);
     reject = !dec.recompute;
   }
   if (reject) {

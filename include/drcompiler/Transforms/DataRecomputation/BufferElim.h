@@ -9,6 +9,9 @@
 #ifndef DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_BUFFERELIM_H
 #define DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_BUFFERELIM_H
 
+#include "drcompiler/Analysis/ArchHandler.h"
+#include "drcompiler/Analysis/RegisterClass.h"
+#include "drcompiler/Analysis/SpillStrategy.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
@@ -58,10 +61,16 @@ using BufferStoredValues =
     llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Value, 4>>;
 
 /// Per-buffer-elim tuning knobs (forwarded from pass options).
+///
+/// Register-pressure penalty is computed via RegisterPressureAnalysis when
+/// `arch` is non-null.  Without an ArchHandler, the rollup falls back to a
+/// zero register-pressure penalty (memory + ALU costs only).
 struct BufferElimTuning {
-  unsigned regBudget = 32;
-  unsigned spillCycles = 4;
   unsigned icacheSoftBudget = 128;
+  const drcompiler::ArchHandler *arch = nullptr;
+  drcompiler::ArchParams archParams;
+  drcompiler::RegisterParams regParams;
+  drcompiler::SpillStrategy spillStrategy = drcompiler::SpillStrategy::ExcessHot;
 };
 
 /// Single-buffer cost rollup. Computes keep/elim cycle estimates and a

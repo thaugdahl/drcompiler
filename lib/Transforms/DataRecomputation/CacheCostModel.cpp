@@ -576,30 +576,49 @@ unsigned estimateOperandReloadPenalty(mlir::Value storedVal,
   return totalPenalty;
 }
 
-MaterializationDecision decideBufferStrategy(unsigned aluCost,
-                                             unsigned leafLoadCost,
-                                             unsigned loadLatency,
-                                             unsigned numConsumers,
-                                             int64_t bufferSizeBytes,
-                                             int64_t storeToLoadFootprint,
-                                             unsigned operandPenalty,
-                                             const CacheParams &cache) {
-  unsigned effectiveLoadLatency = loadLatency;
-  if (storeToLoadFootprint > 0) {
-    int64_t workingSet = bufferSizeBytes + storeToLoadFootprint;
+MaterializationDecision
+decideBufferStrategy(const MaterializationInputs &inputs,
+                     const CacheParams &cache,
+                     const drcompiler::ArchHandler &arch,
+                     const drcompiler::ArchParams &archParams) {
+  unsigned effectiveLoadLatency = inputs.loadLatency;
+  if (inputs.storeToLoadFootprint > 0) {
+    int64_t workingSet = inputs.bufferSizeBytes + inputs.storeToLoadFootprint;
     effectiveLoadLatency = estimateLoadLatency(workingSet, cache);
   }
 
-  unsigned keepCost = aluCost + 1 + numConsumers * effectiveLoadLatency;
-  unsigned recomputeCost =
-      numConsumers * (aluCost + leafLoadCost + operandPenalty);
+  unsigned memKeep = inputs.numConsumers * effectiveLoadLatency;
+  unsigned aluKeep = inputs.aluCost + 1; // store once
+  unsigned regKeep = inputs.regCyclesKeep;
 
-  bool recompute = recomputeCost <= keepCost;
+  unsigned memRecompute =
+      inputs.numConsumers * (inputs.leafLoadCost + inputs.operandPenalty);
+  unsigned aluRecompute = inputs.numConsumers * inputs.aluCost;
+  unsigned regRecompute = inputs.regCyclesRecompute;
 
-  return MaterializationDecision{recompute,        aluCost,
-                                 leafLoadCost,     effectiveLoadLatency,
-                                 numConsumers,     bufferSizeBytes,
-                                 storeToLoadFootprint, operandPenalty};
+  unsigned totalKeep =
+      arch.combineCosts(memKeep, regKeep, aluKeep, archParams);
+  unsigned totalRecompute = arch.combineCosts(memRecompute, regRecompute,
+                                              aluRecompute, archParams);
+
+  MaterializationDecision d;
+  d.recompute = totalRecompute <= totalKeep;
+  d.aluCost = inputs.aluCost;
+  d.leafLoadCost = inputs.leafLoadCost;
+  d.loadLatency = effectiveLoadLatency;
+  d.numConsumers = inputs.numConsumers;
+  d.bufferSizeBytes = inputs.bufferSizeBytes;
+  d.storeToLoadFootprint = inputs.storeToLoadFootprint;
+  d.operandPenalty = inputs.operandPenalty;
+  d.memCyclesKeep = memKeep;
+  d.memCyclesRecompute = memRecompute;
+  d.regCyclesKeep = regKeep;
+  d.regCyclesRecompute = regRecompute;
+  d.aluCyclesKeep = aluKeep;
+  d.aluCyclesRecompute = aluRecompute;
+  d.totalKeep = totalKeep;
+  d.totalRecompute = totalRecompute;
+  return d;
 }
 
 BufferElimCostDecision decideBufferElimination(const BufferElimCostInputs &i) {

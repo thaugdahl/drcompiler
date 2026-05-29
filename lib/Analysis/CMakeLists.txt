@@ -4,11 +4,17 @@ add_mlir_library(DRCompAnalysis
   ArchHandlers/X86_64_AVX2.cpp
   ArchHandlers/X86_64_AVX512.cpp
   ArchHandlers/ARM_Neon.cpp
+  RegisterPressureAnalysis.cpp
+  SpillStrategy.cpp
+  SpillStrategies/ExcessHot.cpp
+  SpillStrategies/SumExcess.cpp
+  SpillStrategies/GraphColor.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/drcompiler/Analysis
 
   LINK_LIBS PUBLIC
+    MLIRAnalysis
     MLIRIR
     MLIRSupport
 )
