@@ -184,6 +184,58 @@ def PrintArchHandlerPass : Pass<"print-arch-handler", "mlir::ModuleOp">
   let constructor = "mlir::createPrintArchHandlerPass()";
 }
 
+def DrAffineLoopFusionPass : Pass<"dr-affine-loop-fusion"> {
+  let summary = "Fuse affine loop nests under the unified cost model";
+
+  let description = [{
+    Fork of upstream `--affine-loop-fusion` (see
+    `lib/Transforms/AffineLoopFusionCostModel/UPSTREAM.md`).  Identical
+    behaviour to the upstream pass *except* the profitability decision
+    (`isFusionProfitable`) is driven by drcompiler's unified cost model
+    (memory + register pressure + ALU combined per ArchHandler).
+
+    See REGISTER_PRESSURE_PLAN.md §7 for the rationale.
+  }];
+
+  let options = [
+    Option<"computeToleranceThreshold", "compute-tolerance", "double",
+           /*default=*/"0.30f",
+           "Fractional increase in additional computation tolerated while fusing">,
+    Option<"fastMemorySpace", "fast-mem-space", "unsigned", /*default=*/"0",
+           "Faster memory space number to promote fusion buffers to">,
+    Option<"localBufSizeThreshold", "local-buf-threshold", "uint64_t",
+           /*default=*/"0",
+           "Threshold size (KiB) for promoting local buffers to fast memory space">,
+    Option<"maximalFusion", "maximal", "bool", /*default=*/"false",
+           "Enables maximal loop fusion">,
+    Option<"affineFusionMode", "mode", "enum FusionMode",
+           "mlir::affine::FusionMode::Greedy", "fusion mode to attempt",
+           "llvm::cl::values(clEnumValN(mlir::affine::FusionMode::Greedy,"
+           " \"greedy\", \"Perform greedy (both producer-consumer and sibling) fusion\"), "
+           "clEnumValN( mlir::affine::FusionMode::ProducerConsumer, "
+           "\"producer\", \"Perform only producer-consumer fusion\"), "
+           "clEnumValN( mlir::affine::FusionMode::Sibling, "
+           "\"sibling\", \"Perform only sibling fusion\"))">,
+    // Drcompiler-specific knobs (additive over upstream).
+    Option<"useUnifiedCostModel", "use-unified-cost-model", "bool",
+           /*default=*/"true",
+           "Drive isFusionProfitable from the unified cost model (memory + "
+           "register-pressure + ALU).  When false, falls back to upstream's "
+           "compute-tolerance heuristic.">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON cost-model file (arch + registers + cache + ops).">,
+    Option<"drArchHandler", "arch-handler", "std::string", /*default=*/"",
+           "ArchHandler name (generic | x86-64-avx2 | x86-64-avx512 | arm-neon).">,
+    Option<"drSpillStrategy", "spill-strategy", "std::string",
+           /*default=*/"\"excess-hot\"",
+           "Spill aggregation: excess-hot | sum-excess | graph-color">
+  ];
+
+  let dependentDialects = ["memref::MemRefDialect"];
+  let constructor = "mlir::createDrAffineLoopFusionPass()";
+}
+
 def PrintRegisterPressurePass
     : Pass<"print-register-pressure", "mlir::ModuleOp">
 {

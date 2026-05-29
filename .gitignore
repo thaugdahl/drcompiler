@@ -3,3 +3,4 @@ polygeist-install/
 polygeist/
 compile_commands.json
 .cache
+test/ONNX/

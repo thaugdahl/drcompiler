@@ -1,4 +1,5 @@
 add_mlir_library(DRCompTransforms
+  AffineLoopFusionCostModel/LoopFusion.cpp
   CpuCostModel.cpp
   DataRecomputation.cpp
   DataRecomputation/BufferElim.cpp
