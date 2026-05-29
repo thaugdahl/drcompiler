@@ -1,7 +1,14 @@
 #ifndef DRCOMPILER_TRANSFORMS_AFFINELOOPFUSION_H
 #define DRCOMPILER_TRANSFORMS_AFFINELOOPFUSION_H
 
+// LLVM trunk re-orgs the Affine Passes.h location; support both layouts so
+// drcompiler builds against either Marco's bundled LLVM (top-level) or an
+// installed 22.1.x (under Transforms/).
+#if __has_include("mlir/Dialect/Affine/Passes.h")
 #include "mlir/Dialect/Affine/Passes.h"
+#else
+#include "mlir/Dialect/Affine/Transforms/Passes.h"
+#endif
 #include "mlir/Pass/Pass.h"
 #include <memory>
 

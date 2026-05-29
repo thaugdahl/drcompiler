@@ -10,7 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if __has_include("mlir/Dialect/Affine/Passes.h")
 #include "mlir/Dialect/Affine/Passes.h"
+#else
+#include "mlir/Dialect/Affine/Transforms/Passes.h"
+#endif
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"

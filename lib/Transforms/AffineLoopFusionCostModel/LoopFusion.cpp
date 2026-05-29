@@ -19,7 +19,11 @@
 #include "drcompiler/Transforms/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
+#if __has_include("mlir/Dialect/Affine/Passes.h")
 #include "mlir/Dialect/Affine/Passes.h"
+#else
+#include "mlir/Dialect/Affine/Transforms/Passes.h"
+#endif
 
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
