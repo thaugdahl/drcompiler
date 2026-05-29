@@ -93,15 +93,43 @@ inline unsigned combine(unsigned memCycles, unsigned regCycles,
   return memCycles + regCycles + aluCycles;
 }
 
-/// Hypothetical-fusion register-pressure approximation: build a fresh trace
-/// over the destination loop body augmented with the slice's source ops.
-inline uint64_t estimateRegCyclesForFusion(AffineForOp dstForOp,
+/// Collect every op inside `srcRegion` that transitively feeds `srcStoreOp`.
+/// This is the "slice" that fusion would clone into the destination body.
+/// Walking the full slice (not just the store) gives RPA a realistic view
+/// of the live-set the fused body would carry.
+inline void collectSliceOps(mlir::Operation *srcStoreOp,
+                            mlir::Region &srcRegion,
+                            llvm::SmallVectorImpl<mlir::Operation *> &out) {
+  if (!srcStoreOp)
+    return;
+  llvm::DenseSet<mlir::Operation *> visited;
+  llvm::SmallVector<mlir::Operation *, 16> worklist{srcStoreOp};
+  while (!worklist.empty()) {
+    mlir::Operation *op = worklist.pop_back_val();
+    if (!visited.insert(op).second)
+      continue;
+    // Restrict to ops inside the source loop's region; we don't want to
+    // pull in iv math or constants defined in the enclosing function.
+    if (!srcRegion.isAncestor(op->getParentRegion()))
+      continue;
+    out.push_back(op);
+    for (mlir::Value v : op->getOperands()) {
+      if (auto *def = v.getDefiningOp())
+        worklist.push_back(def);
+    }
+  }
+}
+
+/// Hypothetical-fusion register-pressure approximation: walk the source
+/// store's full def-use slice and replay it as cloned ops on top of the
+/// destination body's pressure trace.
+inline uint64_t estimateRegCyclesForFusion(AffineForOp srcForOp,
+                                            AffineForOp dstForOp,
                                             Operation *srcStoreOp) {
   if (!gActive || !gActive->archHandler)
     return 0;
-  llvm::SmallVector<Operation *, 4> clonedOps;
-  if (srcStoreOp)
-    clonedOps.push_back(srcStoreOp);
+  llvm::SmallVector<mlir::Operation *, 16> clonedOps;
+  collectSliceOps(srcStoreOp, srcForOp.getRegion(), clonedOps);
   drcompiler::PressureQuery q;
   q.params = gActive->regParams;
   q.strategy = gActive->spillStrategy;
@@ -770,8 +798,8 @@ static bool isFusionProfitable(AffineForOp srcForOp,
       uint64_t memCycles =
           dr_fusion::bytesToMemCycles(sliceWriteRegionSizeBytes);
       uint64_t aluCycles = static_cast<uint64_t>(fusedLoopNestComputeCost);
-      uint64_t regCycles =
-          dr_fusion::estimateRegCyclesForFusion(dstForOp, srcStoreOp);
+      uint64_t regCycles = dr_fusion::estimateRegCyclesForFusion(
+          srcForOp, dstForOp, srcStoreOp);
       // Compute-tolerance still applies as a hard guard so we don't fuse
       // unboundedly redundant work even if mem+reg drop.
       if (additionalComputeFraction > computeToleranceThreshold)
