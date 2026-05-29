@@ -17,6 +17,7 @@
 #include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
 #include "mlir/Dialect/Affine/Passes.h"
 
@@ -65,8 +66,22 @@ struct UnifiedConfig {
   drcompiler::RegisterParams regParams;
   drcompiler::SpillStrategy spillStrategy =
       drcompiler::SpillStrategy::ExcessHot;
+  // DR-DIVERGE: cache hierarchy params used by `bytesToMemCycles` to
+  // convert raw byte counts into cycle estimates comparable to the
+  // ALU/register components of the combiner.
+  dr::CacheParams cache{32768, 262144, 0, 4, 12, 40, 200, 64};
 };
 static const UnifiedConfig *gActive = nullptr;
+
+/// Convert a memory footprint (bytes) to a per-iteration cycle estimate
+/// using the configured cache hierarchy.  This makes memCycles unit-
+/// comparable to ALU and register-spill cycles inside the combiner.
+inline uint64_t bytesToMemCycles(int64_t bytes) {
+  if (!gActive || bytes <= 0)
+    return 0;
+  return static_cast<uint64_t>(
+      dr::estimateLoadLatency(bytes, gActive->cache));
+}
 
 /// Combined cost via the active arch handler.  When no arch is configured we
 /// fall back to a plain sum so call sites can use the result uniformly.
@@ -654,9 +669,12 @@ static bool isFusionProfitable(AffineForOp srcForOp,
   if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel) {
     auto srcMem = getMemoryFootprintBytes(srcForOp);
     auto dstMem = getMemoryFootprintBytes(dstForOp);
+    // DR-DIVERGE: convert raw byte footprints to cycle estimates via the
+    // cache hierarchy so all aspects (mem/reg/alu) of `combineCosts` are
+    // in the same units.
     uint64_t unfusedMem =
-        static_cast<uint64_t>(srcMem.value_or(0)) +
-        static_cast<uint64_t>(dstMem.value_or(0));
+        dr_fusion::bytesToMemCycles(srcMem.value_or(0)) +
+        dr_fusion::bytesToMemCycles(dstMem.value_or(0));
     uint64_t unfusedAlu = srcLoopNestCost + dstLoopNestCost;
     uint64_t unfusedReg = 0;
     if (dr_fusion::gActive->archHandler) {
@@ -744,11 +762,13 @@ static bool isFusionProfitable(AffineForOp srcForOp,
       // running minimum is correctly per-isFusionProfitable-call.
 
       // Aspect costs:
-      //   memCycles ~ slice memory footprint (smaller buffer = better cache)
+      //   memCycles ~ slice memory footprint, converted to cycles via
+      //               the cache hierarchy (`estimateLoadLatency`).
       //   aluCycles ~ fused compute cost
       //   regCycles ~ RPA estimate over the destination body augmented with
       //               the source slice's ops (proxy for hypothetical fusion).
-      uint64_t memCycles = static_cast<uint64_t>(sliceWriteRegionSizeBytes);
+      uint64_t memCycles =
+          dr_fusion::bytesToMemCycles(sliceWriteRegionSizeBytes);
       uint64_t aluCycles = static_cast<uint64_t>(fusedLoopNestComputeCost);
       uint64_t regCycles =
           dr_fusion::estimateRegCyclesForFusion(dstForOp, srcStoreOp);
@@ -1731,6 +1751,26 @@ void DrAffineLoopFusionPass::runOnOperation() {
     config.spillStrategy = drcompiler::parseSpillStrategy(drSpillStrategy);
   else if (archJson.spillStrategy)
     config.spillStrategy = drcompiler::parseSpillStrategy(*archJson.spillStrategy);
+
+  // DR-DIVERGE: pull cache hierarchy from the JSON `cache` block when
+  // present.  Leaves Phase-1 defaults otherwise (`UnifiedConfig::cache`).
+  {
+    const auto &cj = cm.cacheParams();
+    if (cj.l1Size)
+      config.cache.l1Size = *cj.l1Size;
+    if (cj.l2Size)
+      config.cache.l2Size = *cj.l2Size;
+    if (cj.l3Size)
+      config.cache.l3Size = *cj.l3Size;
+    if (cj.l1Latency)
+      config.cache.l1Latency = *cj.l1Latency;
+    if (cj.l2Latency)
+      config.cache.l2Latency = *cj.l2Latency;
+    if (cj.l3Latency)
+      config.cache.l3Latency = *cj.l3Latency;
+    if (cj.memLatency)
+      config.cache.memLatency = *cj.memLatency;
+  }
 
   dr_fusion::gActive = &config;
   struct ActiveResetter {

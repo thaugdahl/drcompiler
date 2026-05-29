@@ -31,6 +31,7 @@
 #include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
 namespace mlir {
 using affine::FusionMode;  // unused here but kept for parity with Fusion fork
@@ -237,11 +238,17 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
       uint64_t tileVolume = 1;
       for (unsigned i = 0; i < band.size(); ++i)
         tileVolume *= candidate;
-      // Footprint proxy: scale parent fp by candidate^2 / excessFactor.
+      // DR-DIVERGE: convert tile footprint to cycles via the cache hierarchy
+      // so the combiner sees mem/reg/alu in the same units.
       uint64_t footprintBytes = static_cast<uint64_t>(*fp) *
                                  (uint64_t)candidate * (uint64_t)candidate /
                                  std::max<uint64_t>(excessFactor, 1);
-      uint64_t memCycles = footprintBytes / 64; // 1 cycle / cache line
+      dr::CacheParams cache{
+          static_cast<unsigned>(cacheSizeInKiB * 1024u / 4u), // L1 ~ 1/4 cache
+          static_cast<unsigned>(cacheSizeInKiB * 1024u),
+          0u, 4u, 12u, 40u, 200u, 64u};
+      uint64_t memCycles = static_cast<uint64_t>(
+          dr::estimateLoadLatency(footprintBytes, cache));
       uint64_t aluCycles = tileVolume * baseAlu;
       uint64_t regCycles = innerPressure.totalSpillCycles * tileVolume;
       unsigned total = handler->combineCosts(
