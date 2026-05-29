@@ -229,7 +229,11 @@ def DrAffineLoopFusionPass : Pass<"dr-affine-loop-fusion"> {
            "ArchHandler name (generic | x86-64-avx2 | x86-64-avx512 | arm-neon).">,
     Option<"drSpillStrategy", "spill-strategy", "std::string",
            /*default=*/"\"excess-hot\"",
-           "Spill aggregation: excess-hot | sum-excess | graph-color">
+           "Spill aggregation: excess-hot | sum-excess | graph-color">,
+    Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
+           "Emit a remark on the source loop with the unified cost-model "
+           "breakdown (mem/reg/alu and unfused baseline) for every fusion "
+           "decision.  Default off so production runs are quiet.">
   ];
 
   let dependentDialects = ["memref::MemRefDialect"];

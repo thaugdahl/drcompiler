@@ -61,6 +61,7 @@ using namespace mlir::affine;
 namespace dr_fusion {
 struct UnifiedConfig {
   bool useUnifiedCostModel = false;
+  bool emitRationale = false;
   std::unique_ptr<drcompiler::ArchHandler> archHandler;
   drcompiler::ArchParams archParams;
   drcompiler::RegisterParams regParams;
@@ -839,7 +840,23 @@ static bool isFusionProfitable(AffineForOp srcForOp,
       bestDstLoopDepth && bestUnifiedTotal >= unfusedTotal) {
     LDBG() << "Unified cost model rejects fusion: fused total "
            << bestUnifiedTotal << " >= unfused total " << unfusedTotal;
+    if (dr_fusion::gActive->emitRationale) {
+      std::string buf;
+      llvm::raw_string_ostream os(buf);
+      os << "fusion-rationale: REJECT fused_total=" << bestUnifiedTotal
+         << " >= unfused_total=" << unfusedTotal;
+      srcForOp->emitRemark(buf);
+    }
     return false;
+  }
+  if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel &&
+      dr_fusion::gActive->emitRationale && bestDstLoopDepth) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    os << "fusion-rationale: FUSE depth=" << *bestDstLoopDepth
+       << " fused_total=" << bestUnifiedTotal
+       << " unfused_total=" << unfusedTotal;
+    srcForOp->emitRemark(buf);
   }
 
   if (!bestDstLoopDepth) {
@@ -1730,6 +1747,7 @@ void DrAffineLoopFusionPass::runOnOperation() {
   // defaults.  Cleared on exit so we never leak past the pass.
   dr_fusion::UnifiedConfig config;
   config.useUnifiedCostModel = useUnifiedCostModel;
+  config.emitRationale = emitRationale;
 
   drcompiler::CpuCostModel cm =
       cpuCostModelFile.empty()
