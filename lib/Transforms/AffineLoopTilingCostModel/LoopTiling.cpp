@@ -234,19 +234,41 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
               inner.getRegion(), *handler, ap, pq);
     }
 
+    // DR-DIVERGE: cache hierarchy reused across the grid + untiled baseline.
+    dr::CacheParams cache{
+        static_cast<unsigned>(cacheSizeInKiB * 1024u / 4u), // L1 ~ 1/4 cache
+        static_cast<unsigned>(cacheSizeInKiB * 1024u),
+        0u, 4u, 12u, 40u, 200u, 64u};
+
+    // DR-DIVERGE: untiled baseline.  If the best tiled candidate doesn't
+    // improve on running the band as-is, fall back to tile=1.  Plan §16
+    // mirror of the fusion fork's unfused-baseline rejection.
+    uint64_t totalTripCount = 1;
+    bool tripsKnown = true;
+    for (AffineForOp f : band) {
+      auto tc = getConstantTripCount(f);
+      if (!tc) { tripsKnown = false; break; }
+      totalTripCount *= *tc;
+    }
+    uint64_t untiledTotal = std::numeric_limits<uint64_t>::max();
+    if (tripsKnown) {
+      uint64_t untiledMem = static_cast<uint64_t>(
+          dr::estimateLoadLatency(static_cast<int64_t>(*fp), cache));
+      uint64_t untiledAlu = totalTripCount * baseAlu;
+      uint64_t untiledReg = innerPressure.totalSpillCycles * totalTripCount;
+      untiledTotal = handler->combineCosts(
+          static_cast<unsigned>(untiledMem),
+          static_cast<unsigned>(untiledReg),
+          static_cast<unsigned>(untiledAlu), ap);
+    }
+
     for (unsigned candidate : kCandidates) {
       uint64_t tileVolume = 1;
       for (unsigned i = 0; i < band.size(); ++i)
         tileVolume *= candidate;
-      // DR-DIVERGE: convert tile footprint to cycles via the cache hierarchy
-      // so the combiner sees mem/reg/alu in the same units.
       uint64_t footprintBytes = static_cast<uint64_t>(*fp) *
                                  (uint64_t)candidate * (uint64_t)candidate /
                                  std::max<uint64_t>(excessFactor, 1);
-      dr::CacheParams cache{
-          static_cast<unsigned>(cacheSizeInKiB * 1024u / 4u), // L1 ~ 1/4 cache
-          static_cast<unsigned>(cacheSizeInKiB * 1024u),
-          0u, 4u, 12u, 40u, 200u, 64u};
       uint64_t memCycles = static_cast<uint64_t>(
           dr::estimateLoadLatency(footprintBytes, cache));
       uint64_t aluCycles = tileVolume * baseAlu;
@@ -259,7 +281,30 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
         bestTile = candidate;
       }
     }
-    tSize = bestTile;
+
+    // DR-DIVERGE: untiled baseline rejection.  When the best tiled total
+    // isn't better than running the band without tiling, set tSize=1 so the
+    // emitted code degenerates to a no-op tile transformation.
+    if (tripsKnown && bestTotal >= untiledTotal) {
+      if (emitRationale) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        os << "tile-rationale: REJECT best_total=" << bestTotal
+           << " >= untiled_total=" << untiledTotal;
+        band.front()->emitRemark(buf);
+      }
+      tSize = 1;
+    } else {
+      if (emitRationale) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        os << "tile-rationale: TILE size=" << bestTile
+           << " best_total=" << bestTotal
+           << " untiled_total=" << untiledTotal;
+        band.front()->emitRemark(buf);
+      }
+      tSize = bestTile;
+    }
   } else {
     // Upstream: nth root of excess factor.
     tSize = static_cast<unsigned>(
