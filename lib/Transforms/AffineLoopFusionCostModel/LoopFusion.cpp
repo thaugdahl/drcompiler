@@ -84,8 +84,16 @@ static const UnifiedConfig *gActive = nullptr;
 inline uint64_t bytesToMemCycles(int64_t bytes) {
   if (!gActive || bytes <= 0)
     return 0;
-  return static_cast<uint64_t>(
-      dr::estimateLoadLatency(bytes, gActive->cache));
+  // estimateLoadLatency returns per-access latency for data of this size.
+  // The TOTAL memory cycles needed to process this many bytes are (lines
+  // touched) * (per-access latency).  Treating per-access latency as the
+  // total was the bug that made fused/unfused mem comparisons negligible
+  // against ALU on programs like gemver.
+  unsigned perAccess =
+      dr::estimateLoadLatency(bytes, gActive->cache);
+  uint64_t lineSize = std::max<uint64_t>(gActive->cache.cacheLineSize, 1u);
+  uint64_t lines = (static_cast<uint64_t>(bytes) + lineSize - 1) / lineSize;
+  return lines * static_cast<uint64_t>(perAccess);
 }
 
 /// Combined cost via the active arch handler.  When no arch is configured we

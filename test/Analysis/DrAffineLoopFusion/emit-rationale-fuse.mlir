@@ -7,7 +7,7 @@
 func.func @producer_consumer(%A: memref<10xf32>, %B: memref<10xf32>) {
   %t = memref.alloc() : memref<10xf32>
   %c = arith.constant 1.0 : f32
-  // expected-remark @below {{fusion-rationale: FUSE depth=1 fused_total=64 unfused_total=68}}
+  // expected-remark @below {{fusion-rationale: FUSE depth=1 fused_total=64 unfused_total=76}}
   affine.for %i = 0 to 10 {
     %v = affine.load %A[%i] : memref<10xf32>
     %r = arith.mulf %v, %c : f32

@@ -243,6 +243,17 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
         static_cast<unsigned>(cacheSizeInKiB * 1024u / 4u), // L1 ~ 1/4 cache
         static_cast<unsigned>(cacheSizeInKiB * 1024u),
         0u, 4u, 12u, 40u, 200u, 64u};
+    // Total memory cycles = (lines touched) * (per-access latency).  See
+    // matching fix in the fusion fork's bytesToMemCycles helper.
+    auto bytesToMemCycles = [&](int64_t bytes) -> uint64_t {
+      if (bytes <= 0)
+        return 0;
+      unsigned perAccess = dr::estimateLoadLatency(bytes, cache);
+      uint64_t lineSize = std::max<uint64_t>(cache.cacheLineSize, 1u);
+      uint64_t lines =
+          (static_cast<uint64_t>(bytes) + lineSize - 1) / lineSize;
+      return lines * static_cast<uint64_t>(perAccess);
+    };
 
     // DR-DIVERGE: untiled baseline.  If the best tiled candidate doesn't
     // improve on running the band as-is, fall back to tile=1.  Plan §16
@@ -256,8 +267,7 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
     }
     uint64_t untiledTotal = std::numeric_limits<uint64_t>::max();
     if (tripsKnown) {
-      uint64_t untiledMem = static_cast<uint64_t>(
-          dr::estimateLoadLatency(static_cast<int64_t>(*fp), cache));
+      uint64_t untiledMem = bytesToMemCycles(static_cast<int64_t>(*fp));
       uint64_t untiledAlu = totalTripCount * baseAlu;
       uint64_t untiledReg = innerPressure.totalSpillCycles * totalTripCount;
       untiledTotal = handler->combineCosts(
@@ -273,8 +283,7 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
       uint64_t footprintBytes = static_cast<uint64_t>(*fp) *
                                  (uint64_t)candidate * (uint64_t)candidate /
                                  std::max<uint64_t>(excessFactor, 1);
-      uint64_t memCycles = static_cast<uint64_t>(
-          dr::estimateLoadLatency(footprintBytes, cache));
+      uint64_t memCycles = bytesToMemCycles(static_cast<int64_t>(footprintBytes));
       uint64_t aluCycles = tileVolume * baseAlu;
       uint64_t regCycles = innerPressure.totalSpillCycles * tileVolume;
       unsigned total = handler->combineCosts(
