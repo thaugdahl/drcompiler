@@ -74,7 +74,21 @@ std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
   for (int64_t dim : memrefTy.getShape())
     numElements *= dim;
 
-  unsigned elementBits = memrefTy.getElementTypeBitWidth();
+  // Element may be int, float, or a vector of int/float.  Calling
+  // `getElementTypeBitWidth()` directly asserts on vector elements, so
+  // dispatch by hand.
+  mlir::Type elemTy = memrefTy.getElementType();
+  unsigned elementBits = 0;
+  if (auto vt = mlir::dyn_cast<mlir::VectorType>(elemTy)) {
+    if (!vt.getElementType().isIntOrFloat())
+      return std::nullopt;
+    elementBits =
+        vt.getElementType().getIntOrFloatBitWidth() * vt.getNumElements();
+  } else if (elemTy.isIntOrFloat()) {
+    elementBits = elemTy.getIntOrFloatBitWidth();
+  } else {
+    return std::nullopt;
+  }
   if (elementBits == 0)
     return std::nullopt;
 
