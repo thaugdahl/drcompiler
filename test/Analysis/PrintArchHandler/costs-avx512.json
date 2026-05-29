@@ -1,0 +1,15 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "triplet": "x86_64-unknown-linux-gnu",
+    "handler": "x86-64-avx512",
+    "vector_width_bits": 512,
+    "spill_strategy": "sum-excess"
+  },
+  "registers": {
+    "gp_budget": 16,
+    "fp_budget": 32,
+    "vec_budget": 32,
+    "pred_budget": 8
+  }
+}

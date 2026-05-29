@@ -11,6 +11,7 @@ add_mlir_library(DRCompTransforms
   DataRecomputation/Strategies/InterprocRemat.cpp
   DataRecomputation/Strategies/PartialRemat.cpp
   MemoryFission.cpp
+  PrintArchHandler.cpp
   RaiseMallocToMemRef.cpp
   Utils/OpDispatchUtils.cpp
   Utils/MemrefBaseAnalysis.cpp
@@ -23,6 +24,7 @@ add_mlir_library(DRCompTransforms
     DRCompPassesIncGen
 
   LINK_LIBS PUBLIC
+    DRCompAnalysis
     MLIRAnalysis
     MLIRFunctionInterfaces
     MLIRLoopLikeInterface

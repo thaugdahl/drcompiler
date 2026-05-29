@@ -1,0 +1,22 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "triplet": "x86_64-unknown-linux-gnu",
+    "handler": "x86-64-avx2",
+    "vector_width_bits": 256,
+    "spill_strategy": "excess-hot",
+    "weights": {
+      "alpha_mem": 1.0,
+      "beta_reg": 1.5,
+      "gamma_alu": 0.5
+    }
+  },
+  "registers": {
+    "gp_budget": 16,
+    "fp_budget": 16,
+    "vec_budget": 16,
+    "pred_budget": 0,
+    "spill_reload_cycles": 5,
+    "spill_store_cycles": 1
+  }
+}

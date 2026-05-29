@@ -79,6 +79,7 @@ endif()
 #===----------------------------------------------------------------------===//
 
 add_subdirectory(include/drcompiler/Transforms)
+add_subdirectory(lib/Analysis)
 add_subdirectory(lib/Transforms)
 add_subdirectory(tools)
 
@@ -95,7 +96,13 @@ target_include_directories(DRCompTransforms
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-install(TARGETS DRCompTransforms
+target_include_directories(DRCompAnalysis
+  INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+install(TARGETS DRCompTransforms DRCompAnalysis
   EXPORT DRCompilerTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

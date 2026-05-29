@@ -147,6 +147,81 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
                  << "' is not a JSON object; ignoring\n";
   }
 
+  // Read optional arch block.
+  if (auto *archObj = root->getObject("arch")) {
+    auto readString = [&](llvm::StringRef key,
+                          std::optional<std::string> &dst) {
+      if (auto v = archObj->getString(key)) {
+        dst = v->str();
+      } else if (archObj->get(key)) {
+        llvm::errs() << "drcompiler warning: non-string arch." << key
+                     << " in '" << path << "'; skipping\n";
+      }
+    };
+    auto readUnsigned = [&](llvm::StringRef key,
+                            std::optional<unsigned> &dst) {
+      if (auto v = archObj->getInteger(key)) {
+        if (*v < 0) {
+          llvm::errs() << "drcompiler warning: negative arch." << key
+                       << " in '" << path << "'; skipping\n";
+          return;
+        }
+        dst = static_cast<unsigned>(*v);
+      } else if (archObj->get(key)) {
+        llvm::errs() << "drcompiler warning: non-integer arch." << key
+                     << " in '" << path << "'; skipping\n";
+      }
+    };
+    readString("triplet", m.arch.triplet);
+    readString("handler", m.arch.handler);
+    readUnsigned("vector_width_bits", m.arch.vectorWidthBits);
+    readString("spill_strategy", m.arch.spillStrategy);
+
+    if (auto *weights = archObj->getObject("weights")) {
+      auto readWeight = [&](llvm::StringRef key,
+                            std::optional<double> &dst) {
+        if (auto v = weights->getNumber(key))
+          dst = *v;
+        else if (weights->get(key))
+          llvm::errs() << "drcompiler warning: non-numeric arch.weights."
+                       << key << " in '" << path << "'; skipping\n";
+      };
+      readWeight("alpha_mem", m.arch.alphaMem);
+      readWeight("beta_reg", m.arch.betaReg);
+      readWeight("gamma_alu", m.arch.gammaAlu);
+    }
+  } else if (root->get("arch")) {
+    llvm::errs() << "drcompiler warning: 'arch' in '" << path
+                 << "' is not a JSON object; ignoring\n";
+  }
+
+  // Read optional registers block.
+  if (auto *regs = root->getObject("registers")) {
+    auto readUnsigned = [&](llvm::StringRef key,
+                            std::optional<unsigned> &dst) {
+      if (auto v = regs->getInteger(key)) {
+        if (*v < 0) {
+          llvm::errs() << "drcompiler warning: negative registers." << key
+                       << " in '" << path << "'; skipping\n";
+          return;
+        }
+        dst = static_cast<unsigned>(*v);
+      } else if (regs->get(key)) {
+        llvm::errs() << "drcompiler warning: non-integer registers." << key
+                     << " in '" << path << "'; skipping\n";
+      }
+    };
+    readUnsigned("gp_budget", m.registers.gpBudget);
+    readUnsigned("fp_budget", m.registers.fpBudget);
+    readUnsigned("vec_budget", m.registers.vecBudget);
+    readUnsigned("pred_budget", m.registers.predBudget);
+    readUnsigned("spill_reload_cycles", m.registers.spillReloadCycles);
+    readUnsigned("spill_store_cycles", m.registers.spillStoreCycles);
+  } else if (root->get("registers")) {
+    llvm::errs() << "drcompiler warning: 'registers' in '" << path
+                 << "' is not a JSON object; ignoring\n";
+  }
+
   m.fromFile = true;
   LLVM_DEBUG(llvm::dbgs() << "DRCOMP-COST: Loaded CPU cost model from '"
                           << path << "' (" << m.table.size() << " ops)\n");

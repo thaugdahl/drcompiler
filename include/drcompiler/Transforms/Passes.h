@@ -3,6 +3,7 @@
 
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/MemoryFission.h"
+#include "drcompiler/Transforms/PrintArchHandler.h"
 #include "drcompiler/Transforms/RaiseMallocToMemRef.h"
 
 namespace mlir {

@@ -139,6 +139,29 @@ def RaiseMallocToMemRefPass
   let constructor = "mlir::createRaiseMallocToMemRefPass()";
 }
 
+def PrintArchHandlerPass : Pass<"print-arch-handler", "mlir::ModuleOp">
+{
+  let summary = "Print the architecture handler chosen for this module";
+
+  let description = [{
+    Diagnostic pass for the unified cost model.  Loads the CPU cost-model
+    JSON (if `cpu-cost-model-file` is set) and emits a remark on the module
+    with the chosen handler name, vector width, register budgets, and
+    weights.  Used to validate end-to-end JSON dispatch in Phase 1 of the
+    register-pressure plan.
+  }];
+
+  let options = [
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON file with cost-model and arch/registers blocks">,
+    Option<"handlerOverride", "handler", "std::string", /*default=*/"",
+           "Override the JSON handler name (use this handler instead)">
+  ];
+
+  let constructor = "mlir::createPrintArchHandlerPass()";
+}
+
 def MemoryFissionPass
     : Pass<"memory-fission", "mlir::ModuleOp">
 {

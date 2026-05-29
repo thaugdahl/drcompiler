@@ -1,0 +1,8 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "triplet": "aarch64-unknown-linux-gnu",
+    "handler": "arm-neon",
+    "vector_width_bits": 128
+  }
+}
