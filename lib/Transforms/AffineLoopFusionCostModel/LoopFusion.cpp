@@ -644,6 +644,41 @@ static bool isFusionProfitable(AffineForOp srcForOp,
   // Compute op instance count for the destination loop nest.
   uint64_t dstLoopNestCost = getComputeCost(dstForOp, dstLoopNestStats);
 
+  // DR-DIVERGE: pre-loop unified-path state.  Carry the running min total
+  // across loop iterations as a local (was `static` previously, which leaked
+  // across isFusionProfitable invocations).
+  uint64_t bestUnifiedTotal = std::numeric_limits<uint64_t>::max();
+  // DR-DIVERGE: compute unfused baseline once for the unfused vs fused
+  // comparison done after the per-depth search.
+  uint64_t unfusedTotal = 0;
+  if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel) {
+    auto srcMem = getMemoryFootprintBytes(srcForOp);
+    auto dstMem = getMemoryFootprintBytes(dstForOp);
+    uint64_t unfusedMem =
+        static_cast<uint64_t>(srcMem.value_or(0)) +
+        static_cast<uint64_t>(dstMem.value_or(0));
+    uint64_t unfusedAlu = srcLoopNestCost + dstLoopNestCost;
+    uint64_t unfusedReg = 0;
+    if (dr_fusion::gActive->archHandler) {
+      drcompiler::PressureQuery q;
+      q.params = dr_fusion::gActive->regParams;
+      q.strategy = dr_fusion::gActive->spillStrategy;
+      q.tripCount = 1;
+      auto rs =
+          drcompiler::RegisterPressureAnalysis::analyzeRegionStatic(
+              srcForOp.getRegion(), *dr_fusion::gActive->archHandler,
+              dr_fusion::gActive->archParams, q);
+      auto rd =
+          drcompiler::RegisterPressureAnalysis::analyzeRegionStatic(
+              dstForOp.getRegion(), *dr_fusion::gActive->archHandler,
+              dr_fusion::gActive->archParams, q);
+      unfusedReg = rs.totalSpillCycles + rd.totalSpillCycles;
+    }
+    unfusedTotal = dr_fusion::combine(static_cast<unsigned>(unfusedMem),
+                                       static_cast<unsigned>(unfusedReg),
+                                       static_cast<unsigned>(unfusedAlu));
+  }
+
   // Evaluate all depth choices for materializing the slice in the destination
   // loop nest.
   for (unsigned i = maxLegalFusionDepth; i >= 1; --i) {
@@ -705,12 +740,8 @@ static bool isFusionProfitable(AffineForOp srcForOp,
     // memory+register+ALU combiner when the unified path is active.  Among
     // legal depths, pick the one that minimises arch.combineCosts(...).
     if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel) {
-      static uint64_t bestUnifiedTotal = std::numeric_limits<uint64_t>::max();
-      // Reset per outer call: the lifetime of bestUnifiedTotal is one
-      // isFusionProfitable invocation, so we re-initialise when bestDstLoopDepth
-      // is still empty (first legal depth visited).
-      if (!bestDstLoopDepth)
-        bestUnifiedTotal = std::numeric_limits<uint64_t>::max();
+      // bestUnifiedTotal is now a function-scope local (see above) so the
+      // running minimum is correctly per-isFusionProfitable-call.
 
       // Aspect costs:
       //   memCycles ~ slice memory footprint (smaller buffer = better cache)
@@ -751,6 +782,17 @@ static bool isFusionProfitable(AffineForOp srcForOp,
   }
 
   // A simple cost model: fuse if it reduces the memory footprint.
+
+  // DR-DIVERGE: under the unified path, reject fusion when the best fused
+  // total is *not* better than running the two nests separately.  This is
+  // the missing piece from plan §7.3 — upstream's placeholder never
+  // compares against an unfused baseline.
+  if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel &&
+      bestDstLoopDepth && bestUnifiedTotal >= unfusedTotal) {
+    LDBG() << "Unified cost model rejects fusion: fused total "
+           << bestUnifiedTotal << " >= unfused total " << unfusedTotal;
+    return false;
+  }
 
   if (!bestDstLoopDepth) {
     LDBG() << "All fusion choices involve more than the threshold amount of "

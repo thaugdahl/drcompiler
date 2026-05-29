@@ -1,0 +1,17 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "handler": "x86-64-avx2",
+    "weights": {
+      "alpha_mem": 1.0,
+      "beta_reg": 10000.0,
+      "gamma_alu": 1.0
+    }
+  },
+  "registers": {
+    "gp_budget": 1,
+    "fp_budget": 1,
+    "vec_budget": 1,
+    "spill_reload_cycles": 1000
+  }
+}
