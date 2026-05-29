@@ -180,10 +180,23 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
   // back to upstream's nth-root heuristic otherwise.
   unsigned tSize = 0;
   if (useUnifiedCostModel) {
-    static constexpr unsigned kCandidates[] = {2, 4, 8, 16, 32, 64};
+    // DR-DIVERGE: seed the grid with upstream's nth_root choice so the
+    // search picks "upstream or better" rather than always converging on
+    // the smallest cache-friendly tile.  Without this, the cost combiner
+    // rewards tile=2 uniformly (best per-tile cache fit) but loses on
+    // loop overhead for kernels like seidel-2d where 6 is closer to
+    // optimal.  We require a CHOICE_MARGIN improvement before overriding
+    // upstream's seed; otherwise stick with it.
+    unsigned nthRootSeed = static_cast<unsigned>(
+        floorl(std::pow(excessFactor, 1.0 / band.size())));
+    if (nthRootSeed < 1) nthRootSeed = 1;
+    llvm::SmallVector<unsigned, 8> candidates{2u, 4u, 8u, 16u, 32u, 64u};
+    if (std::find(candidates.begin(), candidates.end(), nthRootSeed) ==
+        candidates.end())
+      candidates.push_back(nthRootSeed);
     const uint64_t baseAlu = 4; // crude per-iter ALU
     uint64_t bestTotal = std::numeric_limits<uint64_t>::max();
-    unsigned bestTile = DrAffineLoopTilePass::kDefaultTileSize;
+    unsigned bestTile = nthRootSeed; // start at upstream's choice
 
     drcompiler::CpuCostModel cm =
         cpuCostModelFile.empty()
@@ -276,20 +289,51 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
           static_cast<unsigned>(untiledAlu), ap);
     }
 
-    for (unsigned candidate : kCandidates) {
-      uint64_t tileVolume = 1;
+    // Score the nth_root seed first so other candidates have a baseline
+    // to beat.  We require >5% improvement on `total` to override; this
+    // anchors decisions in upstream's calibrated heuristic.
+    // 50% is conservative on purpose: per-tile cost minimisation (which is
+    // what our combiner is currently doing) tends to favour the smallest
+    // tile uniformly, because alu/reg costs all scale down with tileVolume.
+    // We only deviate from upstream's nth_root anchor on big differences
+    // (cache-fit transitions), not on small per-tile arithmetic wins.
+    static constexpr double kChoiceMargin = 0.50;
+    // DR-DIVERGE: score by PER-PROBLEM total cost (multiply per-tile by
+    // num_tiles), not per-tile cost.  Without this, the combiner rewards
+    // the smallest tile uniformly because alu/reg per-tile scale with
+    // tileVolume.  Per-problem total work is invariant in alu/reg; the
+    // only sensitive component is total memory traffic (controlled by
+    // which cache level each tile fits in).
+    auto score = [&](unsigned candidate) -> uint64_t {
+      uint64_t tv = 1;
       for (unsigned i = 0; i < band.size(); ++i)
-        tileVolume *= candidate;
-      uint64_t footprintBytes = static_cast<uint64_t>(*fp) *
-                                 (uint64_t)candidate * (uint64_t)candidate /
-                                 std::max<uint64_t>(excessFactor, 1);
-      uint64_t memCycles = bytesToMemCycles(static_cast<int64_t>(footprintBytes));
-      uint64_t aluCycles = tileVolume * baseAlu;
-      uint64_t regCycles = innerPressure.totalSpillCycles * tileVolume;
-      unsigned total = handler->combineCosts(
-          static_cast<unsigned>(memCycles), static_cast<unsigned>(regCycles),
-          static_cast<unsigned>(aluCycles), ap);
-      if (total < bestTotal) {
+        tv *= candidate;
+      uint64_t numTiles = tripsKnown ? std::max<uint64_t>(totalTripCount / tv, 1)
+                                      : 1;
+      uint64_t fpBytes = static_cast<uint64_t>(*fp) *
+                          (uint64_t)candidate * (uint64_t)candidate /
+                          std::max<uint64_t>(excessFactor, 1);
+      uint64_t perTileMem = bytesToMemCycles(static_cast<int64_t>(fpBytes));
+      uint64_t totalMem = numTiles * perTileMem;
+      uint64_t totalAlu = tripsKnown ? totalTripCount * baseAlu : tv * baseAlu;
+      uint64_t totalReg = tripsKnown
+          ? innerPressure.totalSpillCycles * totalTripCount
+          : innerPressure.totalSpillCycles * tv;
+      return handler->combineCosts(static_cast<unsigned>(totalMem),
+                                    static_cast<unsigned>(totalReg),
+                                    static_cast<unsigned>(totalAlu), ap);
+    };
+    bestTotal = score(nthRootSeed);
+    bestTile = nthRootSeed;
+    for (unsigned candidate : candidates) {
+      if (candidate == nthRootSeed)
+        continue; // already scored as the anchor
+      uint64_t total = score(candidate);
+      double improvement = bestTotal > 0
+          ? (static_cast<double>(bestTotal) - static_cast<double>(total)) /
+              static_cast<double>(bestTotal)
+          : 0.0;
+      if (improvement > kChoiceMargin) {
         bestTotal = total;
         bestTile = candidate;
       }

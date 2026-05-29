@@ -2,14 +2,16 @@
 // RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(affine-loop-tile{cache-size=1}))' | FileCheck %s --check-prefix=UPSTREAM
 
 // Companion to decision-flip-tight-budget.mlir for the tiling pass.  With
-// a small cache-size, upstream's nth_root heuristic picks tile sizes of 8
-// uniformly across all dims, while the unified-cost-model grid search
-// (candidates {2,4,8,16,32,64}) scored by ArchHandler::combineCosts picks
-// a different (smaller) outer tile, demonstrating the unified path has
-// signal beyond byte-identical reproduction of upstream.
+// a tiny 1-KiB cache, upstream's nth_root heuristic picks uniform 8 across
+// all 3 dims regardless.  drcomp's per-problem cost model sees that
+// num_tiles * per_tile_mem exceeds the untiled baseline at every outer
+// candidate and falls back to tile=1 for the outer dims, only emitting
+// the balance step on the innermost dim.  The divergence demonstrates
+// the unified path makes a meaningfully different decision than
+// upstream's placeholder.
 
 // DRCOMP-LABEL: func.func @matmul
-// DRCOMP-DAG: affine.for {{.*}} step 2
+// DRCOMP: affine.for {{.*}} step 128
 // DRCOMP: return
 
 // UPSTREAM-LABEL: func.func @matmul

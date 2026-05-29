@@ -6,7 +6,7 @@
 // cost-model regressions trip lit instead of only runtime.
 
 func.func @matmul(%A: memref<256x256xf32>, %B: memref<256x256xf32>, %C: memref<256x256xf32>) {
-  // expected-remark @below {{tile-rationale: TILE size=2 best_total=12832 untiled_total=69566464}}
+  // expected-remark @below {{tile-rationale: REJECT best_total=603979776 >= untiled_total=69566464}}
   affine.for %i = 0 to 256 {
     affine.for %j = 0 to 256 {
       affine.for %k = 0 to 256 {
