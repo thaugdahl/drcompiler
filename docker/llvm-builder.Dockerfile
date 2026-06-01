@@ -22,12 +22,20 @@
 FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS host-tools
 ARG LLVM_TAG=llvmorg-22.1.1
 
+ARG LLVM_REPO=https://github.com/thaugdahl/llvm-project-memssa.git
+ARG LLVM_COMMIT_HASH=abd7a1e4f170c4ab6f293b7c181416010b2b1826
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake ninja-build git ca-certificates g++ python3 lld \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch "${LLVM_TAG}" \
-      https://github.com/llvm/llvm-project.git /src/llvm
+RUN git clone --no-checkout "${LLVM_REPO}" /src/llvm && \
+    cd /src/llvm && \
+    git fetch --depth 1 origin "${LLVM_COMMIT_HASH}" && \
+    git checkout "${LLVM_COMMIT_HASH}"
+
+# RUN git clone --depth 1 --branch "${LLVM_TAG}" \
+#       ${LLVM_REPO} /src/llvm
 
 RUN cmake -G Ninja -S /src/llvm/llvm -B /build/llvm-host \
       -DLLVM_ENABLE_PROJECTS="clang;mlir" \
