@@ -64,6 +64,25 @@ docker build \
   -f docker/drcc.Dockerfile \
   -t "drcc:${ARCH}" .
 
+# Lean images: built with the default docker driver, which resolves
+# docker-image:// contexts from the local daemon directly (no registry).
+# The multiarch builder's docker-container driver can't load arm64 images from
+# the local daemon, so we use the default driver + binfmt for the RUN steps.
+if [ "${ARCH}" = "aarch64" ]; then
+  echo "==> Registering arm64 binfmt for lean image apt-get steps..."
+  docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
+fi
+
+# drcc-lean depends only on drcc:${ARCH}, NOT on onnx-mlir. Build it here —
+# before the hours-long, failure-prone onnx-mlir step — so a broken onnx-mlir
+# build cannot leave drcc-lean unbuilt (set -e would abort before reaching it).
+docker build \
+  --platform "${PLATFORM}" \
+  --build-arg ARCH_TAG="${ARCH}" \
+  --build-context "drcc:${ARCH}=docker-image://drcc:${ARCH}" \
+  -f docker/drcc-lean.Dockerfile \
+  -t "drcc-lean:${ARCH}" .
+
 # onnx-mlir takes hours to build and requires arm64 Python3 dev headers for
 # cross-compilation (complex multiarch apt setup). Skip if a correct-arch image
 # already exists. To force a full rebuild, delete the image first and re-run,
@@ -80,22 +99,7 @@ else
     -t "onnx-mlir:${ARCH}" .
 fi
 
-# Lean images: built with the default docker driver, which resolves
-# docker-image:// contexts from the local daemon directly (no registry).
-# The multiarch builder's docker-container driver can't load arm64 images from
-# the local daemon, so we use the default driver + binfmt for the RUN steps.
-if [ "${ARCH}" = "aarch64" ]; then
-  echo "==> Registering arm64 binfmt for lean image apt-get steps..."
-  docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
-fi
-
-docker build \
-  --platform "${PLATFORM}" \
-  --build-arg ARCH_TAG="${ARCH}" \
-  --build-context "drcc:${ARCH}=docker-image://drcc:${ARCH}" \
-  -f docker/drcc-lean.Dockerfile \
-  -t "drcc-lean:${ARCH}" .
-
+# onnx-mlir-lean depends on onnx-mlir:${ARCH}, so it must stay after it.
 docker build \
   --platform "${PLATFORM}" \
   --build-arg ARCH_TAG="${ARCH}" \
