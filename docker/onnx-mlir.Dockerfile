@@ -67,17 +67,36 @@ RUN git clone --depth 1 --branch ${ABSL_TAG} \
     cmake --install /tmp/absl-build && \
     rm -rf /tmp/absl /tmp/absl-build
 
-# Pull ONNX-MLIR source code and create build dir
-RUN git clone --recursive https://github.com/onnx/onnx-mlir.git /build/onnx-mlir && \
+# Pull ONNX-MLIR source code and create build dir.
+# PINNED: onnx-mlir main is a moving target and each upstream commit can surface
+# new LLVM-22 API drift that the sed patches below don't cover. Pin to the
+# 2026-03-12 commit the patches in ONNX-FIXES.md were validated against, so
+# rebuilds are reproducible and the patch set stays valid. When bumping
+# ONNX_MLIR_REF, re-run the build and extend the patches for any new API renames.
+ARG ONNX_MLIR_REF=3db4b49b02e0a3c179177678d90119064d026e6d
+RUN git clone https://github.com/onnx/onnx-mlir.git /build/onnx-mlir && \
+    git -C /build/onnx-mlir checkout ${ONNX_MLIR_REF} && \
+    git -C /build/onnx-mlir submodule update --init --recursive && \
     mkdir -p /build/onnx-mlir/build
 
 # Patch MLIR API renames not present in llvmorg-22.1.1:
 #   writeUnownedBlob  -> writeOwnedBlob  (DialectBytecodeWriter, added in c83ebf19)
 #   getNumThreadsVarsMutable -> getNumThreadsMutable  (omp::ParallelOp rename)
+#   llvm::scope_exit -> llvm::make_scope_exit  (scope_exit class form removed)
+# Plus a TableGen escaping fix: the ONNXToLinalg pass-option description embeds
+# escaped double-quotes (\"MatMul.*\") which llvmorg-22.1.1 mlir-tblgen emits into
+# Passes.h.inc without re-escaping, producing an invalid C++ string literal
+# (operator""MatMul). Drop the inner quotes from the example text.
 RUN grep -rl writeUnownedBlob /build/onnx-mlir | xargs -r \
       sed -i 's/writeUnownedBlob/writeOwnedBlob/g' && \
     grep -rl getNumThreadsVarsMutable /build/onnx-mlir | xargs -r \
-      sed -i 's/getNumThreadsVarsMutable/getNumThreadsMutable/g'
+      sed -i 's/getNumThreadsVarsMutable/getNumThreadsMutable/g' && \
+    grep -rl 'llvm::scope_exit' /build/onnx-mlir | xargs -r \
+      sed -i 's/llvm::scope_exit/llvm::make_scope_exit/g' && \
+    grep -rl '\\"MatMul' /build/onnx-mlir/src/Conversion/ONNXToLinalg | xargs -r \
+      sed -i 's/\\"MatMul\.\*\\"/MatMul.*/g' && \
+    grep -rl 'mlir/Dialect/Affine/Transforms/Passes.h' /build/onnx-mlir | xargs -r \
+      sed -i 's#mlir/Dialect/Affine/Transforms/Passes.h#mlir/Dialect/Affine/Passes.h#g'
 
 # Build ONNX-MLIR for the target arch.
 RUN if [ "$TARGETARCH" = "arm64" ]; then \

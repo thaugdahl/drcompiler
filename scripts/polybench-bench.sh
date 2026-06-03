@@ -253,9 +253,31 @@ CLANG=/opt/llvm/bin/clang
   if [[ "$pipeline" == *"dr-recompute=true"* ]]; then
     effective_pipeline="${effective_pipeline/dr-recompute=true/dr-recompute=true dr-summary=true}"
   fi
-  if [[ -n "$COST_MODEL_FILE" && "$pipeline" == *"dr-cost-model=true"* ]]; then
+  if [[ -n "$COST_MODEL_FILE" ]]; then
     cp "$COST_MODEL_FILE" "${stage}/cost_model.json"
-    effective_pipeline="${effective_pipeline/dr-cost-model=true/dr-cost-model=true cpu-cost-model-file=${stage}/cost_model.json}"
+    local cmf="${stage}/cost_model.json"
+    # data-recomputation cost model is keyed on the dr-cost-model=true token.
+    if [[ "$effective_pipeline" == *"dr-cost-model=true"* ]]; then
+      effective_pipeline="${effective_pipeline/dr-cost-model=true/dr-cost-model=true cpu-cost-model-file=${cmf}}"
+    fi
+    # Fork passes (dr-affine-loop-fusion / dr-affine-loop-tile) take the same
+    # cpu-cost-model-file option but carry NO dr-cost-model=true token, so the
+    # branch above never reaches them. Inject the option into their (possibly
+    # empty) option group. Without this the fork always falls back to
+    # CpuCostModel::getDefault() + default (1,1,1) combiner weights, and any
+    # calibrated/probed cost-model JSON is silently ignored — i.e.
+    # calibrate_weights.py would optimize an objective that is constant in
+    # (alpha,beta,gamma). Handle both braced (foo{opts}) and bare (foo) forms.
+    local p lb='{' rb='}'
+    for p in dr-affine-loop-fusion dr-affine-loop-tile; do
+      if [[ "$effective_pipeline" == *"${p}${lb}"* ]]; then
+        # Braced form foo{opts}: prepend the option (space-separated) inside.
+        effective_pipeline="${effective_pipeline/${p}${lb}/${p}${lb}cpu-cost-model-file=${cmf} }"
+      elif [[ "$effective_pipeline" == *"${p}"* ]]; then
+        # Bare form foo: wrap it in a fresh option group.
+        effective_pipeline="${effective_pipeline/${p}/${p}${lb}cpu-cost-model-file=${cmf}${rb}}"
+      fi
+    done
   fi
 
   # Run full-file MLIR/DR pipeline inside the drcc container.

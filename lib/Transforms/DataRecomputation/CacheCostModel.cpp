@@ -15,38 +15,83 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <algorithm>
 
 namespace dr {
 
+namespace {
+
+/// Generic superscalar issue width used for the throughput floor below. The
+/// critical path dominates for dependent chains, so this only matters for wide
+/// independent expressions. Kept conservative; could be sourced per-arch from
+/// ArchParams in a follow-up.
+constexpr unsigned kIssueWidth = 4;
+
+/// An SSA value is a compute "leaf" (cost 0, depth 0) when it is a load: the
+/// value is already resident in a register or memory and is not recomputed.
+bool isComputeLeaf(mlir::Operation *defOp) {
+  return mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
+                   mlir::LLVM::LoadOp>(defOp);
+}
+
+/// Single memoized walk over the recompute cone of `val`. Returns the longest
+/// weighted dependency path ("critical path") to `val`, and accumulates the
+/// total weighted op cost into `totalCost` (each op counted once). Loads and
+/// block arguments are inputs (depth 0). The def-use operand graph is acyclic
+/// for non-block-arg values, so memoized recursion terminates.
+unsigned computeCostWalk(mlir::Value val,
+                         const drcompiler::CpuCostModel &costModel,
+                         llvm::DenseMap<mlir::Value, unsigned> &depthMemo,
+                         llvm::SmallDenseSet<mlir::Operation *> &countedOps,
+                         unsigned &totalCost) {
+  if (auto it = depthMemo.find(val); it != depthMemo.end())
+    return it->second;
+
+  unsigned depth = 0;
+  if (!mlir::isa<mlir::BlockArgument>(val)) {
+    if (mlir::Operation *defOp = val.getDefiningOp()) {
+      if (!isComputeLeaf(defOp)) {
+        unsigned operandDepth = 0;
+        for (mlir::Value operand : defOp->getOperands())
+          operandDepth = std::max(
+              operandDepth, computeCostWalk(operand, costModel, depthMemo,
+                                            countedOps, totalCost));
+        unsigned c = costModel.opCost(defOp);
+        depth = operandDepth + c;
+        if (countedOps.insert(defOp).second)
+          totalCost += c;
+      }
+    }
+  }
+
+  depthMemo[val] = depth;
+  return depth;
+}
+
+} // namespace
+
 unsigned estimateComputeCost(mlir::Value val,
                              const drcompiler::CpuCostModel &costModel) {
-  llvm::SmallVector<mlir::Value, 8> worklist;
-  llvm::SmallDenseSet<mlir::Value> visited;
-  unsigned cost = 0;
-  worklist.push_back(val);
+  llvm::DenseMap<mlir::Value, unsigned> depthMemo;
+  llvm::SmallDenseSet<mlir::Operation *> countedOps;
+  unsigned totalCost = 0;
+  unsigned criticalPath =
+      computeCostWalk(val, costModel, depthMemo, countedOps, totalCost);
 
-  while (!worklist.empty()) {
-    mlir::Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    if (mlir::isa<mlir::BlockArgument>(current))
-      continue;
-    mlir::Operation *defOp = current.getDefiningOp();
-    if (!defOp)
-      continue;
-
-    // Loads are inputs — they represent values already in registers or memory.
-    if (mlir::isa<mlir::memref::LoadOp, mlir::affine::AffineLoadOp,
-                  mlir::LLVM::LoadOp>(defOp))
-      continue;
-
-    cost += costModel.opCost(defOp);
-
-    for (mlir::Value operand : defOp->getOperands())
-      worklist.push_back(operand);
-  }
-  return cost;
+  // The realized cost of recomputing an expression on an out-of-order,
+  // superscalar core is bounded below by (a) its dependency critical path —
+  // you cannot finish before the longest dependent chain — and (b) its
+  // throughput, i.e. total work spread across kIssueWidth issue ports. The
+  // previous model returned `totalCost` (sum of all ops), which over-priced
+  // wide/independent expressions and biased every keep-vs-recompute decision
+  // toward buffering. For a purely linear dependent chain criticalPath ==
+  // totalCost, so this is a no-op there and changes only wide expressions.
+  // See COSTMODEL_FINDINGS_CLAUDE.md §2.4 (A1).
+  unsigned throughput = (totalCost + kIssueWidth - 1) / kIssueWidth;
+  return std::max(criticalPath, throughput);
 }
 
 std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
@@ -202,6 +247,67 @@ std::optional<int64_t> estimateTripCount(mlir::Operation *loopOp,
 
 namespace {
 
+/// Upper bound on the number of DISTINCT bytes a loop can touch in total: the
+/// sum of static sizes of the distinct memrefs it (transitively) accesses. Used
+/// to cap the footprint = bodyFP * tripCount product, which otherwise counts a
+/// small array re-read every iteration as bytes * tripCount — a 64 B array read
+/// 1000 times scored as 64000 B, with no temporal-reuse or spatial-locality
+/// modeling. A loop cannot touch more distinct bytes than the arrays it
+/// accesses contain. Returns nullopt when the loop contains a call or a
+/// dynamically shaped / non-int-float access, where no static distinct-bytes
+/// bound is available — callers then fall back to the uncapped product and so
+/// never under-count. See COSTMODEL_FINDINGS_CLAUDE.md §2.4 (A2).
+std::optional<int64_t> distinctMemrefBytes(mlir::Operation *loopOp) {
+  llvm::SmallDenseSet<mlir::Value> seen;
+  int64_t total = 0;
+  bool uncappable = false;
+  loopOp->walk([&](mlir::Operation *op) {
+    // A call may touch arbitrary memory we cannot statically bound.
+    if (mlir::isa<mlir::CallOpInterface>(op)) {
+      uncappable = true;
+      return mlir::WalkResult::interrupt();
+    }
+    if (!drcompiler::isAnyLoadOp(op) && !drcompiler::isAnyStoreOp(op))
+      return mlir::WalkResult::advance();
+    mlir::Value memref = drcompiler::getLoadStoreMemref(op);
+    if (!memref)
+      return mlir::WalkResult::advance();
+    if (!seen.insert(memref).second)
+      return mlir::WalkResult::advance();
+    auto memrefTy = mlir::dyn_cast<mlir::MemRefType>(memref.getType());
+    if (!memrefTy || !memrefTy.hasStaticShape()) {
+      uncappable = true;
+      return mlir::WalkResult::interrupt();
+    }
+    mlir::Type elemTy = memrefTy.getElementType();
+    if (!elemTy.isIntOrFloat()) {
+      uncappable = true;
+      return mlir::WalkResult::interrupt();
+    }
+    int64_t numElems = 1;
+    for (int64_t dim : memrefTy.getShape())
+      numElems *= dim;
+    total += numElems * (int64_t)(elemTy.getIntOrFloatBitWidth() / 8);
+    return mlir::WalkResult::advance();
+  });
+  if (uncappable || total < 0) // total<0 = multiply overflow; do not bound
+    return std::nullopt;
+  return total;
+}
+
+/// bodyFP * trip, capped by the distinct bytes the loop can touch (temporal
+/// reuse). Falls back to the raw product when no static bound is available, so
+/// this can only move an over-estimate toward (never below) the truth.
+int64_t cappedLoopFootprint(mlir::Operation *loopOp, int64_t bodyFP,
+                            int64_t trip) {
+  int64_t looped = bodyFP * trip;
+  if (looped < 0) // multiply overflow — leave uncapped
+    return looped;
+  if (std::optional<int64_t> distinct = distinctMemrefBytes(loopOp))
+    return std::min<int64_t>(looped, *distinct);
+  return looped;
+}
+
 int64_t estimateOpFootprintBytes(mlir::Operation *op,
                                  const CacheParams &cache) {
   if (drcompiler::isAnyLoadOp(op) || drcompiler::isAnyStoreOp(op)) {
@@ -261,10 +367,8 @@ int64_t estimateBlockFootprintBytes(mlir::Block &block,
         int64_t bodyFP =
             estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
         auto tc = estimateTripCount(&op, callGraph);
-        if (tc)
-          total += bodyFP * *tc;
-        else
-          total += bodyFP * kDefaultTripCount;
+        total += cappedLoopFootprint(&op, bodyFP,
+                                     tc ? *tc : kDefaultTripCount);
       }
       continue;
     }
@@ -291,7 +395,7 @@ int64_t estimateBlockFootprintBytes(mlir::Block &block,
         if (!bodyRegion.empty()) {
           int64_t bodyFP =
               estimateBlockFootprintBytes(bodyRegion.front(), cache, callGraph);
-          total += bodyFP * kDefaultTripCount;
+          total += cappedLoopFootprint(&op, bodyFP, kDefaultTripCount);
         }
       }
       continue;
@@ -327,7 +431,8 @@ int64_t sumFootprintBetween(mlir::Operation *from, mlir::Operation *to,
           int64_t bodyFP =
               estimateBlockFootprintBytes(body.front(), cache, callGraph);
           auto tc = estimateTripCount(it, callGraph);
-          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
+          total += cappedLoopFootprint(it, bodyFP,
+                                       tc ? *tc : kDefaultTripCount);
         }
         continue;
       }
@@ -346,7 +451,7 @@ int64_t sumFootprintBetween(mlir::Operation *from, mlir::Operation *to,
         if (it->getNumRegions() > 1 && !it->getRegion(1).empty()) {
           int64_t bodyFP = estimateBlockFootprintBytes(
               it->getRegion(1).front(), cache, callGraph);
-          total += bodyFP * kDefaultTripCount;
+          total += cappedLoopFootprint(it, bodyFP, kDefaultTripCount);
         }
         continue;
       }
@@ -386,7 +491,8 @@ int64_t sumFootprintBefore(mlir::Operation *op,
           int64_t bodyFP =
               estimateBlockFootprintBytes(body.front(), cache, callGraph);
           auto tc = estimateTripCount(&it, callGraph);
-          total += tc ? bodyFP * *tc : bodyFP * kDefaultTripCount;
+          total += cappedLoopFootprint(&it, bodyFP,
+                                       tc ? *tc : kDefaultTripCount);
         }
         continue;
       }

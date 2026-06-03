@@ -160,7 +160,14 @@ bool loopBoundsAreEntryArgsOrConst(mlir::Operation *loop,
     if (!isAcceptable(sf.getLowerBound())) return false;
     if (!isAcceptable(sf.getUpperBound())) return false;
     if (!isAcceptable(sf.getStep())) return false;
-    if (!sf.getInitArgs().empty()) return false; // no iter_args
+    // iter_args (loop-carried values) are admitted only when every init
+    // operand is reproducible at the caller (entry-block arg or constant).
+    // The whole loop — inits and yields included — is then region-cloned
+    // verbatim by materializeLoop, and the capture walk maps these inits the
+    // same way it maps the bounds. (Single-iteration extraction is separately
+    // disabled for iter_args loops; see buildLoopPlan.)
+    for (mlir::Value init : sf.getInitArgs())
+      if (!isAcceptable(init)) return false;
     return true;
   }
   if (auto af = mlir::dyn_cast<mlir::affine::AffineForOp>(loop)) {
@@ -175,7 +182,9 @@ bool loopBoundsAreEntryArgsOrConst(mlir::Operation *loop,
     if (!checkOperands(af.getLowerBoundOperands())) return false;
     if (!checkOperands(af.getUpperBoundOperands())) return false;
     staticBounds = af.hasConstantLowerBound() && af.hasConstantUpperBound();
-    if (!af.getInits().empty()) return false; // no iter_args
+    // See the scf.for case above: admit iter_args whose inits are reproducible.
+    for (mlir::Value init : af.getInits())
+      if (!isAcceptable(init)) return false;
     return true;
   }
   return false;
@@ -498,8 +507,21 @@ bool buildLoopPlan(
     }
     rec.storeIVs.push_back(barg);
   }
-  rec.extractionViable = ivsOk;
-  if (!ivsOk) rec.storeIVs.clear();
+  // Single-iteration extraction (Strategy F.1) is unsound for loops carrying
+  // iter_args: materializeExtraction clones one iteration's body mapping only
+  // the IVs and writer args, so a reference to a loop-carried value would be
+  // left unmapped — and extracting a single step of a reduction is meaningless
+  // anyway. When any loop in the cloned region has iter_args, force full-loop
+  // materialization (F.2), which region-clones the whole loop soundly.
+  bool anyIterArgs = false;
+  outerLoop->walk([&](mlir::Operation *op) {
+    if (auto sf = mlir::dyn_cast<mlir::scf::ForOp>(op))
+      if (!sf.getInitArgs().empty()) anyIterArgs = true;
+    if (auto af = mlir::dyn_cast<mlir::affine::AffineForOp>(op))
+      if (!af.getInits().empty()) anyIterArgs = true;
+  });
+  rec.extractionViable = ivsOk && !anyIterArgs;
+  if (!rec.extractionViable) rec.storeIVs.clear();
 
   plan.loopMat = rec;
   return true;
