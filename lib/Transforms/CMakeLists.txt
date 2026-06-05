@@ -1,6 +1,7 @@
 add_mlir_library(DRCompTransforms
   AffineLoopFusionCostModel/LoopFusion.cpp
   AffineLoopTilingCostModel/LoopTiling.cpp
+  AffineRegisterBlock.cpp
   CpuCostModel.cpp
   DataRecomputation.cpp
   DataRecomputation/BufferElim.cpp
@@ -36,6 +37,7 @@ add_mlir_library(DRCompTransforms
     MLIRRuntimeVerifiableOpInterface
     MLIRSCFDialect
     MLIRAffineDialect
+    MLIRAffineAnalysis
     MLIRArithDialect
     MLIRMathDialect
     MLIRMemRefDialect

@@ -3,6 +3,7 @@
 
 #include "drcompiler/Transforms/AffineLoopFusion.h"
 #include "drcompiler/Transforms/AffineLoopTile.h"
+#include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/MemoryFission.h"
 #include "drcompiler/Transforms/PrintArchHandler.h"

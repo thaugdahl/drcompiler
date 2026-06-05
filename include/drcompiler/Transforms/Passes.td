@@ -368,4 +368,77 @@ def MemoryFissionPass
   let constructor = "mlir::createMemoryFissionPass()";
 }
 
+def AffineRegisterBlockPass
+    : Pass<"affine-register-block", "mlir::func::FuncOp">
+{
+  let summary = "Register-block a perfectly-nested affine reduction (GEMM)";
+
+  let description = [{
+    Brings DPS-style register-blocking to the memref/affine path (cgeist,
+    ONNX-MLIR Krnl->Affine, MARCO).  Given a perfectly-nested affine loop
+    band whose innermost loop carries a memory reduction with a loop-invariant
+    accumulator address (the canonical `C[i,j] += A[i,k]*B[k,j]` GEMM shape),
+    the pass:
+
+      1. unroll-and-jams the two outer (parallel) loops by `mr` x `nr`,
+         producing an `mr*nr` block of independent accumulators in the
+         reduction-loop body (still backed by memory);
+      2. promotes each accumulator to an `affine.for` `iter_args` SSA value
+         carried across the reduction loop -- the initial load is hoisted
+         before the loop and the final store sunk after it.
+
+    The resulting `iter_args` accumulator block is register-allocated and
+    SLP-vectorized by the LLVM backend, closing the ~100x gap between naive
+    affine GEMM and a register-blocked micro-kernel (see
+    `COSTMODEL_SPIKE_FINDINGS.md`: a fixed 8x16 tile is within 5% of the
+    per-arch optimum across register files and vector widths, so the tile is
+    a fixed knob rather than a cost-model decision).
+  }];
+
+  let options = [
+    Option<"mr", "mr", "unsigned", "8",
+           "Register-block rows (unroll-and-jam factor for the outer loop)">,
+    Option<"nr", "nr", "unsigned", "16",
+           "Register-block cols (unroll-and-jam factor for the middle loop)">,
+    Option<"cacheTile", "cache-tile", "bool", "false",
+           "Cache-block the perfectly-nested GEMM band by mc x nc x kc before "
+           "register blocking, to keep the working set resident at large N "
+           "(register blocking alone is DRAM-bound once the matrices exceed "
+           "the last-level cache). Only applies to perfect nests.">,
+    Option<"mc", "mc", "unsigned", "256",
+           "Cache-tile rows (i) when cache-tile is set">,
+    Option<"nc", "nc", "unsigned", "256",
+           "Cache-tile cols (j) when cache-tile is set">,
+    Option<"kc", "kc", "unsigned", "256",
+           "Cache-tile depth (k) when cache-tile is set">,
+    Option<"familySelect", "family-select", "bool", "true",
+           "Auto-select the register-block configuration from operand layout: "
+           "broadcast family (C=A*B, a multiplicand stride-1 in the spatial dim) "
+           "keeps the wide mr x nr tile with no FP reassociation; dot family "
+           "(rank-k, multiplicands stride-1 in the reduction dim) uses a small "
+           "square tile and sets fastmath<fast> so LLVM vectorizes the "
+           "reduction. When false, always use mr x nr with no reassociation.">,
+    Option<"vectorize", "vectorize", "bool", "true",
+           "For the broadcast family, emit an explicit vector-dialect "
+           "micro-kernel (mr rows x vector<vl> accumulators, contiguous "
+           "affine.vector_load of the streamed operand + vector.broadcast of the "
+           "broadcast operand) instead of unroll-jamming the inner spatial loop "
+           "by nr and relying on LLVM SLP. This survives the >2D accumulator "
+           "addressing of tensor contractions (batched matmul) where SLP fails. "
+           "Falls back to the scalar+SLP path when a band is not cleanly "
+           "vectorizable (non-constant bounds, gather access, etc.).">,
+    Option<"vl", "vl", "unsigned", "8",
+           "Vector lane width for the broadcast vector micro-kernel (doubles per "
+           "vector; 8 = one AVX-512 zmm). mr x vl accumulators must fit the "
+           "vector register file.">
+  ];
+
+  let dependentDialects = [
+    "memref::MemRefDialect", "affine::AffineDialect", "arith::ArithDialect",
+    "vector::VectorDialect"
+  ];
+
+  let constructor = "mlir::createAffineRegisterBlockPass()";
+}
+
 #endif
