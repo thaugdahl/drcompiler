@@ -21,6 +21,7 @@
 
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -580,6 +581,106 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   return true;
 }
 
+/// Diagonal-peel a triangular REDUCTION band: a perfect band `for i { for k =
+/// g(i)..N { for j { red }}}` whose reduction loop's lower bound depends on the
+/// outer spatial IV `i` (e.g. trmm's `k = i..N`).  The mr rows of an i-strip
+/// have different k-ranges, so unroll-and-jam can't fuse them.  Split into:
+///   MAIN:   for i'=0..mr { for j { for k = ii+mr-1 .. N  { red(ii+i', j, k) }}}
+///           -- k range uniform across the strip, pushed innermost, so Stage 3
+///              register-blocks it (no interchange needed).
+///   CORNER: for i'=0..mr { for j { for k = (ii+i') .. ii+mr-1 { red }}}
+///           -- ragged per row, left scalar (Stage 3 skips it).
+/// Together they cover k in [ii+i', N) for each row.  Returns true if rewritten.
+static bool peelTriangularReduction(AffineForOp sOut, unsigned mr,
+                                    IRRewriter &rewriter) {
+  if (mr < 2)
+    return false;
+  AffineForOp redMid = onlyChildFor(sOut); // k
+  if (!redMid)
+    return false;
+  AffineForOp inner = onlyChildFor(redMid); // j
+  if (!inner || !isInnermost(inner))
+    return false;
+  AffineStoreOp store;
+  AffineLoadOp load;
+  if (!findAccPair(inner, store, load))
+    return false;
+  // The accumulator must vary in the inner spatial loop and be invariant in the
+  // reduction (so `redMid` is the reduction and `inner` the spatial dim).
+  if (!addrDependsOnIV(store, inner.getInductionVar()) ||
+      addrDependsOnIV(store, redMid.getInductionVar()))
+    return false;
+  Value iv = sOut.getInductionVar();
+  // Triangular reduction: k's lower bound depends on i, upper bound is constant.
+  if (!llvm::is_contained(redMid.getLowerBoundOperands(), iv) ||
+      !redMid.hasConstantUpperBound())
+    return false;
+  if (!sOut.hasConstantLowerBound() || !sOut.hasConstantUpperBound() ||
+      sOut.getStepAsInt() != 1)
+    return false;
+  int64_t lo = sOut.getConstantLowerBound(), hi = sOut.getConstantUpperBound();
+  if ((hi - lo) % (int64_t)mr != 0)
+    return false;
+  if (!inner.hasConstantLowerBound() || !inner.hasConstantUpperBound())
+    return false;
+
+  MLIRContext *ctx = sOut.getContext();
+  Location loc = sOut.getLoc();
+  AffineExpr d0 = getAffineDimExpr(0, ctx), d1 = getAffineDimExpr(1, ctx);
+  AffineMap idMap = AffineMap::get(1, 0, d0);          // (d0)     -> d0
+  AffineMap addMap = AffineMap::get(2, 0, d0 + d1);    // (d0, d1) -> d0 + d1
+  AffineMap offMap =                                   // (d0)     -> d0 + mr-1
+      AffineMap::get(1, 0, d0 + (int64_t)(mr - 1));
+  AffineMap kUbMap = redMid.getUpperBoundMap();
+  SmallVector<Value> kUbOps(redMid.getUpperBoundOperands());
+  int64_t jlo = inner.getConstantLowerBound(), jhi = inner.getConstantUpperBound();
+  int64_t jstep = inner.getStepAsInt(), kstep = redMid.getStepAsInt();
+
+  auto buildHalf = [&](Value ii, bool corner) -> AffineForOp {
+    auto iL = rewriter.create<AffineForOp>(loc, 0, (int64_t)mr, 1); // i'
+    rewriter.setInsertionPointToStart(iL.getBody());
+    Value iLocal = iL.getInductionVar();
+    auto jL = rewriter.create<AffineForOp>(loc, jlo, jhi, jstep);
+    rewriter.setInsertionPointToStart(jL.getBody());
+    AffineForOp kL;
+    Value ni;
+    if (!corner) {
+      // MAIN: k = ii+mr-1 .. N (uniform); row offset computed INSIDE k-body so
+      // i'/j/k stay perfect single-child nests (Stage 3 can unroll-jam them).
+      kL = rewriter.create<AffineForOp>(loc, ValueRange{ii}, offMap,
+                                        ValueRange(kUbOps), kUbMap, kstep);
+      rewriter.setInsertionPointToStart(kL.getBody());
+      ni = rewriter.create<affine::AffineApplyOp>(loc, addMap,
+                                                  ValueRange{iLocal, ii});
+    } else {
+      // CORNER: k = (ii+i') .. ii+mr-1 (ragged); offset precedes k (feeds its
+      // lower bound).  Left scalar.
+      ni = rewriter.create<affine::AffineApplyOp>(loc, addMap,
+                                                  ValueRange{iLocal, ii});
+      kL = rewriter.create<AffineForOp>(loc, ValueRange{ni}, idMap,
+                                        ValueRange{ii}, offMap, kstep);
+      rewriter.setInsertionPointToStart(kL.getBody());
+    }
+    IRMapping m;
+    m.map(iv, ni);
+    m.map(redMid.getInductionVar(), kL.getInductionVar());
+    m.map(inner.getInductionVar(), jL.getInductionVar());
+    for (Operation &op : inner.getBody()->without_terminator())
+      rewriter.clone(op, m);
+    return iL;
+  };
+
+  rewriter.setInsertionPoint(sOut);
+  auto strip = rewriter.create<AffineForOp>(loc, lo, hi, (int64_t)mr);
+  rewriter.setInsertionPointToStart(strip.getBody());
+  Value ii = strip.getInductionVar();
+  AffineForOp mainI = buildHalf(ii, /*corner=*/false);
+  rewriter.setInsertionPointAfter(mainI);
+  buildHalf(ii, /*corner=*/true);
+  rewriter.eraseOp(sOut);
+  return true;
+}
+
 /// Register-block family, selected from operand layout (OPERAND_PACKING_FINDINGS.md).
 enum class RBFamily { Broadcast, Dot };
 
@@ -712,15 +813,26 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   if (VL < 2)
     return failure();
   Value jIV = sIn.getInductionVar();
-  if (sIn.getStepAsInt() != 1 || !sIn.hasConstantLowerBound() ||
-      !sIn.hasConstantUpperBound())
+  if (sIn.getStepAsInt() != 1)
     return failure();
-  if ((sIn.getConstantUpperBound() - sIn.getConstantLowerBound()) %
-          (int64_t)VL !=
-      0)
+  // The inner spatial extent must be a constant multiple of VL.  This holds for
+  // an untiled loop (trip = N) and for a cache-tiled point loop whose extent is
+  // exactly the tile size (`tc .. tc+tile`, symbolic bound but constant trip) --
+  // so the vector micro-kernel composes with cache tiling.  A *partial* last
+  // tile (`tc .. min(tc+tile, N)`) has a non-constant trip -> we bail here and
+  // fall back to scalar+SLP, which is correct (no out-of-bounds vector access).
+  std::optional<uint64_t> trip = affine::getConstantTripCount(sIn);
+  if (!trip || *trip % VL != 0)
     return failure();
   SmallVector<Acc> accs = collectAccumulators(red);
   if (accs.empty())
+    return failure();
+  // Reserve the explicit vector micro-kernel for the case it is *needed*: a >2D
+  // accumulator (batched matmul / tensor contraction), where LLVM SLP fails on
+  // the multi-dim addressing.  For a 2D accumulator (gemm, gram, 2D-output
+  // einsums) the scalar+SLP path with the wider nr tile is as good or better, so
+  // let it handle those (avoids a ~7% regression on cache-tiled 2D gemm).
+  if (cast<MemRefType>(accs[0].memref.getType()).getRank() < 3)
     return failure();
   llvm::SmallPtrSet<Operation *, 8> accLoads;
   for (Acc &a : accs) {
@@ -888,6 +1000,51 @@ public:
             peeled = true;
             break;
           }
+      }
+
+      // Diagonal-peel triangular *reduction* bands (e.g. trmm's `k = i..N`,
+      // reduction lower bound depends on the outer spatial IV).  First distribute
+      // any sibling (e.g. trmm's `C[i][j] = 0` init loop) so the band is perfect,
+      // then split into a register-blockable MAIN + scalar CORNER.
+      bool rpeeled = true;
+      while (rpeeled) {
+        rpeeled = false;
+        SmallVector<AffineForOp> cands;
+        func.walk([&](AffineForOp s) {
+          for (Operation &op : s.getBody()->without_terminator()) {
+            auto k = dyn_cast<AffineForOp>(&op);
+            if (!k)
+              continue;
+            AffineForOp j = onlyChildFor(k);
+            if (!j || !isInnermost(j))
+              continue;
+            AffineStoreOp st;
+            AffineLoadOp ld;
+            if (!findAccPair(j, st, ld))
+              continue;
+            if (addrDependsOnIV(st, k.getInductionVar()) ||
+                !addrDependsOnIV(st, j.getInductionVar()))
+              continue; // k must be the reduction, j the spatial dim
+            if (!llvm::is_contained(k.getLowerBoundOperands(),
+                                    s.getInductionVar()))
+              continue; // reduction lower bound must depend on the outer IV
+            cands.push_back(s);
+            break;
+          }
+        });
+        for (AffineForOp s : cands) {
+          if (!onlyChildFor(s)) { // a sibling (init loop) is present -> fission
+            if (!distributeLoop(s, rewriter).empty()) {
+              rpeeled = true;
+              break;
+            }
+            continue;
+          }
+          if (peelTriangularReduction(s, mrEff, rewriter)) {
+            rpeeled = true;
+            break;
+          }
+        }
       }
 
       // Tile each perfect GEMM band by mc x nc x kc.  Only fully-rectangular
