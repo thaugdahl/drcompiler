@@ -142,11 +142,17 @@ std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
 
 unsigned estimateLoadLatency(int64_t bufferSizeBytes,
                              const CacheParams &cache) {
+  // Private levels (L1/L2) are not shared, so a co-tenant cannot evict them:
+  // judge residency against their full size.
   if (bufferSizeBytes <= (int64_t)cache.l1Size)
     return cache.l1Latency;
   if (bufferSizeBytes <= (int64_t)cache.l2Size)
     return cache.l2Latency;
-  if (cache.l3Size > 0 && bufferSizeBytes <= (int64_t)cache.l3Size)
+  // The shared LLC is contended: a reuse only counts on the fraction we are
+  // guaranteed, l3Size / llcSharers. Beyond that, assume evicted (memLatency).
+  unsigned sharers = cache.llcSharers ? cache.llcSharers : 1;
+  int64_t effectiveL3 = (int64_t)cache.l3Size / sharers;
+  if (cache.l3Size > 0 && bufferSizeBytes <= effectiveL3)
     return cache.l3Latency;
   return cache.memLatency;
 }

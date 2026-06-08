@@ -312,23 +312,77 @@ void MemoryFissionPass::runOnOperation() {
       unsigned numConsumers = cand.loops.size();
       unsigned computeCost = cand.computeCost;
 
-      // Estimate buffer size: we don't know the trip count statically in
-      // general, but the buffer element size × trip count determines cache
-      // behavior.  For the cost model, use per-element analysis:
-      //   recompute_cost = numConsumers × computeCost
-      //   keep_cost      = computeCost + 1 + numConsumers × loadLatency
-      // We assume the buffer fits in L1 (since we don't know trip count).
-      unsigned loadLatency = l1Latency;
+      // Contention-aware, reuse-distance decision (CONTENTION_AWARE_COSTMODEL.md).
+      // Fission materializes the shared computation into a buffer.  It pays off
+      // when EITHER (a) the whole working set is resident in a cache we can count
+      // on regardless of co-tenants -- the private L2 -- so the buffer round-trip
+      // is cheap; OR (b) recompute would re-read the source past the *effective*
+      // (contended) LLC, so fission avoids that thrash by reading the source once.
+      // In the middle (buffer overflows private L2 but the source still fits) the
+      // buffer just adds contended traffic for no source saving -> skip.
+      bool shouldFission;
+      affine::AffineForOp headLoop = cand.loops[0].first;
+      std::optional<int64_t> tripOpt;
+      if (headLoop.hasConstantUpperBound()) {
+        int64_t lb = headLoop.hasConstantLowerBound()
+                         ? headLoop.getConstantLowerBound()
+                         : 0;
+        tripOpt = headLoop.getConstantUpperBound() - lb;
+      }
 
-      unsigned recomputeCost = numConsumers * computeCost;
-      unsigned keepCost = computeCost + 1 + numConsumers * loadLatency;
+      if (tripOpt && cand.elementType.isIntOrFloat()) {
+        int64_t elemBytes =
+            std::max<int64_t>(1, cand.elementType.getIntOrFloatBitWidth() / 8);
+        int64_t bufferBytes = *tripOpt * elemBytes;
+        // Distinct cache-resident arrays (each ~trip elements => bufferBytes):
+        //   perConsumerFP = the source's re-read reuse distance (one consumer's
+        //                   footprint -- what must survive between re-reads),
+        //   totalWS       = new buffer + every distinct array the consumers touch.
+        llvm::SmallDenseSet<Value> allMemrefs;
+        int64_t perConsumerFP = 0;
+        for (auto &entry : cand.loops) {
+          llvm::SmallDenseSet<Value> loopMemrefs;
+          entry.first.getBody()->walk([&](Operation *op) {
+            Value mr;
+            if (auto ld = dyn_cast<affine::AffineLoadOp>(op))
+              mr = ld.getMemRef();
+            else if (auto st = dyn_cast<affine::AffineStoreOp>(op))
+              mr = st.getMemRef();
+            if (mr) {
+              loopMemrefs.insert(mr);
+              allMemrefs.insert(mr);
+            }
+          });
+          perConsumerFP = std::max<int64_t>(
+              perConsumerFP, (int64_t)loopMemrefs.size() * bufferBytes);
+        }
+        int64_t totalWS = bufferBytes + (int64_t)allMemrefs.size() * bufferBytes;
 
-      bool shouldFission = keepCost < recomputeCost;
+        unsigned sharers = llcSharers ? llcSharers : 1;
+        int64_t effL3 = (int64_t)l3Size / sharers;
+        int64_t guaranteedCache = (int64_t)l2Size * (int64_t)l2OccupancyPct / 100;
 
-      DRDBG() << "Candidate: " << numConsumers << " loops, cost="
-              << computeCost << ", fingerprint=" << cand.fingerprint << "\n";
-      DRDBG() << "  recompute=" << recomputeCost << " vs keep=" << keepCost
-              << " → " << (shouldFission ? "FISSION" : "SKIP") << "\n";
+        bool guaranteedWin = totalWS <= guaranteedCache;
+        bool sourceThrashes = l3Size > 0 && perConsumerFP > effL3;
+        shouldFission = guaranteedWin || sourceThrashes;
+
+        DRDBG() << "Candidate: " << numConsumers << " loops, cost=" << computeCost
+                << ", totalWS=" << totalWS << " vs guaranteed=" << guaranteedCache
+                << (guaranteedWin ? " [resident]" : "")
+                << ", srcReuseDist=" << perConsumerFP << " vs effL3=" << effL3
+                << (sourceThrashes ? " [recompute thrashes]" : "") << " -> "
+                << (shouldFission ? "FISSION" : "SKIP") << "\n";
+      } else {
+        // Dynamic trip or non-scalar element: size unknown, fall back to the
+        // legacy resident-buffer estimate (fission if it saves recompute).
+        unsigned recomputeCost = numConsumers * computeCost;
+        unsigned keepCost = computeCost + 1 + numConsumers * l1Latency;
+        shouldFission = keepCost < recomputeCost;
+        DRDBG() << "Candidate: " << numConsumers << " loops, cost=" << computeCost
+                << ", dynamic-trip (legacy) recompute=" << recomputeCost
+                << " vs keep=" << keepCost << " -> "
+                << (shouldFission ? "FISSION" : "SKIP") << "\n";
+      }
 
       if (testDiagnostics) {
         // Emit on the first loop in the group.

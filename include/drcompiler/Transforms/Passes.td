@@ -54,6 +54,11 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "DRAM access latency in cycles">,
     Option<"drCacheLineSize", "dr-cache-line-size", "unsigned", "64",
            "Cache line size in bytes (used for stride-aware partial remat cost)">,
+    Option<"drLlcSharers", "dr-llc-sharers", "unsigned", "1",
+           "Co-tenants of the shared LLC. Effective L3 a kept buffer can count on "
+           "is dr-l3-size/this; a reuse beyond it is priced as a memory access "
+           "(the residency a co-tenant can evict). 1 = isolated; set to the LLC "
+           "core count for a contention-aware estimate.">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
            "Path to a JSON file with per-op cycle costs (see scripts/gen_cpu_cost_model.py)">,
     Option<"drFootprintAnalysis", "dr-footprint-analysis", "bool", "false",
@@ -343,9 +348,22 @@ def MemoryFissionPass
 
   let options = [
     Option<"l1Size", "l1-size", "unsigned", "32768",
-           "L1 data cache size in bytes">,
-    Option<"l2Size", "l2-size", "unsigned", "262144",
-           "L2 cache size in bytes">,
+           "L1 data cache size in bytes (private)">,
+    Option<"l2Size", "l2-size", "unsigned", "1048576",
+           "Private (per-core) L2 cache size in bytes. The contention-robust "
+           "budget: a materialized buffer whose whole working set fits here is "
+           "resident regardless of co-tenants.">,
+    Option<"l3Size", "l3-size", "unsigned", "33554432",
+           "Shared last-level (L3) cache size in bytes (0 = not modeled)">,
+    Option<"llcSharers", "llc-sharers", "unsigned", "1",
+           "Co-tenants of the shared LLC. The effective L3 a fission buffer can "
+           "count on is l3Size/llcSharers; recompute is preferred unless the "
+           "source's re-read reuse distance exceeds it (then fission avoids the "
+           "thrash). 1 = isolated/optimistic; set to the LLC core count for a "
+           "contention-aware (worst-case) estimate.">,
+    Option<"l2OccupancyPct", "l2-occupancy-pct", "unsigned", "50",
+           "Percent of private L2 a fission working set may use and still be "
+           "treated as guaranteed-resident (margin for code/stack/SMT/prefetch).">,
     Option<"l1Latency", "l1-latency", "unsigned", "4",
            "L1 cache hit latency in cycles">,
     Option<"l2Latency", "l2-latency", "unsigned", "12",

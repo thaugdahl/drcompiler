@@ -822,18 +822,20 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   // tile (`tc .. min(tc+tile, N)`) has a non-constant trip -> we bail here and
   // fall back to scalar+SLP, which is correct (no out-of-bounds vector access).
   std::optional<uint64_t> trip = affine::getConstantTripCount(sIn);
-  if (!trip || *trip % VL != 0)
+  if (!trip)
     return failure();
+  // (The vl-remainder is peeled below, AFTER the band is confirmed vectorizable.)
   SmallVector<Acc> accs = collectAccumulators(red);
   if (accs.empty())
     return failure();
-  // Reserve the explicit vector micro-kernel for the case it is *needed*: a >2D
-  // accumulator (batched matmul / tensor contraction), where LLVM SLP fails on
-  // the multi-dim addressing.  For a 2D accumulator (gemm, gram, 2D-output
-  // einsums) the scalar+SLP path with the wider nr tile is as good or better, so
-  // let it handle those (avoids a ~7% regression on cache-tiled 2D gemm).
-  if (cast<MemRefType>(accs[0].memref.getType()).getRank() < 3)
-    return failure();
+  // The explicit vector micro-kernel handles ALL ranks (2D gemm through tensor
+  // contractions).  Vectorization is emitted in the vector dialect rather than
+  // betting on LLVM-SLP firing downstream, so the codegen -- and the cost model
+  // that reasons about it -- is predictable; we no longer have to guess whether
+  // SLP will vectorize a 2D tile (it loses on awkward N / strided / tail cases).
+  // The full mr x ceil(nr/vl) register tile is completed by the caller, which
+  // unroll-jams this vl-stepped loop into nrVec vector columns.  SLP remains only
+  // as a guarded fallback when this returns failure (a non-vectorizable band).
   llvm::SmallPtrSet<Operation *, 8> accLoads;
   for (Acc &a : accs) {
     if (!innermostStrideOne(a.load, jIV)) // store/load must be vectorizable in j
@@ -849,6 +851,26 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   Value oldKIV = red.getInductionVar();
   Location loc = red.getLoc();
 
+  // Peel the vl-remainder so the explicit kernel fires on ANY N: split `sIn` into
+  // a vl-divisible main loop (vectorized below) + a scalar tail clone.  Bailing
+  // instead drops the band to the SLP fallback, which LOSES to clang on
+  // non-vl-divisible N (clang masks the tail; we don't).  The tail is a small
+  // (<VL) scalar copy left memory-backed; LLVM handles it.  Done here -- after the
+  // rank/stride/DAG checks -- so only bands we will actually vectorize are split
+  // (a rank<3 or non-vectorizable band has already returned failure above).
+  if (*trip % VL != 0) {
+    if (!sIn.hasConstantLowerBound() || !sIn.hasConstantUpperBound())
+      return failure();
+    int64_t lb = sIn.getConstantLowerBound();
+    int64_t mainUb = lb + (int64_t)((*trip / VL) * VL);
+    if (mainUb == lb) // trip < VL: nothing to vectorize, leave to SLP
+      return failure();
+    rewriter.setInsertionPointAfter(sIn);
+    rewriter.clone(*sIn); // scalar tail [mainUb, ub), still memory-backed
+    auto tail = cast<AffineForOp>(sIn->getNextNode());
+    tail.setConstantLowerBound(mainUb);
+    sIn.setConstantUpperBound(mainUb);
+  }
   // The inner spatial loop now strides by VL (one VL-lane along j per iteration).
   sIn.setStep(VL);
 
@@ -893,6 +915,115 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   for (auto [i, a] : llvm::enumerate(accs))
     rewriter.create<affine::AffineVectorStoreOp>(
         a.loc, newK.getResult(i), a.memref, a.map, hoistedOps[i]);
+  rewriter.eraseOp(red);
+  return success();
+}
+
+/// Explicit reduction-vectorization for the DOT (rank-k) family: vectorize the
+/// reduction loop `red` (k) itself by VL, carrying one `vector<VL>` partial sum
+/// per accumulator across k-chunks, then horizontal-reduce, add the original C,
+/// and scalar-store.  Multiplicands are stride-1 in k (contiguous vector loads
+/// over k); the accumulator is k-invariant.  This makes the dot kernel
+/// EXPLICITLY vectorized instead of relying on LLVM to reduction-vectorize the
+/// fastmath'd scalar loop -- the cost model then reasons about real vector ops,
+/// not a bet on LLVM.  Reuses `vectorizeReductionValue` with jIV=k (a load
+/// stride-1 in k -> vector load; the k-invariant acc load -> the carried
+/// iter_arg).  Requires trip(red) % VL == 0; otherwise the caller falls back to
+/// scalar + reassoc + LLVM reduction-vec (still correct).
+static LogicalResult vectorizeDotBand(AffineForOp red, unsigned VL,
+                                      IRRewriter &rewriter) {
+  if (VL < 2 || red.getStepAsInt() != 1)
+    return failure();
+  std::optional<uint64_t> trip = affine::getConstantTripCount(red);
+  if (!trip)
+    return failure();
+  SmallVector<Acc> accs = collectAccumulators(red);
+  if (accs.empty())
+    return failure();
+  Value kIV = red.getInductionVar();
+  Block *redBody = red.getBody();
+  llvm::SmallPtrSet<Operation *, 8> accLoads;
+  for (Acc &a : accs)
+    accLoads.insert(a.load);
+  for (Acc &a : accs) {
+    // Reduction shape `acc +/- prod`, with `prod` vectorizable along k.
+    if (!a.storedVal.getDefiningOp<arith::AddFOp>() &&
+        !a.storedVal.getDefiningOp<arith::SubFOp>())
+      return failure();
+    if (!canVectorizeDAG(a.storedVal, accLoads, kIV, redBody))
+      return failure();
+  }
+  // Peel the k-remainder: split the reduction into a vl-divisible vector MAIN
+  // (vectorized below) + a scalar TAIL that accumulates the leftover k into the
+  // SAME C.  Both are partial sums of one reduction, so -- unlike the broadcast
+  // peel (disjoint output columns) -- the tail must run AFTER the main stores and
+  // read the partial result.  The tail is the original scalar body over
+  // [mainUb, K); cloning it before the main rewrite preserves it, and placing it
+  // after `red` means it follows the main + its stores once `red` is erased.
+  // Bail (-> scalar+reassoc+SLP) when k < VL (no vectorizable main).
+  if (*trip % VL != 0) {
+    if (!red.hasConstantLowerBound() || !red.hasConstantUpperBound())
+      return failure();
+    int64_t lb = red.getConstantLowerBound();
+    int64_t mainUb = lb + (int64_t)((*trip / VL) * VL);
+    if (mainUb == lb)
+      return failure();
+    rewriter.setInsertionPointAfter(red);
+    rewriter.clone(*red); // scalar tail (full original body)
+    auto tail = cast<AffineForOp>(red->getNextNode());
+    tail.setConstantLowerBound(mainUb); // tail = [mainUb, K), accumulates into C
+    red.setConstantUpperBound(mainUb);  // main = [lb, mainUb), vectorized below
+  }
+  auto elemTy = cast<MemRefType>(accs[0].memref.getType()).getElementType();
+  auto vecTy = VectorType::get({(int64_t)VL}, elemTy);
+  Location loc = red.getLoc();
+
+  rewriter.setInsertionPoint(red);
+  IRMapping hoistMap;
+  SmallVector<SmallVector<Value>> hoistedOps(accs.size());
+  for (auto [i, a] : llvm::enumerate(accs)) {
+    SmallVector<Value> ops;
+    for (Value o : a.operands)
+      ops.push_back(hoistOperand(o, red, rewriter, hoistMap));
+    hoistedOps[i] = ops;
+  }
+  // Partial sums start at zero (the original C is added back after the
+  // horizontal reduction); save the original C scalars first.
+  Value zeroElem =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elemTy));
+  Value zeroVec = rewriter.create<vector::BroadcastOp>(loc, vecTy, zeroElem);
+  SmallVector<Value> cOrig, initVals;
+  for (auto [i, a] : llvm::enumerate(accs)) {
+    cOrig.push_back(
+        rewriter.create<AffineLoadOp>(a.loc, a.memref, a.map, hoistedOps[i]));
+    initVals.push_back(zeroVec);
+  }
+
+  Block *oldRedBody = red.getBody();
+  auto newK = rewriter.create<AffineForOp>(
+      loc, red.getLowerBoundOperands(), red.getLowerBoundMap(),
+      red.getUpperBoundOperands(), red.getUpperBoundMap(), (int64_t)VL, initVals,
+      [&](OpBuilder &b, Location bloc, Value iv, ValueRange args) {
+        IRMapping remap = hoistMap;
+        remap.map(kIV, iv); // old k -> new (vl-stepped) k; vector load at [.,k]
+        DenseMap<Value, Value> accToIter;
+        for (auto [i, a] : llvm::enumerate(accs))
+          accToIter[a.load.getResult()] = args[i];
+        SmallVector<Value> yields;
+        for (Acc &a : accs)
+          yields.push_back(vectorizeReductionValue(a.storedVal, accToIter, remap,
+                                                   kIV, vecTy, b, oldRedBody));
+        b.create<affine::AffineYieldOp>(bloc, yields);
+      });
+
+  rewriter.setInsertionPointAfter(newK);
+  for (auto [i, a] : llvm::enumerate(accs)) {
+    Value hsum = rewriter.create<vector::ReductionOp>(
+        a.loc, vector::CombiningKind::ADD, newK.getResult(i), /*acc=*/Value(),
+        arith::FastMathFlags::fast);
+    Value cfin = rewriter.create<arith::AddFOp>(a.loc, cOrig[i], hsum);
+    rewriter.create<AffineStoreOp>(a.loc, cfin, a.memref, a.map, hoistedOps[i]);
+  }
   rewriter.eraseOp(red);
   return success();
 }
@@ -1140,35 +1271,66 @@ public:
       AffineForOp sIn = red->getParentOfType<AffineForOp>();
       if (!sIn)
         continue;
-      // Broadcast family: emit an explicit vector micro-kernel along the inner
-      // spatial loop (survives the >2D accumulator addressing of tensor
-      // contractions, where LLVM SLP fails).  Falls back to the scalar+SLP path
-      // below when the band isn't cleanly vectorizable.
+      // Broadcast family: emit an EXPLICIT vector micro-kernel along the inner
+      // spatial loop (vector dialect), for all ranks -- no reliance on LLVM-SLP.
+      // Tile width (vector columns): a >=3D accumulator (tensor contraction) is
+      // best as mr mr-only vectors (measured: a wider tile over-subscribes and
+      // regresses bmm/ttm), so nrVec=1; a 2D accumulator uses the nr-wide tile.
+      SmallVector<Acc> accsForRank = collectAccumulators(red);
+      unsigned accRank =
+          accsForRank.empty()
+              ? 2u
+              : cast<MemRefType>(accsForRank[0].memref.getType()).getRank();
+      unsigned nrVec = accRank >= 3 ? 1u : (nrEff + vl - 1) / vl;
       if (vectorize && !reassoc &&
-          succeeded(vectorizeBroadcastBand(red, sIn, vl, rewriter)))
+          succeeded(vectorizeBroadcastBand(red, sIn, vl, rewriter))) {
+        // Complete the mr x nrVec register tile explicitly: unroll-jam the (now
+        // vl-stepped) inner spatial loop into nrVec vector columns, so the tile
+        // width matches the nr-wide tile WITHOUT betting on SLP to widen it.
+        if (nrVec > 1)
+          (void)affine::loopUnrollJamByFactor(sIn, nrVec);
         continue;
+      }
+      // Guarded fallback: the band was not explicitly vectorizable (non-constant
+      // bounds, gather, unsupported DAG).  Fall back to scalar promotion + LLVM
+      // SLP and record it -- SLP is never the silent default.
+      LLVM_DEBUG(llvm::dbgs() << "affine-register-block: explicit vectorization "
+                                 "declined; SLP fallback for band at "
+                              << sIn.getLoc() << "\n");
       if (nrEff > 1 && failed(affine::loopUnrollJamByFactor(sIn, nrEff)))
         continue;
       red = findReductionLoopUnder(func);
       if (!red)
         continue;
+      // Dot family: EXPLICIT reduction-vectorization over k (vector dialect, no
+      // reliance on LLVM reduction-vec).  Falls back to scalar promotion +
+      // reassoc + LLVM when the k-trip isn't vl-divisible or the band isn't
+      // cleanly vectorizable along k.
+      if (vectorize && reassoc &&
+          succeeded(vectorizeDotBand(red, vl, rewriter)))
+        continue;
       (void)promoteReductions(red, rewriter);
     }
 
-    // Stage 4: for the dot family, the k-reduction can only be vectorized by
-    // LLVM if the FP ops carry reassociation.  MLIR lowering emits flagless FP
-    // ops and `clang -ffast-math` does NOT retroactively flag a .ll, so without
-    // this the reduction stays scalar (the rank-k "loss" was this, not the
-    // algorithm).  Setting fastmath<fast> matches the -ffast-math baseline the
-    // broadcast family is already compared against; we set it ONLY for the dot
-    // family (it would flip gemm to the wrong horizontal-sum strategy).
-    if (reassoc) {
-      auto fast = arith::FastMathFlagsAttr::get(&getContext(),
-                                                arith::FastMathFlags::fast);
+    // Stage 4: set fast-math on the kernel's FP ops.  MLIR lowering emits
+    // flagless FP ops and `clang -ffast-math` does NOT retroactively flag a .ll,
+    // so without this the backend never forms FMAs (it emits separate mulpd +
+    // addpd, ~half FP throughput) -- measured: vfmadd=0 on the broadcast kernel.
+    //   - Broadcast family: `contract` only.  This lets the backend fuse
+    //     mul+add into FMA *without* reassociating, so the accumulation order
+    //     (and the SLP/vector strategy) is unchanged -- pure throughput win.
+    //   - Dot family: `fast` (contract + reassoc).  The k-reduction can only be
+    //     vectorized by LLVM with reassociation (the rank-k "loss" was this);
+    //     reassoc would flip gemm to the wrong horizontal-sum strategy, hence it
+    //     is reserved for the dot family.
+    {
+      auto flags = reassoc ? arith::FastMathFlags::fast
+                           : arith::FastMathFlags::contract;
+      auto fma = arith::FastMathFlagsAttr::get(&getContext(), flags);
       func.walk([&](Operation *op) {
         if (isa<arith::MulFOp, arith::AddFOp, arith::SubFOp, arith::DivFOp,
                 arith::NegFOp>(op))
-          op->setAttr("fastmath", fast);
+          op->setAttr("fastmath", fma);
       });
     }
   }

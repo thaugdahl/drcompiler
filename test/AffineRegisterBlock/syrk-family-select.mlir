@@ -4,10 +4,11 @@
 // multiplicands A[i][k] and A[j][k] are both stride-1 in the reduction k, none
 // stride-1 in the spatial j -- is detected as the DOT family.  The pass then
 // overrides the tile to a small square (mr=nr=4 here -> strip step 4) so the
-// accumulator grid fits the vector register file, and sets fastmath<fast> on the
-// reduction FP ops so the LLVM backend can reassociate and vectorize the
-// k-reduction (without which it stays scalar -- the rank-k "loss" was exactly
-// this).  Contrast: broadcast family keeps the wide tile and no reassociation
+// accumulator grid fits the vector register file, and EXPLICITLY vectorizes the
+// k-reduction in the vector dialect (vector<vl> partial sums + vector.reduction,
+// see syrk-dot-ktail-peel.mlir) rather than betting on LLVM to reduction-vectorize
+// a scalar loop; fastmath<fast> permits the FMA + the horizontal-reduce reassoc.
+// Contrast: broadcast family keeps the wide tile and no reassociation
 // (gemm-no-reassoc.mlir).
 
 module {

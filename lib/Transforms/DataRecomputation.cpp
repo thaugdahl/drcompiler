@@ -1913,6 +1913,7 @@ void DataRecomputationPass::runOnOperation() {
     CacheParams cache{drL1Size,    drL2Size,    drL3Size,
                       drL1Latency, drL2Latency, drL3Latency,
                       drMemLatency, drCacheLineSize};
+    cache.llcSharers = drLlcSharers; // contention derating of the shared LLC
 
     // S3-A: optional cache hierarchy parameters from the cost-model JSON
     // override CLI defaults.  Per-field: only fields the file actually

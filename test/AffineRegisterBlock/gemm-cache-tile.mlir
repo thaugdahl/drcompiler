@@ -2,7 +2,10 @@
 
 // With cache-tile, the GEMM band is first blocked by mc x nc x kc (here 16^3),
 // producing cache-tile loops stepped by the tile size; the register-block
-// micro-kernel then runs on the cache-resident point loops (iter_args).
+// micro-kernel then runs on the cache-resident point loops.  The micro-kernel is
+// EXPLICITLY vectorized in the vector dialect (no reliance on LLVM-SLP) even for
+// this 2D gemm: mr=2 vector<8xf64> accumulators carried over the reduction, with
+// vector.broadcast of the streamed operand and FMA-contractable arith.
 
 module {
   func.func @gemm(%A: memref<64x64xf64>, %B: memref<64x64xf64>, %C: memref<64x64xf64>) {
@@ -27,6 +30,14 @@ module {
 // CHECK:   affine.for %{{.*}} = 0 to 64 step 16
 // CHECK:     affine.for %{{.*}} = 0 to 64 step 16
 
-// The register-block micro-kernel: a reduction loop carrying 2x2 iter_args.
-// CHECK: affine.for %{{.*}} iter_args({{.*}}) -> (f64, f64, f64, f64)
-// CHECK:   affine.yield %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : f64, f64, f64, f64
+// Explicit-vector register-block micro-kernel on the cache-resident point loops:
+// inner spatial loop stepped by vl=8, two vector<8xf64> accumulators carried over
+// the reduction, vector.broadcast + FMA-contractable vector arith, vector store.
+// CHECK:       affine.for %{{.*}} step 8
+// CHECK:         affine.vector_load %{{.*}} : memref<64x64xf64>, vector<8xf64>
+// CHECK:         affine.for %{{.*}} iter_args({{.*}}) -> (vector<8xf64>, vector<8xf64>)
+// CHECK:           vector.broadcast %{{.*}} : f64 to vector<8xf64>
+// CHECK:           arith.mulf %{{.*}}, %{{.*}} fastmath<contract> : vector<8xf64>
+// CHECK:           arith.addf %{{.*}}, %{{.*}} fastmath<contract> : vector<8xf64>
+// CHECK:           affine.yield %{{.*}}, %{{.*}} : vector<8xf64>, vector<8xf64>
+// CHECK:         affine.vector_store %{{.*}}, %{{.*}} : memref<64x64xf64>, vector<8xf64>

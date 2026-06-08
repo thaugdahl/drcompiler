@@ -30,14 +30,20 @@ module {
 }
 
 // First sibling i-loop: the beta scaling, distributed out and left untiled.
+// (FP ops carry fastmath<contract> so the backend can form FMAs.)
 // CHECK: affine.for %{{.*}} = 0 to 32 {
 // CHECK:   affine.for %{{.*}} = 0 to 32 {
-// CHECK:     arith.mulf %{{.*}}, %{{.*}} : f64
+// CHECK:     arith.mulf %{{.*}}, %{{.*}} fastmath<contract> : f64
 // CHECK:     affine.store
 
-// Second sibling i-loop: the matmul, cache-tiled (step 16) and register-blocked.
+// Second sibling i-loop: the matmul, cache-tiled (step 16) and EXPLICITLY
+// vector register-blocked (vector dialect, not LLVM-SLP) on the point loops.
 // CHECK: affine.for %{{.*}} = 0 to 32 step 16
 // CHECK:   affine.for %{{.*}} = 0 to 32 step 16
 // CHECK:     affine.for %{{.*}} = 0 to 32 step 16
-// CHECK: affine.for %{{.*}} iter_args({{.*}}) -> (f64, f64, f64, f64)
-// CHECK:   affine.yield %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : f64, f64, f64, f64
+// CHECK: affine.for %{{.*}} step 8
+// CHECK: affine.vector_load %{{.*}} : memref<32x32xf64>, vector<8xf64>
+// CHECK: affine.for %{{.*}} iter_args({{.*}}) -> (vector<8xf64>, vector<8xf64>)
+// CHECK:   vector.broadcast %{{.*}} : f64 to vector<8xf64>
+// CHECK:   arith.mulf %{{.*}}, %{{.*}} fastmath<contract> : vector<8xf64>
+// CHECK:   affine.yield %{{.*}}, %{{.*}} : vector<8xf64>, vector<8xf64>

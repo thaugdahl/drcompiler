@@ -33,15 +33,23 @@ namespace dr {
 constexpr int64_t kDefaultTripCount = 128;
 
 /// Cache hierarchy parameters for the cost model.
+///
+/// `llcSharers` makes the model contention-aware: the shared last-level cache is
+/// not exclusively ours, so its *effective* capacity is derated by the number of
+/// cores/processes that can evict our lines (private L1/L2 are not derated). A
+/// reuse whose distance fits the physical L3 but not `l3Size / llcSharers` is
+/// priced as a memory access — the residency a co-tenant can take away. Default
+/// 1 reproduces the exclusive-cache (isolated) model.
 struct CacheParams {
-  unsigned l1Size;        // bytes
-  unsigned l2Size;        // bytes
-  unsigned l3Size;        // bytes (0 = unknown / not modeled)
+  unsigned l1Size;        // bytes (private)
+  unsigned l2Size;        // bytes (private on current x86)
+  unsigned l3Size;        // bytes (0 = unknown / not modeled; shared LLC)
   unsigned l1Latency;     // cycles
   unsigned l2Latency;
   unsigned l3Latency;
   unsigned memLatency;
   unsigned cacheLineSize; // bytes
+  unsigned llcSharers = 1; // co-tenants of the shared LLC (effective L3 = l3Size/this)
 };
 
 /// Estimate the ALU cost of recomputing a value by walking its SSA operand
