@@ -463,6 +463,16 @@ def AffineRegisterBlockPass
            "addressing of tensor contractions (batched matmul) where SLP fails. "
            "Falls back to the scalar+SLP path when a band is not cleanly "
            "vectorizable (non-constant bounds, gather access, etc.).">,
+    // PORTABILITY (vl): `vl` is a fixed ELEMENT count, not ISA-derived. 8 is
+    // the MEASURED optimum on AVX-512 for both f64 and f32 (the broadcast
+    // kernel is ILP-bound, not register-width-bound -- filling the register,
+    // e.g. vl=16 for f32, halves the accumulators and is ~13% slower; see
+    // COSTMODEL_PORTABILITY_FINDINGS.md spike #4). For a non-x86 target an
+    // auto/per-arch scaffold (vl = vectorWidthBits/elemBits, opt-in) was
+    // prototyped and reverted as measured-slower-on-AVX-512 + incomplete (true
+    // NEON/SVE portability also needs mr/nr arch-derivation, since mr*nr=128
+    // accumulator values exceed NEON's 512 B register file at any vl). Re-add
+    // it behind a `vector-width-bits` option when tuning on real ARM hardware.
     Option<"vl", "vl", "unsigned", "8",
            "Vector lane width for the broadcast vector micro-kernel (doubles per "
            "vector; 8 = one AVX-512 zmm). mr x vl accumulators must fit the "

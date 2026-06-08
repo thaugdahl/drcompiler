@@ -1,9 +1,10 @@
 # ==========================================================================
 # drcc-lean: Minimal runtime image for the drcc compiler pipeline.
 #
-# Copies only the five executables (cgeist, dr-opt, mlir-opt, mlir-translate,
-# clang) from the full drcc image — no LLVM headers, no cmake, no build
-# toolchain. Significantly smaller than drcc:aarch64.
+# Copies the compiler executables (cgeist, dr-opt, mlir-opt, mlir-translate,
+# clang) plus the cost-model probe toolchain (llvm-mca + probe scripts) from
+# the full drcc image — no LLVM headers, no cmake, no build toolchain.
+# Significantly smaller than drcc:aarch64.
 #
 # Must be built after drcc:${ARCH_TAG} exists. Use build.sh:
 #   docker/build.sh --arch aarch64
@@ -54,6 +55,10 @@ COPY --from=full /usr/local/bin/dr-opt /usr/local/bin/dr-opt
 COPY --from=full /opt/llvm/bin/mlir-opt       /opt/llvm/bin/mlir-opt
 COPY --from=full /opt/llvm/bin/mlir-translate /opt/llvm/bin/mlir-translate
 COPY --from=full /opt/llvm/bin/clang          /opt/llvm/bin/clang
+# llvm-mca — ALU latency probing for the CPU cost model (probe-cost-model.sh).
+# Optional at runtime (the probe falls back to generic ALU costs without it),
+# but copied so the lean image reproduces the full image's probe quality.
+COPY --from=full /opt/llvm/bin/llvm-mca       /opt/llvm/bin/llvm-mca
 # LLVM 22 compiler-builtin headers (stddef.h, stdint.h, etc.) needed when
 # clang compiles C source files directly (e.g. polybench kernels).
 COPY --from=full /opt/llvm/lib/clang          /opt/llvm/lib/clang
@@ -61,5 +66,10 @@ COPY --from=full /opt/llvm/lib/clang          /opt/llvm/lib/clang
 # drcc wrapper script + struct-memref rewriter
 COPY --from=full /usr/local/bin/drcc                      /usr/local/bin/drcc
 COPY --from=full /usr/local/bin/rewrite-struct-memrefs.py /usr/local/bin/rewrite-struct-memrefs.py
+
+# Cost-model probe scripts (gen_cpu_cost_model.py, cache_latency_bench.c,
+# probe-cost-model.sh) — lets the lean image generate hardware-specific cost
+# models via probe-cost-model-docker.sh, same as the full drcc image.
+COPY --from=full /usr/local/share/drcompiler/scripts/ /usr/local/share/drcompiler/scripts/
 
 ENTRYPOINT ["drcc"]
