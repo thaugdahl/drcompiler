@@ -159,19 +159,18 @@ python3 /usr/local/bin/rewrite-struct-memrefs.py '${stage}/main.mlir'
     "$dr_exe" 2>"$dr_out" >/dev/null \
       || { fail "${kname}/${cfg}/run"; continue; }
 
-    # Diff — compare array values with tolerance for fp rounding
+    # Compare array values.  Bit-exact first; otherwise a REAL max-relative-error
+    # gate (fp-rel-compare.py).  The previous awk here was a no-op -- it skipped
+    # numeric lines and set ok=1 on any diff marker, so it ALWAYS passed (a 1e6x
+    # error passed); a NaN/inf or token-count mismatch is now a hard FAIL, never a
+    # silent pass.  Tolerance overridable via VERIFY_REL_TOL (default 1e-6).
     if diff -q "$ref_out" "$dr_out" >/dev/null 2>&1; then
       pass "${kname}/${cfg}"
     else
-      # Bit-exact diff failed — check for fp differences within 1e-6 relative
-      if awk '
-        /^[0-9eE.+\- ]+$/ { next }   # skip non-numeric lines
-        { ok=1 }
-        END { exit ok ? 0 : 1 }
-      ' <(diff "$ref_out" "$dr_out" 2>/dev/null) 2>/dev/null; then
-        pass "${kname}/${cfg} (fp-approx)"
+      if msg="$(python3 "$(dirname "$0")/fp-rel-compare.py" "$ref_out" "$dr_out" "${VERIFY_REL_TOL:-1e-6}" 2>&1)"; then
+        pass "${kname}/${cfg} (fp-approx: ${msg})"
       else
-        fail "${kname}/${cfg}/output-mismatch"
+        fail "${kname}/${cfg}/output-mismatch (${msg})"
         diff "$ref_out" "$dr_out" | head -20 >&2
       fi
     fi

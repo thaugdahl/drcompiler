@@ -1197,21 +1197,52 @@ public:
       });
       for (auto &band : bands) {
         SmallVector<AffineForOp, 3> in(band.begin(), band.end());
-        // Skip a degenerate tiling: if every loop already fits its tile, tiling
-        // emits `step >extent` loops with min/max (#map) point bounds that the
-        // LLVM vectorizer can't analyze -> the register-block micro-kernel goes
-        // scalar (observed: small-N tensors collapse to ~0.1x).  Only tile when
-        // at least one dim genuinely exceeds its tile.
-        bool worthTiling =
-            in[0].getConstantUpperBound() - in[0].getConstantLowerBound() >
-                (int64_t)mc ||
-            in[1].getConstantUpperBound() - in[1].getConstantLowerBound() >
-                (int64_t)nc ||
-            in[2].getConstantUpperBound() - in[2].getConstantLowerBound() >
-                (int64_t)kc;
-        if (!worthTiling)
+        int64_t ie = in[0].getConstantUpperBound() - in[0].getConstantLowerBound();
+        int64_t je = in[1].getConstantUpperBound() - in[1].getConstantLowerBound();
+        int64_t ke = in[2].getConstantUpperBound() - in[2].getConstantLowerBound();
+        // Element bytes from the accumulator memref.
+        int64_t eb = 8;
+        if (SmallVector<Acc> a = collectAccumulators(in[2]); !a.empty()) {
+          Type et = cast<MemRefType>(a[0].memref.getType()).getElementType();
+          if (et.isIntOrFloat())
+            eb = std::max<int64_t>(1, (int64_t)et.getIntOrFloatBitWidth() / 8);
+        }
+        // The cache we can COUNT ON under contention: a co-tenant can evict the
+        // shared L3, so only l3Size/llcSharers is guaranteed (private caches are
+        // not derated).  Tile ONLY when the band's working set (A + B + C) does
+        // not fit it -- otherwise the register-blocked micro-kernel already runs
+        // cache-resident and tiling just adds min/max point-bound overhead that
+        // scalarizes the kernel (observed: small-N collapse to ~0.1x).  Higher
+        // llcSharers => tile sooner and smaller (can't rely on the shared L3).
+        unsigned sharers = llcSharers ? llcSharers : 1u;
+        int64_t effLLC = (int64_t)l3Size / (int64_t)sharers;
+        int64_t ws = (ie * ke + ke * je + ie * je) * eb;
+        if (effLLC <= 0 || ws <= effLLC)
           continue;
-        SmallVector<unsigned, 3> sizes{mc, nc, kc};
+        // Clamp each tile to its extent, then halve the largest until the
+        // per-tile working set (mc*kc + kc*nc + mc*nc)*eb fits the effective
+        // cache.  Halving 256 keeps mr/nr/vl-friendly multiples.
+        int64_t tmc = std::min<int64_t>(mc, ie), tnc = std::min<int64_t>(nc, je),
+                tkc = std::min<int64_t>(kc, ke);
+        auto tileWS = [&]() {
+          return (tmc * tkc + tkc * tnc + tmc * tnc) * eb;
+        };
+        while (tileWS() > effLLC) {
+          if (tmc >= tnc && tmc >= tkc && tmc > (int64_t)mr)
+            tmc = std::max<int64_t>(mr, tmc / 2);
+          else if (tnc >= tkc && tnc > (int64_t)nr)
+            tnc = std::max<int64_t>(nr, tnc / 2);
+          else if (tkc > (int64_t)vl)
+            tkc = std::max<int64_t>(vl, tkc / 2);
+          else
+            break; // can't shrink further; tile anyway (better than DRAM-bound)
+        }
+        // Degenerate: a tile spanning the full extent gives no blocking benefit
+        // and yields scalarizing point bounds -- leave it register-blocked untiled.
+        if (tmc >= ie && tnc >= je && tkc >= ke)
+          continue;
+        SmallVector<unsigned, 3> sizes{(unsigned)tmc, (unsigned)tnc,
+                                       (unsigned)tkc};
         (void)affine::tilePerfectlyNested(in, sizes);
       }
     }

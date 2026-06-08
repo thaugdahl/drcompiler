@@ -11,6 +11,7 @@
 
 #include "drcompiler/Transforms/MemoryFission.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -358,17 +359,39 @@ void MemoryFissionPass::runOnOperation() {
         }
         int64_t totalWS = bufferBytes + (int64_t)allMemrefs.size() * bufferBytes;
 
+        // Unified remat decision on ONE currency, shared with DataRecomputation's
+        // decideBufferStrategy: materialize (fission) wins over recompute iff the
+        // amortized produce-once + N buffer reloads beats recomputing N times,
+        // where the reload latency is the contention-aware tiered estimate
+        // (effective L3 = l3Size/llcSharers; L2 derated by l2OccupancyPct).  This
+        // replaces the old `totalWS <= occ*L2` KNIFE-EDGE with a smooth,
+        // compute-aware min-of-costs (a cheap recompute correctly beats fission
+        // even when L2-resident; the old threshold over-fissioned that case).
+        //   recompute   = N * computeCost
+        //   materialize = computeCost (once) + 1 (store) + N * loadLat(totalWS)
         unsigned sharers = llcSharers ? llcSharers : 1;
         int64_t effL3 = (int64_t)l3Size / sharers;
-        int64_t guaranteedCache = (int64_t)l2Size * (int64_t)l2OccupancyPct / 100;
-
-        bool guaranteedWin = totalWS <= guaranteedCache;
+        dr::CacheParams cp{l1Size, l2Size,   l3Size,      l1Latency,
+                           l2Latency, l3Latency, /*mem*/ 200u, /*line*/ 64u,
+                           sharers, l2OccupancyPct};
+        unsigned bufLat = dr::estimateLoadLatency(totalWS, cp);
+        int64_t recomputeC = (int64_t)numConsumers * computeCost;
+        int64_t materializeC =
+            (int64_t)computeCost + 1 + (int64_t)numConsumers * bufLat;
+        bool materializeWins = materializeC < recomputeC;
+        // The source-reread REVERSAL (WS4.6M): when recompute would re-read the
+        // source past the effective LLC N times, fission (reading it once into a
+        // just-produced, warm buffer) wins even though the per-tier load cost of
+        // buffer vs source looks equal.  A tier-latency cost cannot express that
+        // warm-vs-evicted asymmetry without a per-level BANDWIDTH term (the still-
+        // missing roofline currency), so it stays a separate clause.
         bool sourceThrashes = l3Size > 0 && perConsumerFP > effL3;
-        shouldFission = guaranteedWin || sourceThrashes;
+        shouldFission = materializeWins || sourceThrashes;
 
         DRDBG() << "Candidate: " << numConsumers << " loops, cost=" << computeCost
-                << ", totalWS=" << totalWS << " vs guaranteed=" << guaranteedCache
-                << (guaranteedWin ? " [resident]" : "")
+                << ", totalWS=" << totalWS << " bufLat=" << bufLat
+                << " materialize=" << materializeC << " vs recompute=" << recomputeC
+                << (materializeWins ? " [materialize wins]" : "")
                 << ", srcReuseDist=" << perConsumerFP << " vs effL3=" << effL3
                 << (sourceThrashes ? " [recompute thrashes]" : "") << " -> "
                 << (shouldFission ? "FISSION" : "SKIP") << "\n";

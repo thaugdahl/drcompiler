@@ -1,4 +1,8 @@
-// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(affine-register-block{mr=2 nr=2 cache-tile=true mc=16 nc=16 kc=16}))' | FileCheck %s
+// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(affine-register-block{mr=2 nr=2 cache-tile=true mc=16 nc=16 kc=16 l3-size=16384}))' | FileCheck %s
+
+// l3-size=16384: tiling is gated on the band's working set exceeding the
+// effective cache (l3Size/llcSharers); the small 64x64 band here (~96 KiB) only
+// exceeds a 16 KiB budget, which forces the cache-tiling path on for the test.
 
 // With cache-tile, the GEMM band is first blocked by mc x nc x kc (here 16^3),
 // producing cache-tile loops stepped by the tile size; the register-block

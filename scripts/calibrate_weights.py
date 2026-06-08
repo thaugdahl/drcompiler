@@ -39,6 +39,47 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 
+def nelder_mead(f, x0, max_iter=30, init_step=0.5,
+                ralpha=1.0, rgamma=2.0, rrho=0.5, rsigma=0.5):
+    """Pure-Python downhill-simplex (Nelder-Mead) minimizer, used when scipy is
+    unavailable (e.g. PEP-668 environments where pip is blocked).  Returns
+    (best_x, best_f).  Same role as scipy.optimize.minimize(method='Nelder-Mead').
+    """
+    n = len(x0)
+    pts = [list(map(float, x0))]
+    for i in range(n):
+        p = list(map(float, x0))
+        p[i] += init_step
+        pts.append(p)
+    fv = [f(p) for p in pts]
+    for _ in range(max_iter):
+        idx = sorted(range(len(pts)), key=lambda i: fv[i])
+        pts = [pts[i] for i in idx]
+        fv = [fv[i] for i in idx]
+        best, worst = pts[0], pts[-1]
+        cen = [sum(pts[i][d] for i in range(n)) / n for d in range(n)]
+        refl = [cen[d] + ralpha * (cen[d] - worst[d]) for d in range(n)]
+        fr = f(refl)
+        if fv[0] <= fr < fv[-2]:
+            pts[-1], fv[-1] = refl, fr
+            continue
+        if fr < fv[0]:
+            exp = [cen[d] + rgamma * (refl[d] - cen[d]) for d in range(n)]
+            fe = f(exp)
+            pts[-1], fv[-1] = (exp, fe) if fe < fr else (refl, fr)
+            continue
+        con = [cen[d] + rrho * (worst[d] - cen[d]) for d in range(n)]
+        fc = f(con)
+        if fc < fv[-1]:
+            pts[-1], fv[-1] = con, fc
+            continue
+        for i in range(1, len(pts)):
+            pts[i] = [best[d] + rsigma * (pts[i][d] - best[d]) for d in range(n)]
+            fv[i] = f(pts[i])
+    idx = sorted(range(len(pts)), key=lambda i: fv[i])
+    return pts[idx[0]], fv[idx[0]]
+
+
 @dataclass
 class CalibrationResult:
     weights: Tuple[float, float, float]
@@ -141,8 +182,7 @@ def main() -> int:
     args = p.parse_args()
 
     if not SCIPY_AVAILABLE:
-        sys.stderr.write("scipy not available; pip install scipy\n")
-        return 1
+        sys.stderr.write("scipy not available; using built-in Nelder-Mead\n")
 
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
@@ -175,11 +215,22 @@ def main() -> int:
                 )
         return score
 
-    result = minimize(
-        objective, args.init, method="Nelder-Mead",
-        options={"maxiter": args.max_iter, "xatol": 0.05, "fatol": 1e-4,
-                 "disp": True},
-    )
+    if SCIPY_AVAILABLE:
+        result = minimize(
+            objective, args.init, method="Nelder-Mead",
+            options={"maxiter": args.max_iter, "xatol": 0.05, "fatol": 1e-4,
+                     "disp": True},
+        )
+        best_x, best_fun = result.x, result.fun
+    else:
+        best_x, best_fun = nelder_mead(objective, args.init,
+                                       max_iter=args.max_iter)
+
+    class _R:
+        pass
+
+    result = _R()
+    result.x, result.fun = best_x, best_fun
     best_alpha, best_beta, best_gamma = [max(0.01, v) for v in result.x]
 
     print()

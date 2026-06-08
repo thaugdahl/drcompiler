@@ -50,6 +50,10 @@ struct CacheParams {
   unsigned memLatency;
   unsigned cacheLineSize; // bytes
   unsigned llcSharers = 1; // co-tenants of the shared LLC (effective L3 = l3Size/this)
+  unsigned l2OccupancyPct = 100; // fraction of the private L2 a working set may use
+                                 // and still be treated as L2-resident (margin for
+                                 // co-resident arrays / SMT / prefetch). 100 = no
+                                 // derate (DR default); fission sets it lower.
 };
 
 /// Estimate the ALU cost of recomputing a value by walking its SSA operand
@@ -77,6 +81,23 @@ std::optional<int64_t> traceToConstant(mlir::Value val,
 /// if the trip count cannot be determined.
 std::optional<int64_t> estimateTripCount(mlir::Operation *loopOp,
                                          const EnrichedCallGraph &callGraph);
+
+/// Find the innermost enclosing affine.for / scf.for induction variable of
+/// `op`, or a null Value when `op` is not inside any such loop.
+mlir::Value innermostEnclosingIV(mlir::Operation *op);
+
+/// Element size in bytes of a memref load/store op (8 if non-int/float).
+unsigned accessElementBytes(mlir::Operation *accessOp);
+
+/// Estimate the per-iteration address stride (in ELEMENTS) of a load/store
+/// relative to induction variable `iv`:
+///   - 0 when the access is invariant in iv (same address every iteration),
+///   - a positive integer when statically determinable,
+///   - std::nullopt when it cannot be determined (callers should pessimize as
+///     full-cache-line, i.e. spatially non-local).
+/// Handles both memref.load/store and affine.load/store.
+std::optional<int64_t> estimateAccessStrideElements(mlir::Operation *accessOp,
+                                                     mlir::Value iv);
 
 /// Estimate the total memory footprint of operations between storeOp and
 /// loadOp in program order. This is the "interjected" memory traffic

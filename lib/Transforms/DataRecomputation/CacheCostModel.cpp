@@ -19,6 +19,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
+#include <functional>
 
 namespace dr {
 
@@ -142,11 +143,14 @@ std::optional<int64_t> estimateBufferSizeBytes(mlir::Operation *allocOp) {
 
 unsigned estimateLoadLatency(int64_t bufferSizeBytes,
                              const CacheParams &cache) {
-  // Private levels (L1/L2) are not shared, so a co-tenant cannot evict them:
-  // judge residency against their full size.
+  // Private levels (L1/L2) are not shared, so a co-tenant cannot evict them --
+  // but a working set only stays L2-resident if it leaves room for the other
+  // co-resident arrays (and the SMT sibling / prefetcher); judge L2 residency
+  // against l2OccupancyPct of the size (100 = full, the default for DR).
   if (bufferSizeBytes <= (int64_t)cache.l1Size)
     return cache.l1Latency;
-  if (bufferSizeBytes <= (int64_t)cache.l2Size)
+  unsigned occ = cache.l2OccupancyPct ? cache.l2OccupancyPct : 100;
+  if (bufferSizeBytes <= (int64_t)cache.l2Size * (int64_t)occ / 100)
     return cache.l2Latency;
   // The shared LLC is contended: a reuse only counts on the fraction we are
   // guaranteed, l3Size / llcSharers. Beyond that, assume evicted (memLatency).
@@ -251,6 +255,248 @@ std::optional<int64_t> estimateTripCount(mlir::Operation *loopOp,
   return std::nullopt;
 }
 
+//===----------------------------------------------------------------------===//
+// Stride-aware access primitives.
+//
+// Analyze a load/store's per-iteration address stride relative to an induction
+// variable. Shared by the spatial-locality footprint refinement below
+// (estimateOpFootprintBytes) and by the partial-remat leaf cost in
+// RematKernel.cpp (estimateAccessLatency).
+//===----------------------------------------------------------------------===//
+
+mlir::Value innermostEnclosingIV(mlir::Operation *op) {
+  mlir::Operation *parent = op ? op->getParentOp() : nullptr;
+  while (parent) {
+    if (auto f = mlir::dyn_cast<mlir::affine::AffineForOp>(parent))
+      return f.getInductionVar();
+    if (auto f = mlir::dyn_cast<mlir::scf::ForOp>(parent))
+      return f.getInductionVar();
+    parent = parent->getParentOp();
+  }
+  return {};
+}
+
+unsigned accessElementBytes(mlir::Operation *accessOp) {
+  mlir::Type elemTy;
+  if (auto o = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  else if (auto o = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp))
+    elemTy = o.getMemRefType().getElementType();
+  if (!elemTy || !elemTy.isIntOrFloat())
+    return 8; // conservative
+  unsigned bits = elemTy.getIntOrFloatBitWidth();
+  return bits > 0 ? bits / 8 : 8;
+}
+
+namespace {
+
+/// Return the linear coefficient of dim `pos` in an affine expression.
+/// Returns std::nullopt when the expression is not affine-linear in that
+/// dim (e.g. uses mod/div/floordiv/ceildiv or multiplies the dim by a
+/// non-constant).
+std::optional<int64_t> affineLinearCoef(mlir::AffineExpr expr, unsigned pos) {
+  if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(expr))
+    return (int64_t)0;
+  if (auto d = mlir::dyn_cast<mlir::AffineDimExpr>(expr))
+    return (d.getPosition() == pos) ? (int64_t)1 : (int64_t)0;
+  if (mlir::isa<mlir::AffineSymbolExpr>(expr))
+    return (int64_t)0;
+  auto bin = mlir::dyn_cast<mlir::AffineBinaryOpExpr>(expr);
+  if (!bin)
+    return std::nullopt;
+  auto lhs = affineLinearCoef(bin.getLHS(), pos);
+  auto rhs = affineLinearCoef(bin.getRHS(), pos);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  switch (bin.getKind()) {
+  case mlir::AffineExprKind::Add:
+    return *lhs + *rhs;
+  case mlir::AffineExprKind::Mul: {
+    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getLHS()))
+      return c.getValue() * *rhs;
+    if (auto c = mlir::dyn_cast<mlir::AffineConstantExpr>(bin.getRHS()))
+      return *lhs * c.getValue();
+    return std::nullopt;
+  }
+  default:
+    return std::nullopt; // mod/floordiv/ceildiv
+  }
+}
+
+/// Return true when value `v` transitively depends on `iv`.  Walks defining
+/// ops; stops on block arguments (other than `iv` itself).
+bool dependsOnValue(mlir::Value v, mlir::Value iv) {
+  if (!v || !iv)
+    return false;
+  llvm::SmallVector<mlir::Value, 8> worklist;
+  llvm::SmallDenseSet<mlir::Value> visited;
+  worklist.push_back(v);
+  while (!worklist.empty()) {
+    mlir::Value cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+    if (cur == iv)
+      return true;
+    mlir::Operation *defOp = cur.getDefiningOp();
+    if (!defOp)
+      continue;
+    for (mlir::Value o : defOp->getOperands())
+      worklist.push_back(o);
+  }
+  return false;
+}
+
+} // namespace
+
+std::optional<int64_t>
+estimateAccessStrideElements(mlir::Operation *accessOp, mlir::Value iv) {
+  if (!accessOp || !iv)
+    return std::nullopt;
+
+  mlir::MemRefType memrefTy;
+  mlir::ValueRange rawIndices;
+  mlir::AffineMap map;
+  mlir::ValueRange mapOperands;
+
+  if (auto op = mlir::dyn_cast<mlir::memref::LoadOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    rawIndices = op.getIndices();
+  } else if (auto op = mlir::dyn_cast<mlir::memref::StoreOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    rawIndices = op.getIndices();
+  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineLoadOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    map = op.getAffineMap();
+    mapOperands = op.getMapOperands();
+  } else if (auto op = mlir::dyn_cast<mlir::affine::AffineStoreOp>(accessOp)) {
+    memrefTy = op.getMemRefType();
+    map = op.getAffineMap();
+    mapOperands = op.getMapOperands();
+  } else {
+    return std::nullopt;
+  }
+
+  unsigned rank = memrefTy.getRank();
+  if (rank == 0)
+    return (int64_t)0; // scalar memref: always same address
+
+  llvm::ArrayRef<int64_t> shape = memrefTy.getShape();
+  // Trailing-dim-product for each dim gives the element stride that a
+  // coefficient of 1 in that dim contributes (row-major).
+  llvm::SmallVector<int64_t, 4> trailing(rank, 1);
+  for (int i = (int)rank - 2; i >= 0; --i) {
+    if (shape[i + 1] < 0)
+      return std::nullopt; // dynamic trailing dim
+    trailing[i] = trailing[i + 1] * shape[i + 1];
+  }
+
+  int64_t totalStride = 0;
+
+  if (map) {
+    // affine.load/store: analyze each result expression.
+    int ivPos = -1;
+    for (unsigned i = 0; i < mapOperands.size(); ++i) {
+      if (mapOperands[i] == iv) {
+        ivPos = (int)i;
+        break;
+      }
+    }
+    if (ivPos < 0)
+      return (int64_t)0; // iv not among the map operands
+
+    // In MLIR, affine map operands are laid out as [dims..., symbols...].
+    // AffineDimExpr positions reference the dim portion. If the iv is
+    // passed as a symbol, treat as unknown.
+    unsigned numDims = map.getNumDims();
+    if ((unsigned)ivPos >= numDims)
+      return std::nullopt;
+
+    for (unsigned i = 0; i < rank; ++i) {
+      auto coef = affineLinearCoef(map.getResult(i), (unsigned)ivPos);
+      if (!coef)
+        return std::nullopt;
+      totalStride += *coef * trailing[i];
+    }
+  } else {
+    // memref.load/store: inspect each index.
+    for (unsigned i = 0; i < rank; ++i) {
+      mlir::Value idx = rawIndices[i];
+      if (idx == iv) {
+        totalStride += trailing[i];
+        continue;
+      }
+      if (!dependsOnValue(idx, iv))
+        continue; // invariant in this dim
+      // Simple pattern: idx = iv * c  or  iv * c + k  (linear integer
+      // arithmetic via arith.muli/addi).  Walk and try to extract a
+      // constant coefficient; bail out otherwise.
+      std::function<std::optional<int64_t>(mlir::Value)> coefOf =
+          [&](mlir::Value v) -> std::optional<int64_t> {
+        if (v == iv)
+          return (int64_t)1;
+        if (!dependsOnValue(v, iv))
+          return (int64_t)0;
+        mlir::Operation *d = v.getDefiningOp();
+        if (!d)
+          return std::nullopt;
+        if (mlir::isa<mlir::arith::AddIOp>(d)) {
+          auto lhs = coefOf(d->getOperand(0));
+          auto rhs = coefOf(d->getOperand(1));
+          if (!lhs || !rhs)
+            return std::nullopt;
+          return *lhs + *rhs;
+        }
+        if (mlir::isa<mlir::arith::MulIOp>(d)) {
+          auto getConst = [](mlir::Value x) -> std::optional<int64_t> {
+            auto *dx = x.getDefiningOp();
+            if (!dx)
+              return std::nullopt;
+            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(dx))
+              return (int64_t)c.value();
+            if (auto c = mlir::dyn_cast<mlir::arith::ConstantIntOp>(dx))
+              return (int64_t)c.value();
+            return std::nullopt;
+          };
+          auto c0 = getConst(d->getOperand(0));
+          auto c1 = getConst(d->getOperand(1));
+          if (c0) {
+            auto r = coefOf(d->getOperand(1));
+            if (!r)
+              return std::nullopt;
+            return *c0 * *r;
+          }
+          if (c1) {
+            auto l = coefOf(d->getOperand(0));
+            if (!l)
+              return std::nullopt;
+            return *l * *c1;
+          }
+          return std::nullopt;
+        }
+        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastOp>(d))
+          return coefOf(cast.getOperand());
+        if (auto cast = mlir::dyn_cast<mlir::arith::IndexCastUIOp>(d))
+          return coefOf(cast.getOperand());
+        return std::nullopt;
+      };
+      auto c = coefOf(idx);
+      if (!c)
+        return std::nullopt;
+      totalStride += *c * trailing[i];
+    }
+  }
+
+  // Normalize: negative strides access in reverse but still touch one line
+  // per iteration conservatively; use magnitude.
+  if (totalStride < 0)
+    totalStride = -totalStride;
+  return totalStride;
+}
+
 namespace {
 
 /// Upper bound on the number of DISTINCT bytes a loop can touch in total: the
@@ -318,9 +564,29 @@ int64_t estimateOpFootprintBytes(mlir::Operation *op,
                                  const CacheParams &cache) {
   if (drcompiler::isAnyLoadOp(op) || drcompiler::isAnyStoreOp(op)) {
     mlir::Type elemTy = drcompiler::getLoadStoreElementType(op);
-    if (elemTy && elemTy.isIntOrFloat())
-      return elemTy.getIntOrFloatBitWidth() / 8;
-    return 8;
+    unsigned elemBytes = (elemTy && elemTy.isIntOrFloat())
+                             ? elemTy.getIntOrFloatBitWidth() / 8
+                             : 8;
+    // Spatial-locality refinement. The per-iteration footprint of a scalar
+    // access is NOT one element when it skips cache lines: a strided / gather
+    // access touches (and so can evict) up to a full line every iteration,
+    // while a contiguous (stride-1) stream amortizes one line over
+    // line/elem iterations and so contributes one element per iteration.
+    // When the per-iteration stride relative to the innermost enclosing loop
+    // is statically known we charge min(line, stride*elem); otherwise we fall
+    // back to the per-element estimate. The refinement is monotone-upward
+    // (stride<=1 and unknown-stride are unchanged from the old per-element
+    // value); only provably-strided accesses grow, fixing the prior
+    // under-count that priced a column sweep like a contiguous stream.
+    if (mlir::Value iv = innermostEnclosingIV(op)) {
+      if (std::optional<int64_t> stride = estimateAccessStrideElements(op, iv)) {
+        if (*stride > 1) {
+          int64_t line = cache.cacheLineSize ? cache.cacheLineSize : 64;
+          return std::min<int64_t>(line, *stride * (int64_t)elemBytes);
+        }
+      }
+    }
+    return elemBytes;
   }
 
   for (mlir::Value result : op->getResults()) {

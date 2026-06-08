@@ -1,4 +1,8 @@
-// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(affine-register-block{mr=2 nr=2 cache-tile=true mc=16 nc=16 kc=16}))' | FileCheck %s
+// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(affine-register-block{mr=2 nr=2 cache-tile=true mc=16 nc=16 kc=16 l3-size=16384}))' | FileCheck %s
+
+// l3-size=16384: cache tiling is gated on the band's working set exceeding the
+// effective cache; the small 32x32 band (~24 KiB) exceeds a 16 KiB budget, which
+// forces the cache-tiling path on for the test.
 
 // PolyBench-shaped GEMM (imperfect i-nest: a beta-scaling sibling loop + an
 // i-k-j matmul).  With cache-tile, the pass must first DISTRIBUTE the i-loop so

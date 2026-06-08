@@ -69,6 +69,10 @@ done
 
 DRCC_IMAGE="${DRCC_IMAGE:-drcc}"
 DRCC_TAG="${DRCC_TAG:-latest}"
+# cgeist codegen target.  Default to the host arch so the produced object runs
+# locally (the harness was originally hardcoded to aarch64 for an ARM drcc image;
+# on an x86 host + drcc:x86_64 that cross-targets ARM and every kernel FAILs).
+CGEIST_TARGET="${CGEIST_TARGET:-$(uname -m)-linux-gnu}"
 
 if [[ -n "$COST_MODEL_FILE" ]]; then
   [[ -f "$COST_MODEL_FILE" ]] || die "cost model file not found: $COST_MODEL_FILE"
@@ -296,7 +300,7 @@ MLIR_TRANSLATE=/opt/llvm/bin/mlir-translate
 CLANG=/opt/llvm/bin/clang
 
 \$CGEIST '${src_name}' -S --function='*' --raise-scf-to-affine \\
-  -target aarch64-linux-gnu \\
+  -target ${CGEIST_TARGET} \\
   -include '${stage}/nodce.h' \\
   -I '${stage}' -DPOLYBENCH_TIME ${DATASET_DEFINE} -O2 \\
   -o '${stage}/main.mlir' || exit 1

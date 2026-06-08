@@ -40,10 +40,16 @@ def DataRecomputationPass : Pass<"data-recomputation", "mlir::ModuleOp">
            "Gate recomputation on a cache-aware cost model">,
     Option<"drL1Size", "dr-l1-size", "unsigned", "32768",
            "L1 data cache size in bytes">,
-    Option<"drL2Size", "dr-l2-size", "unsigned", "262144",
-           "L2 cache size in bytes">,
-    Option<"drL3Size", "dr-l3-size", "unsigned", "0",
-           "L3 cache size in bytes (0 = unmodeled, buffers > L2 use mem latency)">,
+    Option<"drL2Size", "dr-l2-size", "unsigned", "1048576",
+           "Private (per-core) L2 cache size in bytes. Matches MemoryFission/"
+           "AffineRegisterBlock so the three passes judge one machine on one "
+           "geometry (was 262144, a stale/shared value 4x too small for Zen4).">,
+    Option<"drL3Size", "dr-l3-size", "unsigned", "33554432",
+           "Shared last-level (L3) cache size in bytes. Was 0, which made the "
+           "`l3Size>0` guard SKIP the LLC tier entirely: every buffer 256KB-32MB "
+           "was priced straight at mem latency and dr-llc-sharers was dead "
+           "(effectiveL3=0/sharers=0). Setting it revives the contention model on "
+           "the DataRecomputation path.">,
     Option<"drL1Latency", "dr-l1-latency", "unsigned", "4",
            "L1 cache hit latency in cycles">,
     Option<"drL2Latency", "dr-l2-latency", "unsigned", "12",
@@ -428,7 +434,19 @@ def AffineRegisterBlockPass
     Option<"nc", "nc", "unsigned", "256",
            "Cache-tile cols (j) when cache-tile is set">,
     Option<"kc", "kc", "unsigned", "256",
-           "Cache-tile depth (k) when cache-tile is set">,
+           "Cache-tile depth (k) when cache-tile is set (upper bound; the tile is "
+           "shrunk to fit the effective cache, see l3-size/llc-sharers)">,
+    Option<"l3Size", "l3-size", "unsigned", "33554432",
+           "Shared last-level (L3) cache size in bytes. Cache tiling fires only "
+           "when the band's working set exceeds the EFFECTIVE cache we can count "
+           "on (l3Size/llcSharers) -- otherwise the register-blocked kernel is "
+           "already cache-resident and tiling only adds point-bound overhead -- "
+           "and tile sizes are clamped so the per-tile working set fits it.">,
+    Option<"llcSharers", "llc-sharers", "unsigned", "1",
+           "Co-tenants of the shared LLC. The cache a fission/tile can count on "
+           "is l3Size/this (a co-tenant can evict the rest); higher => tile "
+           "sooner and smaller. 1 = isolated; set to the LLC core count for a "
+           "contention-aware estimate.">,
     Option<"familySelect", "family-select", "bool", "true",
            "Auto-select the register-block configuration from operand layout: "
            "broadcast family (C=A*B, a multiplicand stride-1 in the spatial dim) "

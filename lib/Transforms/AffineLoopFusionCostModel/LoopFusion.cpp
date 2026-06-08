@@ -73,8 +73,12 @@ struct UnifiedConfig {
       drcompiler::SpillStrategy::ExcessHot;
   // DR-DIVERGE: cache hierarchy params used by `bytesToMemCycles` to
   // convert raw byte counts into cycle estimates comparable to the
-  // ALU/register components of the combiner.
-  dr::CacheParams cache{32768, 262144, 0, 4, 12, 40, 200, 64};
+  // ALU/register components of the combiner. Unified Zen4 geometry,
+  // matching DataRecomputation/MemoryFission/AffineRegisterBlock (one
+  // machine, one geometry) — was {.,262144,0,.} (l2 4x too small, and
+  // l3=0 disabled the L3 tier so every 256 KB–∞ working set was priced
+  // at mem=200 instead of L3=40).
+  dr::CacheParams cache{32768, 1048576, 33554432, 4, 12, 40, 200, 64};
 };
 static const UnifiedConfig *gActive = nullptr;
 
