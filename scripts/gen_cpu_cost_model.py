@@ -108,6 +108,104 @@ PRESETS = {
     "skylake": SKYLAKE,
 }
 
+# ---------- arch + register-file model ----------
+#
+# Mirrors drcompiler's per-ArchHandler tables (lib/Analysis/ArchHandlers/*.cpp)
+# so a probed/preset JSON reproduces the compiler's built-in defaults exactly.
+# CpuCostModel.cpp parses these into m.arch (handler/triplet/vector_width_bits/
+# spill_strategy/weights) and m.registers (gp/fp/vec/pred budgets + spill
+# cycles); without them every arch/register knob falls back to compiler
+# defaults and the cache-architecture flags cannot be exercised from JSON.
+
+# handler name -> (vector_width_bits, gp, fp, vec, pred, reload_cy, store_cy)
+ARCH_HANDLERS = {
+    "generic":       (128, 16, 16, 16, 0, 5, 1),
+    "x86-64-avx2":   (256, 16, 16, 16, 0, 5, 1),
+    "x86-64-avx512": (512, 16, 32, 32, 8, 5, 1),
+    "arm-neon":      (128, 31, 32, 32, 0, 5, 1),
+}
+
+# Unified cost-model blend weights — ArchHandler.h defaults (arch-independent).
+DEFAULT_WEIGHTS = {"alpha_mem": 1.0, "beta_reg": 1.0, "gamma_alu": 1.0}
+# Matches the dr-affine-* pass option default (spill-strategy="excess-hot").
+DEFAULT_SPILL_STRATEGY = "excess-hot"
+
+
+def _host_triplet(cc):
+    """Target triple via `cc -dumpmachine`; fall back to a platform guess."""
+    try:
+        out = subprocess.run([cc, "-dumpmachine"], capture_output=True,
+                             text=True, timeout=10)
+        t = out.stdout.strip()
+        if t:
+            return t
+    except (OSError, subprocess.SubprocessError):
+        pass
+    import platform
+    return f"{platform.machine() or 'unknown'}-unknown-linux-gnu"
+
+
+def _cpu_flags():
+    """x86/ARM feature tokens from /proc/cpuinfo (empty set if unavailable)."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(("flags", "Features")):
+                    return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return set()
+
+
+def detect_handler(cc="cc"):
+    """Pick the finest ArchHandler the host supports → (triplet, handler).
+
+    Finer than the compiler's triple-only inference (ArchHandlerRegistry.cpp's
+    pickHandlerForTriple always returns the x86_64 family default
+    x86-64-avx2) — probing is precisely where avx512-vs-avx2 should be resolved
+    from real CPU flags.
+    """
+    triplet = _host_triplet(cc)
+    arch = triplet.split("-", 1)[0]
+    if arch in ("aarch64", "arm64"):
+        return triplet, "arm-neon"
+    if arch in ("x86_64", "amd64"):
+        flags = _cpu_flags()
+        if "avx512f" in flags:
+            return triplet, "x86-64-avx512"
+        if "avx2" in flags:
+            return triplet, "x86-64-avx2"
+    return triplet, "generic"
+
+
+def arch_registers_for(handler, triplet):
+    """Return (arch_dict, registers_dict) for a handler name."""
+    vw, gp, fp, vec, pred, reload_cy, store_cy = \
+        ARCH_HANDLERS.get(handler, ARCH_HANDLERS["generic"])
+    arch = {
+        "triplet": triplet,
+        "handler": handler,
+        "vector_width_bits": vw,
+        "spill_strategy": DEFAULT_SPILL_STRATEGY,
+        "weights": dict(DEFAULT_WEIGHTS),
+    }
+    registers = {
+        "gp_budget": gp,
+        "fp_budget": fp,
+        "vec_budget": vec,
+        "pred_budget": pred,
+        "spill_reload_cycles": reload_cy,
+        "spill_store_cycles": store_cy,
+    }
+    return arch, registers
+
+
+# Preset name -> (handler, triplet) for the non-probing --target path.
+PRESET_ARCH = {
+    "generic": ("generic", "x86_64-unknown-linux-gnu"),
+    "skylake": ("x86-64-avx2", "x86_64-unknown-linux-gnu"),
+}
+
 # ---------- MLIR op → x86-64 assembly for llvm-mca ----------
 
 MLIR_TO_X86 = {
@@ -469,7 +567,12 @@ def main():
     if args.probe:
         model = _do_probe(args)
     else:
-        model = PRESETS[args.target or "generic"]
+        target = args.target or "generic"
+        model = dict(PRESETS[target])  # shallow copy: don't mutate the preset
+        # Attach the matching arch/register model so preset JSON is
+        # schema-complete (parser expects optional arch + registers blocks).
+        handler, triplet = PRESET_ARCH.get(target, PRESET_ARCH["generic"])
+        model["arch"], model["registers"] = arch_registers_for(handler, triplet)
 
     text = json.dumps(model, indent=2) + "\n"
 
@@ -506,6 +609,10 @@ def _do_probe(args):
     cache = probe_cache_latencies(args.cc)
     if cache:
         model["cache"] = cache
+
+    triplet, handler = detect_handler(args.cc)
+    print(f"Arch handler: {handler}  ({triplet})", file=sys.stderr)
+    model["arch"], model["registers"] = arch_registers_for(handler, triplet)
 
     return model
 
