@@ -39,6 +39,8 @@ namespace mlir {
 #include "drcompiler/Transforms/Passes.h.inc"
 } // namespace mlir
 
+#define DEBUG_TYPE "affine-register-block"
+
 using namespace mlir;
 using affine::AffineForOp;
 using affine::AffineLoadOp;
