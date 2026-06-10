@@ -310,6 +310,14 @@ def DrAffineLoopFusionPass : Pass<"dr-affine-loop-fusion"> {
            "Drive isFusionProfitable from the unified cost model (memory + "
            "register-pressure + ALU).  When false, falls back to upstream's "
            "compute-tolerance heuristic.">,
+    Option<"sinkSequentialLoops", "sink-sequential-loops", "bool",
+           /*default=*/"false",
+           "Upstream pre-pass that permutes every fusion-destination nest "
+           "(sequential loops inward) to deepen legal fusion depths.  It "
+           "mutates nests even when nothing fuses and can destroy spatial "
+           "locality (real gemm at O0: k sunk innermost makes B[k][j] a "
+           "column walk, 0.18x).  Off by default; enable for upstream "
+           "parity experiments.">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
            /*default=*/"",
            "Path to a JSON cost-model file (arch + registers + cache + ops).">,

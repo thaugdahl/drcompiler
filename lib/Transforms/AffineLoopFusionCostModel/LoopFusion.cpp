@@ -65,6 +65,7 @@ using namespace mlir::affine;
 // by our replacement of `isFusionProfitable`'s placeholder decision.
 namespace dr_fusion {
 struct UnifiedConfig {
+  bool sinkSequentialLoops = false;
   bool useUnifiedCostModel = false;
   bool emitRationale = false;
   std::unique_ptr<drcompiler::ArchHandler> archHandler;
@@ -1440,7 +1441,12 @@ public:
     // while preserving relative order. This can increase the maximum loop
     // depth at which we can fuse a slice of a producer loop nest into a
     // consumer loop nest.
-    sinkSequentialLoops(dstNode);
+    // DR-DIVERGE: off by default — it permutes the destination nest even
+    // when no fusion lands.  Measured on real (cgeist -O0) gemm at LARGE:
+    // the matmul band rotated from (k,j) to (j,k), turning B[k][j] into a
+    // per-iteration column walk — 0.18x with zero fusions performed.
+    if (dr_fusion::gActive && dr_fusion::gActive->sinkSequentialLoops)
+      sinkSequentialLoops(dstNode);
     auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
 
     // Try to fuse 'dstNode' with candidate producer loops until a fixed point
@@ -2167,6 +2173,7 @@ void DrAffineLoopFusionPass::runOnOperation() {
   dr_fusion::UnifiedConfig config;
   config.useUnifiedCostModel = useUnifiedCostModel;
   config.emitRationale = emitRationale;
+  config.sinkSequentialLoops = this->sinkSequentialLoops;
 
   drcompiler::CpuCostModel cm =
       cpuCostModelFile.empty()
