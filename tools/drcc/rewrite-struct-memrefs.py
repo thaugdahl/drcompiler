@@ -263,13 +263,22 @@ def rewrite_llvm_memrefs(text):
                 i = close_pos + 1
                 continue
 
-        # Also rewrite memref<?xi8> and memref<Nxi8> (C char* represented as
-        # byte-array memrefs by cgeist for argv and string literals).
-        # Two-pass iteration in rewrite() promotes memref<?xmemref<?xi8>>
-        # first to memref<?x!llvm.ptr> then to !llvm.ptr.
-        if re.match(r'^([0-9]+|\?)\s*x\s*i8$', inner):
+        # Also rewrite NESTED i8 memrefs (C char** — argv — is represented as
+        # memref<?xmemref<?xi8>>): the INNER memref<?xi8> is promoted to
+        # !llvm.ptr here, and the next fixpoint pass turns the resulting
+        # memref<?x!llvm.ptr> into !llvm.ptr via the rule above.
+        #
+        # Deliberately NOT a blanket i8 rewrite: kernels with genuine byte
+        # arrays (e.g. PolyBench nussinov's seq, memref<5500xi8>, which
+        # survives at cgeist -O0) must keep their typed memrefs — rewriting
+        # them produced invalid `memref.alloc() : !llvm.ptr` IR.  Only an
+        # i8 memref that is itself the element type of an enclosing memref
+        # is a C pointer-to-string in disguise.
+        if re.match(r'^([0-9]+|\?)\s*x\s*memref<([0-9]+|\?)\s*x\s*i8>$',
+                    inner):
             out.append(text[i:idx])
-            out.append("!llvm.ptr")
+            out.append("memref<" + inner[:inner.find("memref<")]
+                       + "!llvm.ptr>")
             i = close_pos + 1
             continue
 
