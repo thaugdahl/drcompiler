@@ -157,6 +157,64 @@ inline uint64_t estimateRegCyclesForFusion(AffineForOp srcForOp,
       gActive->archParams, q);
   return res.totalSpillCycles;
 }
+
+/// Per-memref bounding-box footprint of every affine access in `forOp`
+/// (regions unioned per memref at the nest root's depth), or std::nullopt
+/// if any region fails to compute.
+inline std::optional<llvm::DenseMap<mlir::Value, int64_t>>
+perMemrefFootprintBytes(AffineForOp forOp) {
+  llvm::DenseMap<mlir::Value, std::unique_ptr<mlir::affine::MemRefRegion>>
+      regions;
+  unsigned depth = mlir::affine::getNestingDepth(forOp);
+  bool error = false;
+  forOp->walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (!mlir::isa<mlir::affine::AffineReadOpInterface,
+                   mlir::affine::AffineWriteOpInterface>(op))
+      return mlir::WalkResult::advance();
+    auto region = std::make_unique<mlir::affine::MemRefRegion>(op->getLoc());
+    if (failed(region->compute(op, depth))) {
+      error = true;
+      return mlir::WalkResult::interrupt();
+    }
+    auto it = regions.find(region->memref);
+    if (it == regions.end()) {
+      regions[region->memref] = std::move(region);
+    } else if (failed(it->second->unionBoundingBox(*region))) {
+      error = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (error)
+    return std::nullopt;
+  llvm::DenseMap<mlir::Value, int64_t> sizes;
+  for (auto &kv : regions) {
+    std::optional<int64_t> size = kv.second->getRegionSize();
+    if (!size)
+      return std::nullopt;
+    sizes[kv.first] = *size;
+  }
+  return sizes;
+}
+
+/// Bytes of data the two nests both touch: for each memref accessed by both,
+/// the smaller of the two per-nest footprints (a bounding-box overlap upper
+/// bound — good enough for a fraction-of-traffic gate).  std::nullopt when
+/// either side is unanalyzable.
+inline std::optional<int64_t> sharedTrafficBytes(AffineForOp srcForOp,
+                                                 AffineForOp dstForOp) {
+  auto src = perMemrefFootprintBytes(srcForOp);
+  auto dst = perMemrefFootprintBytes(dstForOp);
+  if (!src || !dst)
+    return std::nullopt;
+  int64_t shared = 0;
+  for (auto &kv : *src) {
+    auto it = dst->find(kv.first);
+    if (it != dst->end())
+      shared += std::min(kv.second, it->second);
+  }
+  return shared;
+}
 } // namespace dr_fusion
 
 namespace {
@@ -1069,6 +1127,38 @@ static bool isFusionProfitable(AffineForOp srcForOp,
       srcForOp->emitRemark(buf);
     }
     return false;
+  }
+  // DR-DIVERGE (shared-traffic gate): the only cost fusion genuinely
+  // removes is memory traffic on data BOTH nests touch (a producer's stores
+  // forwarded to consumer loads, or two nests sweeping the same array).
+  // The cycle totals above cannot see what fusion breaks in the backend
+  // (interleaved bodies that no longer vectorize): measured on atax at
+  // EXTRALARGE, a fusion the totals scored 23% better ran 5x slower.  So
+  // require the overlap to be a substantial fraction of the nests' combined
+  // footprint before fusing; with nothing real to save, keep them apart.
+  if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel &&
+      bestDstLoopDepth) {
+    std::optional<int64_t> shared =
+        dr_fusion::sharedTrafficBytes(srcForOp, dstForOp);
+    auto srcFp = getMemoryFootprintBytes(srcForOp);
+    auto dstFp = getMemoryFootprintBytes(dstForOp);
+    if (shared && srcFp && dstFp && *srcFp + *dstFp > 0) {
+      double fraction = static_cast<double>(*shared) /
+                        static_cast<double>(*srcFp + *dstFp);
+      if (fraction < 0.05) {
+        LDBG() << "Unified cost model rejects fusion: shared traffic "
+               << *shared << " bytes is only " << (100.0 * fraction)
+               << "% of combined footprint";
+        if (dr_fusion::gActive->emitRationale) {
+          std::string buf;
+          llvm::raw_string_ostream os(buf);
+          os << "fusion-rationale: REJECT reason=no-shared-traffic shared="
+             << *shared << " combined=" << (*srcFp + *dstFp);
+          srcForOp->emitRemark(buf);
+        }
+        return false;
+      }
+    }
   }
   if (dr_fusion::gActive && dr_fusion::gActive->useUnifiedCostModel &&
       dr_fusion::gActive->emitRationale && bestDstLoopDepth) {
