@@ -1150,12 +1150,10 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   // The inner spatial extent must be a constant multiple of VL.  This holds for
   // an untiled loop (trip = N) and for a cache-tiled point loop whose extent is
   // exactly the tile size (`tc .. tc+tile`, symbolic bound but constant trip) --
-  // so the vector micro-kernel composes with cache tiling.  A *partial* last
-  // tile (`tc .. min(tc+tile, N)`) has a non-constant trip -> we bail here and
-  // fall back to scalar+SLP, which is correct (no out-of-bounds vector access).
+  // so the vector micro-kernel composes with cache tiling.  A non-constant
+  // trip (a symbolic bound, e.g. j = k+1..M) is handled below by an AFFINE
+  // vl-split: main loop up to lb + ((ub-lb) floordiv VL)*VL, scalar tail.
   std::optional<uint64_t> trip = affine::getConstantTripCount(sIn);
-  if (!trip)
-    return failure();
   // The j-body must be PERFECT: re-stepping j by VL turns every remaining
   // scalar statement into a once-per-VL-lanes operation.  Measured on
   // covariance's mean nest `for j { mean[j]=0; for i acc; mean[j]/=n }`:
@@ -1200,7 +1198,7 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   // (<VL) scalar copy left memory-backed; LLVM handles it.  Done here -- after the
   // rank/stride/DAG checks -- so only bands we will actually vectorize are split
   // (a rank<3 or non-vectorizable band has already returned failure above).
-  if (*trip % VL != 0) {
+  if (trip && *trip % VL != 0) {
     if (!sIn.hasConstantLowerBound() || !sIn.hasConstantUpperBound())
       return failure();
     int64_t lb = sIn.getConstantLowerBound();
@@ -1212,6 +1210,31 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
     auto tail = cast<AffineForOp>(sIn->getNextNode());
     tail.setConstantLowerBound(mainUb);
     sIn.setConstantUpperBound(mainUb);
+  } else if (!trip) {
+    // SYMBOLIC trip (gramschmidt's projection sweep j = k+1..M under the
+    // sequential k): same split with affine bounds.  mainUb =
+    // lb + ((ub - lb) floordiv VL) * VL, expressed over the concatenated
+    // lb/ub operands; (mainUb - lb) is a VL multiple by construction, so
+    // the VL-stepped main loop ends exactly at mainUb.  A runtime trip
+    // < VL makes the main loop zero-trip and the tail cover everything.
+    AffineMap lbM = sIn.getLowerBoundMap(), ubM = sIn.getUpperBoundMap();
+    if (lbM.getNumResults() != 1 || ubM.getNumResults() != 1 ||
+        lbM.getNumSymbols() != 0 || ubM.getNumSymbols() != 0)
+      return failure();
+    unsigned nlb = lbM.getNumDims(), nub = ubM.getNumDims();
+    SmallVector<Value> ops(sIn.getLowerBoundOperands());
+    ops.append(sIn.getUpperBoundOperands().begin(),
+               sIn.getUpperBoundOperands().end());
+    AffineExpr lbE = lbM.getResult(0);
+    AffineExpr ubE = ubM.getResult(0).shiftDims(nub, nlb);
+    AffineExpr mainUbE =
+        lbE + (ubE - lbE).floorDiv((int64_t)VL) * (int64_t)VL;
+    AffineMap mainUbMap = AffineMap::get(nlb + nub, 0, mainUbE);
+    rewriter.setInsertionPointAfter(sIn);
+    rewriter.clone(*sIn);
+    auto tail = cast<AffineForOp>(sIn->getNextNode());
+    tail.setLowerBound(ops, mainUbMap);
+    sIn.setUpperBound(ops, mainUbMap);
   }
   // The inner spatial loop now strides by VL (one VL-lane along j per iteration).
   sIn.setStep(VL);
@@ -1729,6 +1752,38 @@ public:
           succeeded(vectorizeDotBand(red, vl, rewriter)))
         continue;
       (void)promoteReductions(red, rewriter);
+    }
+
+    // Stage 3b: explicit broadcast vectorization for reductions Stage 3
+    // cannot reach through a parallel (sOut, sIn) PAIR -- e.g. a projection
+    // sweep under a SEQUENTIAL outer loop (gramschmidt's
+    // R[k][j] += Q[i][k]*A[i][j] under k; measured 0.94x vs base because
+    // distribute splits the sweep and nothing downstream captured it).
+    // vectorizeBroadcastBand only re-steps sIn by vl (lanes must be
+    // independent => sIn parallel is required) and rebuilds the reduction
+    // loop; the sequential ancestor is untouched, so no unroll-jam legality
+    // is involved.  Already-promoted/vectorized nests have no scalar
+    // load/store accumulator pair left and are skipped naturally.
+    if (vectorize && !reassoc) {
+      SmallVector<AffineForOp> reds;
+      func.walk([&](AffineForOp r) {
+        if (isInnermost(r) && !collectAccumulators(r).empty())
+          reds.push_back(r);
+      });
+      for (AffineForOp red : reds) {
+        AffineForOp sIn = red->getParentOfType<AffineForOp>();
+        if (!sIn || onlyChildFor(sIn) != red)
+          continue;
+        AffineStoreOp store;
+        AffineLoadOp load;
+        if (!findAccPair(red, store, load))
+          continue;
+        if (!addrDependsOnIV(store, sIn.getInductionVar()))
+          continue;
+        if (!affine::isLoopParallel(sIn))
+          continue;
+        (void)vectorizeBroadcastBand(red, sIn, vl, rewriter);
+      }
     }
 
     // Stage 4: set fast-math on the kernel's FP ops.  MLIR lowering emits

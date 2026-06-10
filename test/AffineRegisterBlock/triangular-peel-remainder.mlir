@@ -14,9 +14,13 @@
 // CHECK: affine.for %[[II:.*]] = 0 to 64 step 8 {
 // CHECK:   affine.for %{{.*}} = #map{{[0-9]*}}(%[[II]]) to #map{{[0-9]*}}(%[[II]]) {
 // CHECK:   affine.for %{{.*}} = #map{{[0-9]*}}(%[[II]]) to 80
+// The epilogue keeps the original triangular nest over [64, 67); its
+// j-sweep has symbolic-trip bounds (j = i..80), which the affine vl-split
+// now vectorizes: a step-8 vector main + scalar tail per row.
 // CHECK: affine.for %[[IE:.*]] = 64 to 67 {
-// CHECK-NEXT:   affine.for %{{.*}} = #map{{[0-9]*}}(%[[IE]]) to 80 {
-// CHECK-NEXT:     affine.for %{{.*}} = 0 to 128 {
+// CHECK:   affine.for %{{.*}} = #map{{[0-9]*}}(%[[IE]]) to #map{{[0-9]*}}(%[[IE]]) step 8 {
+// CHECK:   affine.for %{{.*}} = #map{{[0-9]*}}(%[[IE]]) to 80 {
+// CHECK:     affine.for %{{.*}} = 0 to 128 {
 #map_lb = affine_map<(d0) -> (d0)>
 func.func @corr_like(%data: memref<128x80xf64>, %corr: memref<80x80xf64>) {
   affine.for %i = 0 to 67 {
