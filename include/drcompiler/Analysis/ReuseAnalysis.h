@@ -71,8 +71,12 @@ struct RefInfo {
 
 struct BandReuseInfo {
   llvm::SmallVector<mlir::affine::AffineForOp, 6> band;
-  /// Constant trip count per band loop.
+  /// Trip count per band loop (exact, or an upper bound when the matching
+  /// tripIsExact entry is false — see acceptTripUpperBounds).
   llvm::SmallVector<uint64_t, 6> tripCounts;
+  /// False for loops whose trip count is an upper-bound estimate
+  /// (triangular bounds: constant-ub minus the constant/zero lb floor).
+  llvm::SmallVector<bool, 6> tripIsExact;
   llvm::SmallVector<RefInfo, 8> refs;
 
   /// Bytes touched by one tile with the given per-loop iteration counts
@@ -110,9 +114,17 @@ struct BandReuseInfo {
 /// distribution asking "would this child nest, once isolated under these
 /// loops, carry exploitable reuse?", pass the child as walkRoot so sibling
 /// units still present in the IR don't poison the analysis.
+/// `acceptTripUpperBounds`: instead of failing on a loop without a constant
+/// trip count, accept a constant upper bound (constant ub minus the
+/// constant lb if present, else 0 — assumes non-negative IVs, which holds
+/// for the normalized loops this analysis targets).  Footprints and reuse
+/// distances become upper bounds, which errs toward "evicted", i.e. toward
+/// transforming — appropriate for the tiler on triangular bands
+/// (covariance/syrk j = i..M), not for exactness-sensitive clients.
 mlir::FailureOr<BandReuseInfo>
 analyzeBandReuse(llvm::ArrayRef<mlir::affine::AffineForOp> band,
-                 mlir::Operation *walkRoot = nullptr);
+                 mlir::Operation *walkRoot = nullptr,
+                 bool acceptTripUpperBounds = false);
 
 } // namespace reuse
 } // namespace drcompiler

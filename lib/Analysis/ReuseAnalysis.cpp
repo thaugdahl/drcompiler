@@ -146,19 +146,32 @@ bool BandReuseInfo::anyTemporalReuse() const {
 
 FailureOr<BandReuseInfo>
 drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band,
-                                    Operation *walkRoot) {
+                                    Operation *walkRoot,
+                                    bool acceptTripUpperBounds) {
   if (band.empty())
     return failure();
 
   BandReuseInfo info;
   info.band.assign(band.begin(), band.end());
 
-  // Constant trip counts only.
   for (AffineForOp forOp : band) {
     std::optional<uint64_t> tc = getConstantTripCount(forOp);
-    if (!tc || *tc == 0)
-      return failure();
-    info.tripCounts.push_back(*tc);
+    if (tc && *tc > 0) {
+      info.tripCounts.push_back(*tc);
+      info.tripIsExact.push_back(true);
+      continue;
+    }
+    if (acceptTripUpperBounds && forOp.hasConstantUpperBound()) {
+      int64_t ub = forOp.getConstantUpperBound();
+      int64_t lbFloor =
+          forOp.hasConstantLowerBound() ? forOp.getConstantLowerBound() : 0;
+      if (ub > lbFloor) {
+        info.tripCounts.push_back(static_cast<uint64_t>(ub - lbFloor));
+        info.tripIsExact.push_back(false);
+        continue;
+      }
+    }
+    return failure();
   }
 
   llvm::SmallDenseMap<Value, unsigned, 8> ivIndex;

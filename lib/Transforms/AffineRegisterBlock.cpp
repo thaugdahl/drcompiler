@@ -513,11 +513,22 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   if (mr == 0 || (hi - lo) % (int64_t)mr != 0)
     return false;
   Value iv = sOut.getInductionVar();
-  // Triangular iff the inner spatial upper bound depends on i but its lower
-  // bound does not (the common `0..i+c` rank-k shape).
-  if (!llvm::is_contained(sIn.getUpperBoundOperands(), iv))
+  // Two triangular orientations:
+  //  - upper-triangular-in-bound (syrk): `j = LB .. f(i)` — ub depends on i;
+  //  - lower-bound-from-IV (covariance/correlation): `j = g(i) .. UB` — lb
+  //    depends on i, ub constant.  Mirrored split: the DIAG covers the
+  //    ragged `g(ni) .. ii+mr` corner, the HEAD `ii+mr .. UB` is invariant
+  //    in i' and register-blocks.
+  bool ubTriangular = llvm::is_contained(sIn.getUpperBoundOperands(), iv) &&
+                      !llvm::is_contained(sIn.getLowerBoundOperands(), iv);
+  bool lbTriangular = llvm::is_contained(sIn.getLowerBoundOperands(), iv) &&
+                      !llvm::is_contained(sIn.getUpperBoundOperands(), iv) &&
+                      sIn.hasConstantUpperBound();
+  if (!ubTriangular && !lbTriangular)
     return false;
-  if (llvm::is_contained(sIn.getLowerBoundOperands(), iv))
+  // The HEAD lower bound ii+mr must stay within the j range: require the
+  // strip cover (hi) not to exceed j's constant upper bound.
+  if (lbTriangular && hi > sIn.getConstantUpperBound())
     return false;
 
   MLIRContext *ctx = sOut.getContext();
@@ -539,7 +550,37 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   // cannot thread a non-loop op sitting between the jammed loops); its j runs
   // `LB..ii` (invariant in i').  For the DIAG the offset must precede the j-loop
   // (it feeds the ragged `ii..f(ni)` bound), but the DIAG is left scalar.
+  AffineMap addMrMap =
+      AffineMap::get(1, 0, d0 + (int64_t)mr); // (d0) -> d0 + mr
+
   auto buildHalf = [&](Value ii, bool diag) -> AffineForOp {
+    if (diag && lbTriangular) {
+      // lb-triangular DIAG: emit in ORIGINAL coordinates — a real
+      // `for i2 = ii .. ii+mr { for j = g(i2) .. ii+mr }` whose ragged
+      // bound hangs directly off i2's IV.  The normalized 0..mr + apply
+      // form used below reads as jam-able to Stage 3 (the bound dependence
+      // hides behind the affine.apply), and unroll-jamming it collapses
+      // the DIAG's j range to empty — measured on covariance as a lost
+      // diagonal (checksum p+40 -> p+64).  This shape is exactly the
+      // original triangular nest Stage 3 provably skips.
+      auto i2 = rewriter.create<AffineForOp>(loc, ValueRange{ii}, idMap,
+                                             ValueRange{ii}, addMrMap, 1);
+      rewriter.setInsertionPointToStart(i2.getBody());
+      Value ni2 = i2.getInductionVar();
+      SmallVector<Value> jLbOps(sInLbOps);
+      for (Value &v : jLbOps)
+        if (v == iv)
+          v = ni2;
+      auto jL = rewriter.create<AffineForOp>(loc, ValueRange(jLbOps),
+                                             sInLbMap, ValueRange{ii},
+                                             addMrMap, 1);
+      rewriter.setInsertionPointToStart(jL.getBody());
+      IRMapping m;
+      m.map(iv, ni2);
+      m.map(sIn.getInductionVar(), jL.getInductionVar());
+      rewriter.clone(*red.getOperation(), m);
+      return i2;
+    }
     auto iL = rewriter.create<AffineForOp>(loc, 0, (int64_t)mr, 1);
     rewriter.setInsertionPointToStart(iL.getBody());
     Value iLocal = iL.getInductionVar();
@@ -550,19 +591,35 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
     AffineForOp jL;
     Value ni;
     if (!diag) {
-      jL = rewriter.create<AffineForOp>(loc, ValueRange(sInLbOps), sInLbMap,
-                                        ValueRange{ii}, idMap, 1); // 0 .. ii
+      if (ubTriangular) {
+        jL = rewriter.create<AffineForOp>(loc, ValueRange(sInLbOps), sInLbMap,
+                                          ValueRange{ii}, idMap, 1); // 0 .. ii
+      } else {
+        // lb-triangular HEAD: j = ii+mr .. UB, invariant in i'.
+        jL = rewriter.create<AffineForOp>(loc, ValueRange{ii}, addMrMap,
+                                          ValueRange(sInUbOps), sInUbMap, 1);
+      }
       rewriter.setInsertionPointToStart(jL.getBody());
       ni = emitApply(); // row offset computed inside the (perfect) j-loop
     } else {
       ni = emitApply(); // offset precedes j (feeds the ragged bound)
-      SmallVector<Value> jUbOps(sInUbOps);
-      for (Value &v : jUbOps)
-        if (v == iv)
-          v = ni;
-      jL = rewriter.create<AffineForOp>(loc, ValueRange{ii}, idMap,
-                                        ValueRange(jUbOps), sInUbMap,
-                                        1); // ii .. f(ni)
+      if (ubTriangular) {
+        SmallVector<Value> jUbOps(sInUbOps);
+        for (Value &v : jUbOps)
+          if (v == iv)
+            v = ni;
+        jL = rewriter.create<AffineForOp>(loc, ValueRange{ii}, idMap,
+                                          ValueRange(jUbOps), sInUbMap,
+                                          1); // ii .. f(ni)
+      } else {
+        // lb-triangular DIAG: j = g(ni) .. ii+mr, ragged mr-wide corner.
+        SmallVector<Value> jLbOps(sInLbOps);
+        for (Value &v : jLbOps)
+          if (v == iv)
+            v = ni;
+        jL = rewriter.create<AffineForOp>(loc, ValueRange(jLbOps), sInLbMap,
+                                          ValueRange{ii}, addMrMap, 1);
+      }
       rewriter.setInsertionPointToStart(jL.getBody());
     }
     IRMapping m;
@@ -576,9 +633,12 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   auto strip = rewriter.create<AffineForOp>(loc, lo, hi, (int64_t)mr);
   rewriter.setInsertionPointToStart(strip.getBody());
   Value ii = strip.getInductionVar();
-  AffineForOp headI = buildHalf(ii, /*diag=*/false);
-  rewriter.setInsertionPointAfter(headI);
-  buildHalf(ii, /*diag=*/true);
+  // Per-row j order stays ascending: ub-triangular runs HEAD (LB..ii) before
+  // DIAG (ii..f(ni)); lb-triangular runs DIAG (g(ni)..ii+mr) before HEAD
+  // (ii+mr..UB).  Reductions are insensitive either way; keep it tidy.
+  AffineForOp first = buildHalf(ii, /*diag=*/!ubTriangular);
+  rewriter.setInsertionPointAfter(first);
+  buildHalf(ii, /*diag=*/ubTriangular);
   rewriter.eraseOp(sOut);
   return true;
 }
@@ -826,6 +886,16 @@ static LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   std::optional<uint64_t> trip = affine::getConstantTripCount(sIn);
   if (!trip)
     return failure();
+  // The j-body must be PERFECT: re-stepping j by VL turns every remaining
+  // scalar statement into a once-per-VL-lanes operation.  Measured on
+  // covariance's mean nest `for j { mean[j]=0; for i acc; mean[j]/=n }`:
+  // only every 16th element was initialized and divided — a silent
+  // miscompile, not a missed optimization.  Anything besides the reduction
+  // loop and the terminator (modulo pure ops feeding only the bound/body)
+  // bails to the scalar path.
+  for (Operation &op : sIn.getBody()->without_terminator())
+    if (&op != red.getOperation() && !isMemoryEffectFree(&op))
+      return failure();
   // (The vl-remainder is peeled below, AFTER the band is confirmed vectorizable.)
   SmallVector<Acc> accs = collectAccumulators(red);
   if (accs.empty())
@@ -944,6 +1014,21 @@ static LogicalResult vectorizeDotBand(AffineForOp red, unsigned VL,
     return failure();
   Value kIV = red.getInductionVar();
   Block *redBody = red.getBody();
+  // The vectorized loop is rebuilt from the accumulators' def-use DAGs
+  // alone; any other effectful op in the reduction body (a store to a
+  // different array, a call) would be silently DROPPED.  Bail instead.
+  {
+    llvm::SmallPtrSet<Operation *, 8> accStores;
+    for (Acc &a : accs)
+      accStores.insert(a.store);
+    for (Operation &op : redBody->without_terminator()) {
+      if (isMemoryEffectFree(&op) || isa<AffineLoadOp>(op))
+        continue;
+      if (isa<AffineStoreOp>(op) && accStores.contains(&op))
+        continue;
+      return failure();
+    }
+  }
   llvm::SmallPtrSet<Operation *, 8> accLoads;
   for (Acc &a : accs)
     accLoads.insert(a.load);
@@ -1079,6 +1164,78 @@ public:
       }
     }
 
+    // Stage 1c (run unconditionally; historically nested under cache-tile,
+    // which default-off meant triangular peeling NEVER ran in the default
+    // configs): diagonal-peel triangular bands so their rectangular bulk
+    // becomes register-blockable.  Handles both orientations: ub-from-IV
+    // (syrk `j: 0..i+1`) and lb-from-IV (covariance/correlation `j: i..M`).
+    // Diagonal-peel triangular reduction bands (e.g. syrk/syr2k `j:0..i+1`)
+    // so their rectangular bulk becomes register-blockable.
+    bool peeled = true;
+    while (peeled) {
+      peeled = false;
+      SmallVector<AffineForOp> cands;
+      func.walk([&](AffineForOp s) {
+        AffineForOp sIn = onlyChildFor(s);
+        if (!sIn)
+          return;
+        AffineForOp r = onlyChildFor(sIn);
+        if (r && isInnermost(r))
+          cands.push_back(s);
+      });
+      for (AffineForOp s : cands)
+        if (peelTriangularNest(s, mrEff, rewriter)) {
+          peeled = true;
+          break;
+        }
+    }
+
+    // Diagonal-peel triangular *reduction* bands (e.g. trmm's `k = i..N`,
+    // reduction lower bound depends on the outer spatial IV).  First distribute
+    // any sibling (e.g. trmm's `C[i][j] = 0` init loop) so the band is perfect,
+    // then split into a register-blockable MAIN + scalar CORNER.
+    bool rpeeled = true;
+    while (rpeeled) {
+      rpeeled = false;
+      SmallVector<AffineForOp> cands;
+      func.walk([&](AffineForOp s) {
+        for (Operation &op : s.getBody()->without_terminator()) {
+          auto k = dyn_cast<AffineForOp>(&op);
+          if (!k)
+            continue;
+          AffineForOp j = onlyChildFor(k);
+          if (!j || !isInnermost(j))
+            continue;
+          AffineStoreOp st;
+          AffineLoadOp ld;
+          if (!findAccPair(j, st, ld))
+            continue;
+          if (addrDependsOnIV(st, k.getInductionVar()) ||
+              !addrDependsOnIV(st, j.getInductionVar()))
+            continue; // k must be the reduction, j the spatial dim
+          if (!llvm::is_contained(k.getLowerBoundOperands(),
+                                  s.getInductionVar()))
+            continue; // reduction lower bound must depend on the outer IV
+          cands.push_back(s);
+          break;
+        }
+      });
+      for (AffineForOp s : cands) {
+        if (!onlyChildFor(s)) { // a sibling (init loop) is present -> fission
+          if (!distributeLoop(s, rewriter).empty()) {
+            rpeeled = true;
+            break;
+          }
+          continue;
+        }
+        if (peelTriangularReduction(s, mrEff, rewriter)) {
+          rpeeled = true;
+          break;
+        }
+      }
+    }
+
+
     // Stage 1b: optional cache blocking.  Register blocking alone is DRAM-bound
     // once the matrices exceed the last-level cache (the full B is re-streamed
     // per i-block).  Tile each perfectly-nested GEMM band by mc x nc x kc so
@@ -1109,72 +1266,6 @@ public:
             continue;
           if (!distributeLoop(sOut, rewriter).empty()) {
             changed = true;
-            break;
-          }
-        }
-      }
-
-      // Diagonal-peel triangular reduction bands (e.g. syrk/syr2k `j:0..i+1`)
-      // so their rectangular bulk becomes register-blockable.
-      bool peeled = true;
-      while (peeled) {
-        peeled = false;
-        SmallVector<AffineForOp> cands;
-        func.walk([&](AffineForOp s) {
-          AffineForOp sIn = onlyChildFor(s);
-          if (!sIn)
-            return;
-          AffineForOp r = onlyChildFor(sIn);
-          if (r && isInnermost(r))
-            cands.push_back(s);
-        });
-        for (AffineForOp s : cands)
-          if (peelTriangularNest(s, mrEff, rewriter)) {
-            peeled = true;
-            break;
-          }
-      }
-
-      // Diagonal-peel triangular *reduction* bands (e.g. trmm's `k = i..N`,
-      // reduction lower bound depends on the outer spatial IV).  First distribute
-      // any sibling (e.g. trmm's `C[i][j] = 0` init loop) so the band is perfect,
-      // then split into a register-blockable MAIN + scalar CORNER.
-      bool rpeeled = true;
-      while (rpeeled) {
-        rpeeled = false;
-        SmallVector<AffineForOp> cands;
-        func.walk([&](AffineForOp s) {
-          for (Operation &op : s.getBody()->without_terminator()) {
-            auto k = dyn_cast<AffineForOp>(&op);
-            if (!k)
-              continue;
-            AffineForOp j = onlyChildFor(k);
-            if (!j || !isInnermost(j))
-              continue;
-            AffineStoreOp st;
-            AffineLoadOp ld;
-            if (!findAccPair(j, st, ld))
-              continue;
-            if (addrDependsOnIV(st, k.getInductionVar()) ||
-                !addrDependsOnIV(st, j.getInductionVar()))
-              continue; // k must be the reduction, j the spatial dim
-            if (!llvm::is_contained(k.getLowerBoundOperands(),
-                                    s.getInductionVar()))
-              continue; // reduction lower bound must depend on the outer IV
-            cands.push_back(s);
-            break;
-          }
-        });
-        for (AffineForOp s : cands) {
-          if (!onlyChildFor(s)) { // a sibling (init loop) is present -> fission
-            if (!distributeLoop(s, rewriter).empty()) {
-              rpeeled = true;
-              break;
-            }
-            continue;
-          }
-          if (peelTriangularReduction(s, mrEff, rewriter)) {
-            rpeeled = true;
             break;
           }
         }

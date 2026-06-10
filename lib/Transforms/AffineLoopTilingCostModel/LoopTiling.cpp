@@ -224,7 +224,11 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
       band.front()->emitRemark("tile-rationale: " + msg);
   };
 
-  auto infoOr = drcompiler::reuse::analyzeBandReuse(band);
+  // Upper-bound trips accepted: triangular bands (covariance/syrk
+  // j = i..M) tile via min/max bounds; over-estimated footprints only err
+  // toward tiling, and the traffic ranking is shape-relative.
+  auto infoOr = drcompiler::reuse::analyzeBandReuse(
+      band, /*walkRoot=*/nullptr, /*acceptTripUpperBounds=*/true);
   if (failed(infoOr)) {
     rationale("REJECT reason=out-of-model (non-constant trips, imperfect "
               "below band, or non-affine references)");
@@ -257,13 +261,16 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
   }
 
   // Per-dimension candidates: modest powers plus "untiled" (= trip count).
+  // Dims with only an upper-bound trip (triangular) cannot express
+  // "untiled" as a tile size; they always pick from the fixed candidates.
   static constexpr uint64_t kCands[] = {16, 24, 32, 48, 64, 96, 128};
   SmallVector<SmallVector<uint64_t, 8>, 6> cands(d);
   for (unsigned l = 0; l < d; ++l) {
     for (uint64_t c : kCands)
       if (c < info.tripCounts[l])
         cands[l].push_back(c);
-    cands[l].push_back(info.tripCounts[l]); // untiled
+    if (info.tripIsExact[l] || cands[l].empty())
+      cands[l].push_back(info.tripCounts[l]); // untiled (or tiny trip)
   }
 
   // Exhaustive odometer walk (PolyBench bands are depth <= 4; 8^4 max).
@@ -310,7 +317,7 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
   }
   bool allUntiled = true;
   for (unsigned l = 0; l < d; ++l)
-    allUntiled &= best[l] == info.tripCounts[l];
+    allUntiled &= info.tripIsExact[l] && best[l] == info.tripCounts[l];
   if (allUntiled) {
     rationale("REJECT reason=untiled-optimal");
     return false;
@@ -320,7 +327,9 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
     uint64_t t = best[l];
     // Snap tiled dims to trip-count divisors to avoid min/max bounds (the
     // shared helper would also halve untiled dims, so do it here).
-    if (avoidMaxMinBounds && t < info.tripCounts[l])
+    // Upper-bound-trip dims keep their raw size: their bounds are min/max
+    // either way.
+    if (avoidMaxMinBounds && info.tripIsExact[l] && t < info.tripCounts[l])
       while (info.tripCounts[l] % t != 0)
         --t;
     (*tileSizes)[l] = static_cast<unsigned>(t);

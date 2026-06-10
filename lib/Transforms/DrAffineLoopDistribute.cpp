@@ -314,8 +314,15 @@ private:
           // still present under `loop` and would otherwise poison the band.
           auto infoOr = drcompiler::reuse::analyzeBandReuse(
               band, bodyOps[u.opIdx.front()]);
-          if (failed(infoOr))
-            continue;
+          if (failed(infoOr)) {
+            // Out of the constant-coefficient model (e.g. a triangular band
+            // like covariance's j = i..M around its k-reduction).  Unknown
+            // is not "no benefit": the harmful shared-sweep cases this guard
+            // exists for (atax/bicg BLAS-2 bodies) analyze cleanly, so stay
+            // optimistic here and let the split stand.
+            reuseBenefit = true;
+            break;
+          }
           for (unsigned l = 0, e = band.size(); l < e && !reuseBenefit; ++l)
             reuseBenefit = infoOr->loopCarriesEvictedReuse(l, cacheBytes);
           if (reuseBenefit)
