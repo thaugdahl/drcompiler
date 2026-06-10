@@ -84,6 +84,10 @@ struct BandReuseInfo {
   /// `loopIdx` (outer loops and the loop itself fixed, inner loops full).
   int64_t refIterFootprint(unsigned refIdx, unsigned loopIdx) const;
 
+  /// Bytes the given reference touches within one tile of the given shape.
+  int64_t refFootprintBytes(unsigned refIdx,
+                            llvm::ArrayRef<uint64_t> tileSizes) const;
+
   /// Bytes touched (all references) between consecutive reuses carried by
   /// band loop `loopIdx` — i.e. one full iteration of that loop.
   int64_t reuseDistanceBytes(unsigned loopIdx) const;

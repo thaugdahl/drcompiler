@@ -94,6 +94,11 @@ int64_t BandReuseInfo::footprintBytes(ArrayRef<uint64_t> tileSizes) const {
   return total;
 }
 
+int64_t BandReuseInfo::refFootprintBytes(unsigned refIdx,
+                                         ArrayRef<uint64_t> tileSizes) const {
+  return refFootprint(refs[refIdx], tileSizes);
+}
+
 int64_t BandReuseInfo::refIterFootprint(unsigned refIdx,
                                         unsigned loopIdx) const {
   SmallVector<uint64_t, 6> sizes(band.size(), 1);

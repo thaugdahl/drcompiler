@@ -31,11 +31,8 @@
 // DR-DIVERGE: pull in our cost-model primitives + ensure our tablegen Base
 // is found in `mlir::` rather than `mlir::affine::`.
 #include "drcompiler/Transforms/AffineLoopTile.h"
-#include "drcompiler/Analysis/ArchHandler.h"
-#include "drcompiler/Analysis/RegisterPressureAnalysis.h"
-#include "drcompiler/Analysis/SpillStrategy.h"
+#include "drcompiler/Analysis/ReuseAnalysis.h"
 #include "drcompiler/Transforms/CpuCostModel.h"
-#include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
 namespace mlir {
 using affine::FusionMode;  // unused here but kept for parity with Fusion fork
@@ -63,8 +60,15 @@ struct DrAffineLoopTilePass
   }
 
   void runOnOperation() override;
-  void getTileSizes(ArrayRef<AffineForOp> band,
+  // Returns false when the band should not be tiled at all (v2 REJECT path);
+  // v1 always tiled, even with size 1, which paid loop-structure overhead on
+  // bands with nothing to reuse.
+  bool getTileSizes(ArrayRef<AffineForOp> band,
                     SmallVectorImpl<unsigned> *tileSizes);
+  // v2 reuse-driven model (default): gate on evicted temporal reuse, then a
+  // per-dimension grid search minimizing inter-tile memory traffic.
+  bool getTileSizesV2(ArrayRef<AffineForOp> band,
+                      SmallVectorImpl<unsigned> *tileSizes);
 
   // Default tile size if nothing is provided.
   constexpr static unsigned kDefaultTileSize = 4;
@@ -120,30 +124,34 @@ static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
 // along each of the dimensions being tiled.
 // TODO: evolve this model. Tile size determination is a large area
 // to play with in general.
-void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
+bool DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
                               SmallVectorImpl<unsigned> *tileSizes) {
   if (band.empty())
-    return;
+    return false;
 
   // Use command-line tileSize for all loops if specified.
   if (tileSize) {
     tileSizes->assign(band.size(), tileSize);
-    return;
+    return true;
   }
 
   // Use supplied tile sizes and fill them with default tile size if it's short.
   if (!this->tileSizes.empty()) {
     tileSizes->assign(this->tileSizes.begin(), this->tileSizes.end());
     tileSizes->resize(band.size(), kDefaultTileSize);
-    return;
+    return true;
   }
   tileSizes->resize(band.size());
+
+  // DR-DIVERGE: the unified path is now the reuse-driven v2 model.
+  if (useUnifiedCostModel)
+    return getTileSizesV2(band, tileSizes);
 
   // If the cache size is zero, set the minimum valid tile size. No good reason
   // to pick another specific size over this.
   if (cacheSizeInKiB == 0) {
     llvm::fill(*tileSizes, 1);
-    return;
+    return true;
   }
 
   // Obtain memory footprint and set tile sizes so that a tile fits in
@@ -162,7 +170,7 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
     LLVM_DEBUG(
         rootForOp.emitWarning("memory footprint unknown: using default tile "
                               "sizes adjusted to trip count divisors"));
-    return;
+    return true;
   }
 
   // Check how many times larger the cache size is when compared to footprint.
@@ -171,204 +179,15 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
   if (excessFactor <= 1) {
     // No need of any tiling - set tile size to 1.
     llvm::fill(*tileSizes, 1);
-    return;
+    return true;
   }
 
-  // DR-DIVERGE: unified cost-model-driven tile-size selection.  When the
-  // unified path is active, do a small grid search over uniform candidate
-  // tile sizes, scoring each via arch.combineCosts(mem, reg, alu).  Falls
-  // back to upstream's nth-root heuristic otherwise.
-  unsigned tSize = 0;
-  if (useUnifiedCostModel) {
-    // DR-DIVERGE: tile-size selection driven by the unified cache<->register
-    // cost model.  Candidates are ranked by the TILE-SENSITIVE cost only
-    // (memory traffic, which falls as the tile grows because each datum is
-    // reused ~tile times before eviction, traded against register pressure,
-    // which rises with the tile's c^2 accumulator block).  See the scoring
-    // block below.  The previous version ranked by the full combined total,
-    // which (a) was dominated by a tile-INVARIANT ALU term that drowned the
-    // tile signal, and (b) cast a uint64 traffic estimate to 32-bit, which
-    // overflowed to ~0 at realistic sizes — so it degenerated to the
-    // smallest tile regardless of weights or problem size.
-    llvm::SmallVector<unsigned, 12> candidates{2u,  4u,  6u,  8u,  12u,
-                                               16u, 24u, 32u, 48u, 64u};
-    uint64_t bestTotal = std::numeric_limits<uint64_t>::max();
-    uint64_t untiledTotal = std::numeric_limits<uint64_t>::max();
-    unsigned bestTile = 1;
-
-    drcompiler::CpuCostModel cm =
-        cpuCostModelFile.empty()
-            ? drcompiler::CpuCostModel::getDefault()
-            : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
-    const auto &archJson = cm.archParams();
-    const auto &regsJson = cm.registerParams();
-
-    std::string handlerName;
-    if (!drArchHandler.empty())
-      handlerName = drArchHandler;
-    else if (archJson.handler)
-      handlerName = *archJson.handler;
-    else if (archJson.triplet)
-      handlerName = drcompiler::ArchHandler::pickHandlerForTriple(
-                        llvm::Triple(*archJson.triplet))
-                        .str();
-    else
-      handlerName = "generic";
-    auto handler = drcompiler::ArchHandler::create(handlerName);
-    auto ap = handler->defaultParams();
-    auto rp = handler->defaultRegisters();
-    if (archJson.vectorWidthBits)
-      ap.vectorWidthBits = *archJson.vectorWidthBits;
-    if (regsJson.gpBudget)
-      rp.gpBudget = *regsJson.gpBudget;
-    if (regsJson.fpBudget)
-      rp.fpBudget = *regsJson.fpBudget;
-    if (regsJson.vecBudget)
-      rp.vecBudget = *regsJson.vecBudget;
-    if (regsJson.predBudget)
-      rp.predBudget = *regsJson.predBudget;
-    if (regsJson.spillReloadCycles)
-      rp.spillReloadCycles = *regsJson.spillReloadCycles;
-    if (regsJson.spillStoreCycles)
-      rp.spillStoreCycles = *regsJson.spillStoreCycles;
-    drcompiler::SpillStrategy sp = drcompiler::SpillStrategy::ExcessHot;
-    if (!drSpillStrategy.empty())
-      sp = drcompiler::parseSpillStrategy(drSpillStrategy);
-    else if (archJson.spillStrategy)
-      sp = drcompiler::parseSpillStrategy(*archJson.spillStrategy);
-
-    drcompiler::PressureResult innerPressure;
-    {
-      drcompiler::PressureQuery pq;
-      pq.params = rp;
-      pq.strategy = sp;
-      pq.tripCount = 1;
-      auto inner = band.back();
-      innerPressure =
-          drcompiler::RegisterPressureAnalysis::analyzeRegionStatic(
-              inner.getRegion(), *handler, ap, pq);
-    }
-
-    // DR-DIVERGE (reuse + register fix): cache hierarchy from the JSON model
-    // (falling back to the cache-size option), used to map a tile's working
-    // set to its latency tier.
-    const auto &cj = cm.cacheParams();
-    auto orElse = [](std::optional<unsigned> v, unsigned dflt) -> unsigned {
-      return v ? *v : dflt;
-    };
-    dr::CacheParams cache{
-        orElse(cj.l1Size, static_cast<unsigned>(cacheSizeInKiB * 1024u / 4u)),
-        orElse(cj.l2Size, static_cast<unsigned>(cacheSizeInKiB * 1024u)),
-        orElse(cj.l3Size, 0u),
-        orElse(cj.l1Latency, 4u), orElse(cj.l2Latency, 12u),
-        orElse(cj.l3Latency, 40u), orElse(cj.memLatency, 200u), 64u};
-    (void)innerPressure; // tile pressure is modeled analytically below
-
-    uint64_t totalTripCount = 1;
-    bool tripsKnown = true;
-    for (AffineForOp f : band) {
-      auto tc = getConstantTripCount(f);
-      if (!tc) { tripsKnown = false; break; }
-      totalTripCount *= *tc;
-    }
-
-    // Tile-sensitive cost model, evaluated in double to avoid the 32-bit
-    // overflow that previously zeroed the score at scale.  We deliberately
-    // exclude the tile-INVARIANT ALU term (~totalTripCount): it dominates the
-    // absolute total and would drown the only signal that distinguishes tile
-    // sizes.  The two tile-sensitive components are memory traffic (falls with
-    // reuse as the tile grows) and register-block spill (rises with c^2).
-    double numIter = static_cast<double>(totalTripCount);
-    unsigned d = std::max<unsigned>(band.size(), 1u);
-    // Linear extent per dimension assuming a roughly cubical iteration space.
-    double nExtent =
-        tripsKnown ? std::pow(numIter, 1.0 / static_cast<double>(d)) : 0.0;
-    // Register capacity in scalar values = vector registers * lanes/register.
-    unsigned elemBits = 64u; // f64 working assumption
-    double lanes =
-        static_cast<double>(std::max(1u, ap.vectorWidthBits / elemBits));
-    double regCap = std::max(1.0, static_cast<double>(rp.vecBudget) * lanes);
-    double spillCyc = static_cast<double>(std::max(1u, rp.spillReloadCycles));
-
-    auto tileCost = [&](double c) -> double {
-      if (!tripsKnown || nExtent <= 0.0 || c < 1.0)
-        return std::numeric_limits<double>::infinity();
-      // Per-tile data footprint: a c-by-c block of each distinct array
-      // (2D-array assumption, matching upstream's identity-access model),
-      // derived from the whole-nest footprint fp ~ (#arrays) * nExtent^2.
-      double perTileFP =
-          static_cast<double>(*fp) * (c * c) / (nExtent * nExtent);
-      if (perTileFP < 1.0)
-        perTileFP = 1.0;
-      unsigned lat = dr::estimateLoadLatency(
-          static_cast<int64_t>(std::min(perTileFP, 9.0e18)), cache);
-      // Each datum is reused ~c times within a tile before eviction, so
-      // distinct fetches from the bottleneck level scale as numIter / c.
-      double memCycles = (numIter / c) * static_cast<double>(lat);
-      // The inner tile keeps ~c^2 accumulators live; the excess over the
-      // register file spills on the fraction of iterations that touch it.
-      // This is what caps the useful tile size below the cache-filling size.
-      double liveVals = c * c;
-      double regCycles = liveVals > regCap
-                             ? numIter * (1.0 - regCap / liveVals) * spillCyc
-                             : 0.0;
-      return ap.alphaMem * memCycles + ap.betaReg * regCycles;
-    };
-
-    auto clampU64 = [](double x) -> uint64_t {
-      if (!(x < 1.8e19))
-        return std::numeric_limits<uint64_t>::max();
-      if (x < 0.0)
-        return 0u;
-      return static_cast<uint64_t>(x);
-    };
-
-    double untiledCost = tileCost(1.0);
-    double bestCost = untiledCost;
-    bestTile = 1;
-    for (unsigned candidate : candidates) {
-      double tc = tileCost(static_cast<double>(candidate));
-      if (tc < bestCost) {
-        bestCost = tc;
-        bestTile = candidate;
-      }
-    }
-    bestTotal = clampU64(bestCost);
-    untiledTotal = clampU64(untiledCost);
-
-    if (bestTile <= 1) {
-      if (emitRationale)
-        band.front()->emitRemark(
-            "tile-rationale: REJECT (untiled best) untiled_cost=" +
-            std::to_string(untiledTotal));
-      tSize = 1;
-    } else {
-      if (emitRationale) {
-        std::string buf;
-        llvm::raw_string_ostream os(buf);
-        os << "tile-rationale: TILE size=" << bestTile
-           << " tile_cost=" << bestTotal << " untiled_cost=" << untiledTotal
-           << " (nExtent=" << static_cast<uint64_t>(nExtent)
-           << " regCap=" << static_cast<uint64_t>(regCap) << ")";
-        band.front()->emitRemark(buf);
-      }
-      tSize = bestTile;
-    }
-  } else {
-    // Upstream: nth root of excess factor.
-    tSize = static_cast<unsigned>(
-        floorl(std::pow(excessFactor, 1.0 / band.size())));
-  }
-  // DR-DIVERGE: when the unified cost model chose the tile size, emit it
-  // UNIFORMLY across the band.  Upstream sets the last dimension to
-  // `excessFactor / product(other dims)` to "cover the balance", but that
-  // overrides our chosen size on the innermost loop with a large, unrelated
-  // value — for GEMM it leaves the k-loop essentially untiled, which both
-  // blows the register block we sized for and measures far slower than the
-  // uniform tiling the cost model actually scored.
+  // Upstream: nth root of excess factor, last dimension covers the balance.
+  unsigned tSize = static_cast<unsigned>(
+      floorl(std::pow(excessFactor, 1.0 / band.size())));
   unsigned cumulProductOfTileSizes = 1;
   for (unsigned i = 0, e = band.size(); i < e; i++) {
-    if (useUnifiedCostModel || i < e - 1)
+    if (i < e - 1)
       (*tileSizes)[i] = tSize;
     else
       // Set last tile size to cover the balance.
@@ -378,6 +197,146 @@ void DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
   }
   if (avoidMaxMinBounds)
     adjustToDivisorsOfTripCounts(band, tileSizes);
+  return true;
+}
+
+// DR-DIVERGE: v2 reuse-driven tile-size selection.
+//
+// Decision structure:
+//  1. analyzeBandReuse — constant-coefficient per-reference reuse model.
+//     Out-of-model bands (imperfect below the band, vector ops, symbolic
+//     subscripts, unknown trips) are REJECTED: if we cannot see the reuse we
+//     do not restructure the loops.  This is what protects streaming and
+//     stencil kernels that v1 tiled for pure overhead (atax reg-block-tile
+//     0.55x at EXTRALARGE).
+//  2. Gate: some band loop must carry non-degenerate temporal reuse whose
+//     reuse distance overflows the target cache share.  Otherwise every
+//     datum is either register-held, cache-resident, or never reused —
+//     tiling cannot convert any miss to a hit.  REJECT.
+//  3. Per-dimension grid search (untiled is a candidate per dim) minimizing
+//     inter-tile traffic  sum_ref (writeFactor * tiles * refFootprint(T))
+//     subject to footprint(T) <= target.  This replaces v1's uniform-c
+//     GEMM-shaped formula (reuse ~c for every kernel, c^2 accumulators).
+bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
+                                          SmallVectorImpl<unsigned> *tileSizes) {
+  auto rationale = [&](const std::string &msg) {
+    if (emitRationale)
+      band.front()->emitRemark("tile-rationale: " + msg);
+  };
+
+  auto infoOr = drcompiler::reuse::analyzeBandReuse(band);
+  if (failed(infoOr)) {
+    rationale("REJECT reason=out-of-model (non-constant trips, imperfect "
+              "below band, or non-affine references)");
+    return false;
+  }
+  drcompiler::reuse::BandReuseInfo &info = *infoOr;
+  unsigned d = band.size();
+
+  // Target capacity: half the private L2 from the cost-model JSON (same
+  // convention as MemoryFission's l2-occupancy-pct default), falling back to
+  // the cache-size option.
+  drcompiler::CpuCostModel cm =
+      cpuCostModelFile.empty()
+          ? drcompiler::CpuCostModel::getDefault()
+          : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
+  int64_t l2Bytes = cm.cacheParams().l2Size
+                        ? static_cast<int64_t>(*cm.cacheParams().l2Size)
+                        : static_cast<int64_t>(cacheSizeInKiB) * 1024;
+  int64_t target = std::max<int64_t>(l2Bytes / 2, 4096);
+
+  // Gate on evicted temporal reuse.
+  bool anyEvicted = false;
+  for (unsigned l = 0; l < d && !anyEvicted; ++l)
+    anyEvicted = info.loopCarriesEvictedReuse(l, target);
+  if (!anyEvicted) {
+    rationale("REJECT reason=no-evicted-reuse footprint=" +
+              std::to_string(info.footprintBytes(info.tripCounts)) +
+              " target=" + std::to_string(target));
+    return false;
+  }
+
+  // Per-dimension candidates: modest powers plus "untiled" (= trip count).
+  static constexpr uint64_t kCands[] = {16, 24, 32, 48, 64, 96, 128};
+  SmallVector<SmallVector<uint64_t, 8>, 6> cands(d);
+  for (unsigned l = 0; l < d; ++l) {
+    for (uint64_t c : kCands)
+      if (c < info.tripCounts[l])
+        cands[l].push_back(c);
+    cands[l].push_back(info.tripCounts[l]); // untiled
+  }
+
+  // Exhaustive odometer walk (PolyBench bands are depth <= 4; 8^4 max).
+  SmallVector<unsigned, 6> idx(d, 0);
+  SmallVector<uint64_t, 6> cur(d), best;
+  double bestTraffic = std::numeric_limits<double>::infinity();
+  double bestTiles = std::numeric_limits<double>::infinity();
+  for (;;) {
+    for (unsigned l = 0; l < d; ++l)
+      cur[l] = cands[l][idx[l]];
+    if (info.footprintBytes(cur) <= target) {
+      double tiles = 1.0;
+      for (unsigned l = 0; l < d; ++l)
+        tiles *= std::ceil(static_cast<double>(info.tripCounts[l]) /
+                           static_cast<double>(cur[l]));
+      double traffic = 0.0;
+      for (unsigned r = 0, e = info.refs.size(); r < e; ++r)
+        traffic += (info.refs[r].isWrite ? 2.0 : 1.0) * tiles *
+                   static_cast<double>(info.refFootprintBytes(r, cur));
+      // Prefer lower traffic; tie-break on fewer tiles (less loop-structure
+      // overhead, which also prefers untiled dims).
+      if (traffic < bestTraffic * (1.0 - 1e-9) ||
+          (traffic < bestTraffic * (1.0 + 1e-9) && tiles < bestTiles)) {
+        bestTraffic = traffic;
+        bestTiles = tiles;
+        best.assign(cur.begin(), cur.end());
+      }
+    }
+    // Odometer increment.
+    unsigned l = 0;
+    for (; l < d; ++l) {
+      if (++idx[l] < cands[l].size())
+        break;
+      idx[l] = 0;
+    }
+    if (l == d)
+      break;
+  }
+
+  if (best.empty()) {
+    rationale("REJECT reason=no-feasible-tile target=" +
+              std::to_string(target));
+    return false;
+  }
+  bool allUntiled = true;
+  for (unsigned l = 0; l < d; ++l)
+    allUntiled &= best[l] == info.tripCounts[l];
+  if (allUntiled) {
+    rationale("REJECT reason=untiled-optimal");
+    return false;
+  }
+
+  for (unsigned l = 0; l < d; ++l) {
+    uint64_t t = best[l];
+    // Snap tiled dims to trip-count divisors to avoid min/max bounds (the
+    // shared helper would also halve untiled dims, so do it here).
+    if (avoidMaxMinBounds && t < info.tripCounts[l])
+      while (info.tripCounts[l] % t != 0)
+        --t;
+    (*tileSizes)[l] = static_cast<unsigned>(t);
+  }
+
+  if (emitRationale) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    os << "TILE sizes=[";
+    llvm::interleaveComma(*tileSizes, os);
+    os << "] footprint=" << info.footprintBytes(best)
+       << " target=" << target
+       << " traffic=" << static_cast<uint64_t>(bestTraffic);
+    rationale(buf);
+  }
+  return true;
 }
 
 void DrAffineLoopTilePass::runOnOperation() {
@@ -390,7 +349,11 @@ void DrAffineLoopTilePass::runOnOperation() {
     // Set up tile sizes; fill missing tile sizes at the end with default tile
     // size or tileSize if one was provided.
     SmallVector<unsigned, 6> tileSizes;
-    getTileSizes(band, &tileSizes);
+    // DR-DIVERGE: a REJECT from the cost model now leaves the band entirely
+    // untouched.  v1 tiled with size 1, which still restructured the loops
+    // and paid min/max-bound overhead for zero reuse benefit.
+    if (!getTileSizes(band, &tileSizes))
+      continue;
     if (llvm::DebugFlag) {
       auto diag = band[0].emitRemark("using tile sizes [");
       llvm::interleaveComma(tileSizes, llvm::dbgs());

@@ -54,23 +54,23 @@ struct DrAffineLoopDistributePass
     func::FuncOp fn = getOperation();
     if (fn.isExternal())
       return;
-    // Process loops outermost-first; after a successful split, re-examine
-    // the copies (a split can expose further distributable levels).
-    SmallVector<AffineForOp> worklist;
-    for (Block &b : fn.getBody())
-      for (auto loop : b.getOps<AffineForOp>())
-        worklist.push_back(loop);
-    while (!worklist.empty()) {
-      AffineForOp loop = worklist.pop_back_val();
-      SmallVector<AffineForOp, 4> copies;
-      if (tryDistribute(loop, copies)) {
-        // Examine each copy again (and their children via the else-branch).
-        for (AffineForOp c : copies)
-          worklist.push_back(c);
-      } else {
-        for (auto child : loop.getBody()->getOps<AffineForOp>())
-          worklist.push_back(child);
-      }
+    // Fixpoint: re-walk after every successful split.  A split erases loops
+    // (sibling units in each copy) and can make new loops distributable
+    // (e.g. 2mm's `for i { for j { tmp=0; for k } }`: splitting j leaves i
+    // with two perfectly nestable j-children), so a pointer worklist would
+    // dangle; fresh pre-order walks are cheap at kernel scale and always
+    // see a consistent IR.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      fn.walk<WalkOrder::PreOrder>([&](AffineForOp loop) -> WalkResult {
+        SmallVector<AffineForOp, 4> copies;
+        if (tryDistribute(loop, copies)) {
+          changed = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
     }
   }
 
@@ -84,37 +84,125 @@ private:
   }
 
   /// Returns true (and fills `copies`, original loop first) if `loop` was
-  /// distributed into one copy per top-level child nest.
+  /// distributed into one copy per distribution unit.
+  ///
+  /// A unit is either a top-level child affine.for nest or a maximal
+  /// contiguous run of top-level memory-effectful non-loop ops (a statement
+  /// block, e.g. the `tmp[i][j] = 0` matmul init that makes 2mm/3mm nests
+  /// imperfect).  Memory-effect-free scalar ops are replicated into every
+  /// copy; dead replicas fold away later.
   bool tryDistribute(AffineForOp loop, SmallVectorImpl<AffineForOp> &copies) {
     Block *body = loop.getBody();
-
-    SmallVector<AffineForOp, 4> children;
-    for (Operation &op : body->without_terminator()) {
-      if (auto childFor = dyn_cast<AffineForOp>(op)) {
-        if (childFor->getNumResults() > 0)
-          return false; // iter_args: leave untouched
-        children.push_back(childFor);
-        continue;
-      }
-      // Everything else must be pure scalar computation we can replicate.
-      if (!isMemoryEffectFree(&op) || op.getNumRegions() > 0)
-        return false;
-    }
-    if (children.size() < 2)
-      return false;
     if (loop->getNumResults() > 0)
       return false;
 
-    // Legality: no dependence from a later child to an earlier child carried
-    // exactly by `loop`.  Dependences carried by loops enclosing `loop` are
-    // unaffected by fission (the copies stay together inside them), and
-    // loop-independent backward dependences cannot exist (program order).
-    unsigned loopDepth = getNestingDepth(loop) + 1;
-    SmallVector<SmallVector<Operation *, 8>, 4> accesses(children.size());
-    for (unsigned i = 0; i < children.size(); ++i)
-      collectAccesses(children[i], accesses[i]);
+    // Partition body ops (by index) into units.
+    struct Unit {
+      bool isLoop = false;
+      SmallVector<unsigned, 4> opIdx; // indices into body op order
+    };
+    SmallVector<Unit, 4> units;
+    SmallVector<Operation *, 16> bodyOps;
+    unsigned numLoops = 0;
+    // First sweep: collect ops, loop units, and maximal contiguous runs of
+    // non-loop ops that contain at least one memory-effectful op.
+    SmallVector<SmallVector<unsigned, 8>, 4> runs;
+    bool runOpen = false, runHasEffect = false;
+    auto closeRun = [&]() {
+      if (runOpen && !runHasEffect)
+        runs.pop_back(); // pure-only run: everything stays replicated
+      runOpen = runHasEffect = false;
+    };
+    for (Operation &op : body->without_terminator()) {
+      unsigned idx = bodyOps.size();
+      bodyOps.push_back(&op);
+      if (auto childFor = dyn_cast<AffineForOp>(op)) {
+        if (childFor->getNumResults() > 0)
+          return false; // iter_args: leave untouched
+        closeRun();
+        units.push_back(Unit{/*isLoop=*/true, {idx}});
+        ++numLoops;
+        continue;
+      }
+      if (op.getNumRegions() > 0)
+        return false;
+      if (!runOpen) {
+        runs.emplace_back();
+        runOpen = true;
+      }
+      runs.back().push_back(idx);
+      runHasEffect |= !isMemoryEffectFree(&op);
+    }
+    closeRun();
 
-    for (unsigned j = 1; j < children.size(); ++j) {
+    // Each effectful run becomes a statement unit owning its effectful ops
+    // plus every pure run-op that is dead once the unit is erased (its users
+    // all land inside the unit, computed to fixpoint).  Remaining pure ops
+    // are replicated into every copy.  SSA safety: a unit op whose result is
+    // used outside the unit (a load feeding a later nest) blocks fission —
+    // erasing it would orphan the user, and replicating a read across the
+    // split is unsound when an intervening copy writes that location.
+    for (const SmallVector<unsigned, 8> &run : runs) {
+      llvm::SmallPtrSet<Operation *, 8> inUnit;
+      for (unsigned idx : run)
+        if (!isMemoryEffectFree(bodyOps[idx]))
+          inUnit.insert(bodyOps[idx]);
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (unsigned idx : llvm::reverse(run)) {
+          Operation *op = bodyOps[idx];
+          if (inUnit.contains(op) || !isMemoryEffectFree(op))
+            continue;
+          bool allUsersInUnit = !op->use_empty();
+          for (Operation *user : op->getUsers())
+            allUsersInUnit &= inUnit.contains(user);
+          if (allUsersInUnit) {
+            inUnit.insert(op);
+            changed = true;
+          }
+        }
+      }
+      for (Operation *op : inUnit)
+        for (Operation *user : op->getUsers())
+          if (!inUnit.contains(user))
+            return false;
+      Unit u;
+      u.isLoop = false;
+      for (unsigned idx : run)
+        if (inUnit.contains(bodyOps[idx]))
+          u.opIdx.push_back(idx);
+      // Splice the statement unit into program-order position among units.
+      units.push_back(std::move(u));
+      for (unsigned i = units.size() - 1; i > 0; --i)
+        if (units[i - 1].opIdx.front() > units[i].opIdx.front())
+          std::swap(units[i - 1], units[i]);
+    }
+    if (units.size() < 2 || numLoops == 0)
+      return false;
+
+    // Legality: no dependence between distinct units carried exactly by
+    // `loop`.  Dependences carried by enclosing loops are unaffected by
+    // fission (the copies stay together inside them); loop-independent
+    // dependences are always forward in program order and remain satisfied
+    // (all iterations of an earlier copy run before any of a later copy).
+    unsigned loopDepth = getNestingDepth(loop) + 1;
+    SmallVector<SmallVector<Operation *, 8>, 4> accesses(units.size());
+    for (unsigned i = 0; i < units.size(); ++i) {
+      for (unsigned idx : units[i].opIdx) {
+        if (units[i].isLoop)
+          collectAccesses(cast<AffineForOp>(bodyOps[idx]), accesses[i]);
+        else if (isa<AffineReadOpInterface, AffineWriteOpInterface>(
+                     bodyOps[idx]))
+          accesses[i].push_back(bodyOps[idx]);
+        else if (!isMemoryEffectFree(bodyOps[idx]))
+          return false; // effectful op we cannot reason about (call, memref.*)
+        // else: pure op absorbed into the unit (dead once the unit is
+        // erased); no memory access to model.
+      }
+    }
+
+    for (unsigned j = 1; j < units.size(); ++j) {
       for (unsigned i = 0; i < j; ++i) {
         for (Operation *a : accesses[j]) {
           for (Operation *b : accesses[i]) {
@@ -131,7 +219,8 @@ private:
                 /*dependenceComponents=*/nullptr);
             if (hasDependence(result)) {
               LLVM_DEBUG(llvm::dbgs()
-                         << "fission illegal: backward dep carried by loop\n");
+                         << "fission illegal: dep carried by loop between "
+                            "units\n");
               return false;
             }
           }
@@ -139,26 +228,32 @@ private:
       }
     }
 
-    // Transform: clone `loop` (children.size() - 1) times after the
-    // original; copy k keeps only child k.  The original keeps child 0.
+    // Transform: clone `loop` (units.size() - 1) times after the original;
+    // copy k keeps only unit k's ops (plus replicated pure ops).
     OpBuilder b(loop->getBlock(), std::next(Block::iterator(loop)));
     SmallVector<AffineForOp, 4> all;
     all.push_back(loop);
-    for (unsigned k = 1; k < children.size(); ++k) {
+    for (unsigned k = 1; k < units.size(); ++k) {
       auto clone = cast<AffineForOp>(b.clone(*loop.getOperation()));
       all.push_back(clone);
       b.setInsertionPointAfter(clone);
     }
     for (unsigned k = 0; k < all.size(); ++k) {
-      SmallVector<AffineForOp, 4> kids;
-      for (auto child : all[k].getBody()->getOps<AffineForOp>())
-        kids.push_back(child);
-      assert(kids.size() == children.size() && "clone mismatch");
-      for (unsigned c = 0; c < kids.size(); ++c)
-        if (c != k)
-          kids[c].erase();
+      SmallVector<Operation *, 16> copyOps;
+      for (Operation &op : all[k].getBody()->without_terminator())
+        copyOps.push_back(&op);
+      assert(copyOps.size() == bodyOps.size() && "clone mismatch");
+      for (unsigned u = 0; u < units.size(); ++u) {
+        if (u == k)
+          continue;
+        for (unsigned idx : llvm::reverse(units[u].opIdx))
+          copyOps[idx]->erase();
+      }
     }
-    copies.append(all.begin(), all.end());
+    // Report only the loop-unit copies for re-examination.
+    for (unsigned k = 0; k < all.size(); ++k)
+      if (units[k].isLoop)
+        copies.push_back(all[k]);
     LLVM_DEBUG(llvm::dbgs() << "distributed loop into " << all.size()
                             << " copies\n");
     return true;
