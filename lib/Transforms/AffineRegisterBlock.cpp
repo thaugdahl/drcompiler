@@ -498,7 +498,10 @@ static bool canonicalizeOnce(func::FuncOp func) {
 /// becomes legal and Stage 3 register-blocks it; the DIAG keeps the ragged
 /// bound and stays scalar (its own unroll-jam fails harmlessly).  Returns true
 /// if it rewrote; a no-op (false) on rectangular bands and non-perfect nests.
+static bool innermostStrideOne(AffineLoadOp load, Value iv);
+
 static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
+                               unsigned kTileTarget, int64_t effLLC,
                                IRRewriter &rewriter) {
   AffineForOp sIn = onlyChildFor(sOut);
   if (!sIn)
@@ -539,6 +542,49 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   if (lbTriangular && stripHi > sIn.getConstantUpperBound())
     return false;
 
+  // A2: k-strip the HEAD's reduction loop.  When a multiplicand is k-STRIDED
+  // (column access, e.g. covariance's data[k][i] / data[k][j] with a row
+  // stride > page size) and the streamed working set exceeds the effective
+  // LLC, the HEAD re-streams the whole data matrix per row-strip and every
+  // k step touches a new TLB page.  Chunking k by Tk keeps the slab's page
+  // set TLB/cache-resident across the j sweep.  Per-(i,j) additions stay in
+  // ascending k order with exact intermediate store/load roundtrips, so the
+  // result is BIT-IDENTICAL.  Tk is the largest divisor of the k-trip <=
+  // the target, so no remainder chunk exists.  Row-major (stride-1-in-k,
+  // dot-family) bands are excluded: their streams prefetch fine and the
+  // extra loop level only costs.
+  int64_t kTileSize = 0;
+  if (kTileTarget > 0 && red.hasConstantLowerBound() &&
+      red.hasConstantUpperBound()) {
+    int64_t ktrip =
+        red.getConstantUpperBound() - red.getConstantLowerBound();
+    Value kIV = red.getInductionVar();
+    bool kStrided = false;
+    int64_t elemBytes = 8;
+    for (Operation &op : red.getBody()->without_terminator()) {
+      auto ld = dyn_cast<AffineLoadOp>(&op);
+      if (!ld || !llvm::is_contained(ld.getMapOperands(), kIV))
+        continue;
+      auto mt = cast<MemRefType>(ld.getMemRef().getType());
+      if (mt.getElementType().isIntOrFloat())
+        elemBytes = std::max<int64_t>(
+            1, (int64_t)mt.getElementType().getIntOrFloatBitWidth() / 8);
+      if (!innermostStrideOne(ld, kIV))
+        kStrided = true;
+    }
+    int64_t jExt = lbTriangular ? sIn.getConstantUpperBound() : hi;
+    if (kStrided && effLLC > 0 && ktrip * jExt * elemBytes > effLLC)
+      for (int64_t d = std::min<int64_t>(kTileTarget, ktrip); d >= 64; --d)
+        if (ktrip % d == 0) {
+          kTileSize = d;
+          break;
+        }
+  }
+  AffineMap addTkMap =
+      kTileSize ? AffineMap::get(1, 0, getAffineDimExpr(0, sOut.getContext()) +
+                                           kTileSize)
+                : AffineMap();
+
   MLIRContext *ctx = sOut.getContext();
   Location loc = sOut.getLoc();
   AffineExpr d0 = getAffineDimExpr(0, ctx), d1 = getAffineDimExpr(1, ctx);
@@ -561,7 +607,7 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   AffineMap addMrMap =
       AffineMap::get(1, 0, d0 + (int64_t)mr); // (d0) -> d0 + mr
 
-  auto buildHalf = [&](Value ii, bool diag) -> AffineForOp {
+  auto buildHalf = [&](Value ii, bool diag, Value kkIV) -> AffineForOp {
     if (diag && lbTriangular) {
       // lb-triangular DIAG: emit in ORIGINAL coordinates — a real
       // `for i2 = ii .. ii+mr { for j = g(i2) .. ii+mr }` whose ragged
@@ -633,8 +679,27 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
     IRMapping m;
     m.map(iv, ni);
     m.map(sIn.getInductionVar(), jL.getInductionVar());
-    rewriter.clone(*red.getOperation(), m);
+    auto redClone = cast<AffineForOp>(rewriter.clone(*red.getOperation(), m));
+    if (!diag && kkIV) {
+      redClone.setLowerBound(ValueRange{kkIV}, idMap);
+      redClone.setUpperBound(ValueRange{kkIV}, addTkMap);
+    }
     return iL;
+  };
+
+  // Emit one half; the HEAD gets the optional kk chunk loop wrapped around
+  // its i' nest (kk sits ABOVE i' so Stage 3 still sees the perfect
+  // i'-j-k band: red's parent must remain the j loop).
+  auto emitHalf = [&](Value ii, bool diag) -> AffineForOp {
+    if (!diag && kTileSize) {
+      auto kkL = rewriter.create<AffineForOp>(
+          loc, red.getConstantLowerBound(), red.getConstantUpperBound(),
+          kTileSize);
+      rewriter.setInsertionPointToStart(kkL.getBody());
+      buildHalf(ii, /*diag=*/false, kkL.getInductionVar());
+      return kkL;
+    }
+    return buildHalf(ii, diag, Value());
   };
 
   rewriter.setInsertionPoint(sOut);
@@ -652,9 +717,9 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   // Per-row j order stays ascending: ub-triangular runs HEAD (LB..ii) before
   // DIAG (ii..f(ni)); lb-triangular runs DIAG (g(ni)..ii+mr) before HEAD
   // (ii+mr..UB).  Reductions are insensitive either way; keep it tidy.
-  AffineForOp first = buildHalf(ii, /*diag=*/!ubTriangular);
+  AffineForOp first = emitHalf(ii, /*diag=*/!ubTriangular);
   rewriter.setInsertionPointAfter(first);
-  buildHalf(ii, /*diag=*/ubTriangular);
+  emitHalf(ii, /*diag=*/ubTriangular);
   rewriter.eraseOp(sOut);
   return true;
 }
@@ -1207,8 +1272,9 @@ public:
         if (r && isInnermost(r))
           cands.push_back(s);
       });
+      int64_t effLLC = (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
       for (AffineForOp s : cands)
-        if (peelTriangularNest(s, mrEff, rewriter)) {
+        if (peelTriangularNest(s, mrEff, peelKTile, effLLC, rewriter)) {
           peeled = true;
           break;
         }

@@ -564,7 +564,20 @@ def AffineRegisterBlockPass
     Option<"vl", "vl", "unsigned", "8",
            "Vector lane width for the broadcast vector micro-kernel (doubles per "
            "vector; 8 = one AVX-512 zmm). mr x vl accumulators must fit the "
-           "vector register file.">
+           "vector register file.">,
+    Option<"peelKTile", "peel-k-tile", "unsigned", "128",
+           "Target k-chunk size for tiling the reduction loop of a peeled "
+           "triangular HEAD (0 = off). Applies only when some multiplicand is "
+           "k-strided (column access, e.g. covariance's data[k][i]) AND the "
+           "streamed working set exceeds l3-size/llc-sharers: the HEAD then "
+           "re-streams the full data matrix per row-strip with a >page stride "
+           "(20.8 KB row at XL), touching a new TLB page every k step. The "
+           "actual chunk is the largest divisor of the k-trip <= this target "
+           "with a floor of 64 (targets < 64 disable the chunking), so no "
+           "remainder chunk is needed. Measured on covariance XL: a wide "
+           "plateau at targets 75-150 (11.0-11.5x vs base; untiled HEAD was "
+           "3.7x, Polly 6.25x); 128 sits mid-plateau. Dot-family bands "
+           "(stride-1 in k) are excluded by the gate and unaffected.">
   ];
 
   let dependentDialects = [
