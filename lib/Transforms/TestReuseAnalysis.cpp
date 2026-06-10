@@ -65,6 +65,19 @@ struct DrTestReuseAnalysisPass
       os << "] anyTemporal=" << (info.anyTemporalReuse() ? 1 : 0);
       forOp->emitRemark(buf);
 
+      for (const RefGroup &g : info.groups) {
+        std::string gbuf;
+        llvm::raw_string_ostream gos(gbuf);
+        gos << "reuse-analysis: group members=" << g.members.size()
+            << " span=[";
+        llvm::interleaveComma(g.span, gos);
+        gos << "] carries=[";
+        for (unsigned l = 0, nl = g.carriesReuse.size(); l < nl; ++l)
+          gos << (l ? "," : "") << (g.carriesReuse[l] ? 1 : 0);
+        gos << "]";
+        info.refs[g.members.front()].op->emitRemark(gbuf);
+      }
+
       for (unsigned r = 0, e = info.refs.size(); r < e; ++r) {
         const RefInfo &ref = info.refs[r];
         std::string rbuf;

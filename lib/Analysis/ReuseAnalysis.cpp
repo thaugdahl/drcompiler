@@ -18,13 +18,19 @@ namespace {
 /// ceildiv, dim*dim) or with a non-constant coefficient.  Symbols are allowed
 /// only with zero coefficient (they never appear once `coeffOk` rejects them).
 bool collectLinearCoeffs(AffineExpr expr, unsigned numDims,
-                         SmallVectorImpl<int64_t> &dimCoeffs) {
+                         SmallVectorImpl<int64_t> &dimCoeffs,
+                         int64_t &constTerm) {
   dimCoeffs.assign(numDims, 0);
+  constTerm = 0;
   // Recursive walk accumulating `scale * expr`.
   std::function<bool(AffineExpr, int64_t)> walk = [&](AffineExpr e,
                                                       int64_t scale) -> bool {
-    if (auto c = dyn_cast<AffineConstantExpr>(e))
-      return true; // constants shift the base address; irrelevant to extents
+    if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+      // Constants shift the base address; irrelevant to extents, but they
+      // are the stencil offset that distinguishes group members.
+      constTerm += scale * c.getValue();
+      return true;
+    }
     if (auto d = dyn_cast<AffineDimExpr>(e)) {
       dimCoeffs[d.getPosition()] += scale;
       return true;
@@ -246,8 +252,10 @@ drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band,
       return WalkResult::interrupt();
     for (AffineExpr expr : map.getResults()) {
       SmallVector<int64_t, 4> dimCoeffs;
-      if (!collectLinearCoeffs(expr, numDims, dimCoeffs))
+      int64_t constTerm = 0;
+      if (!collectLinearCoeffs(expr, numDims, dimCoeffs, constTerm))
         return WalkResult::interrupt();
+      ref.constOffset.push_back(constTerm);
       SmallVector<int64_t, 4> loopCoeffs(band.size(), 0);
       for (unsigned d = 0; d < numDims; ++d) {
         if (dimCoeffs[d] == 0)
@@ -294,5 +302,48 @@ drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band,
     return failure();
   if (info.refs.empty())
     return failure();
+
+  // Group stencil neighbours: same memref, same per-loop coefficient matrix,
+  // differing only in the constant offset vector.
+  for (unsigned r = 0, e = info.refs.size(); r < e; ++r) {
+    bool grouped = false;
+    for (RefGroup &g : info.groups) {
+      const RefInfo &rep = info.refs[g.members.front()];
+      if (rep.memref == info.refs[r].memref &&
+          rep.coeff == info.refs[r].coeff) {
+        g.members.push_back(r);
+        grouped = true;
+        break;
+      }
+    }
+    if (!grouped) {
+      RefGroup g;
+      g.members.push_back(r);
+      info.groups.push_back(std::move(g));
+    }
+  }
+  llvm::erase_if(info.groups,
+                 [](const RefGroup &g) { return g.members.size() < 2; });
+  for (RefGroup &g : info.groups) {
+    const RefInfo &rep = info.refs[g.members.front()];
+    unsigned rank = rep.coeff.size();
+    SmallVector<bool, 4> dimDiffers(rank, false);
+    for (unsigned d = 0; d < rank; ++d) {
+      int64_t mn = std::numeric_limits<int64_t>::max();
+      int64_t mx = std::numeric_limits<int64_t>::min();
+      for (unsigned m : g.members) {
+        mn = std::min(mn, info.refs[m].constOffset[d]);
+        mx = std::max(mx, info.refs[m].constOffset[d]);
+      }
+      g.span.push_back(mx - mn);
+      dimDiffers[d] = mx != mn;
+    }
+    for (unsigned l = 0, nl = info.band.size(); l < nl; ++l) {
+      bool carries = false;
+      for (unsigned d = 0; d < rank; ++d)
+        carries |= dimDiffers[d] && rep.coeff[d][l] != 0;
+      g.carriesReuse.push_back(carries);
+    }
+  }
   return info;
 }

@@ -59,6 +59,9 @@ struct RefInfo {
   int64_t elemBytes = 0;
   /// coeff[d][l] = coefficient of band loop l's IV in subscript dim d.
   llvm::SmallVector<llvm::SmallVector<int64_t, 4>, 4> coeff;
+  /// Constant term of each subscript dim (the stencil offset: A[i][j-1] has
+  /// constOffset = {0, -1}).
+  llvm::SmallVector<int64_t, 4> constOffset;
   /// Static memref dim sizes (-1 if dynamic) used to clamp extents.
   llvm::SmallVector<int64_t, 4> dimSizes;
   /// Per band loop classification.
@@ -67,6 +70,26 @@ struct RefInfo {
   bool invariantIn(unsigned loopIdx) const {
     return kinds[loopIdx] == ReuseKind::Invariant;
   }
+};
+
+/// A GROUP of references to the same memref whose subscripts share one
+/// linear coefficient matrix and differ only in the constant offset vector —
+/// the stencil-neighbour pattern (A[i][j-1], A[i][j], A[i][j+1], ...).
+/// Per-reference analysis sees these as unrelated streams ("no temporal
+/// reuse"); the group view exposes the reuse a time-tiling/skewing transform
+/// can exploit: members re-touch each other's elements `span` iterations
+/// apart along the loops that index the differing dims.
+struct RefGroup {
+  /// Indices into BandReuseInfo::refs (>= 2 entries).
+  llvm::SmallVector<unsigned, 4> members;
+  /// span[d] = max - min constant offset over members in subscript dim d
+  /// (the halo width of the stencil along that dim).
+  llvm::SmallVector<int64_t, 4> span;
+  /// carriesReuse[l] = true if band loop l indexes (nonzero coefficient)
+  /// some subscript dim whose member offsets differ: one iteration of l
+  /// brings a member onto an element another member touched up to span
+  /// iterations earlier.
+  llvm::SmallVector<bool, 6> carriesReuse;
 };
 
 struct BandReuseInfo {
@@ -78,6 +101,10 @@ struct BandReuseInfo {
   /// (triangular bounds: constant-ub minus the constant/zero lb floor).
   llvm::SmallVector<bool, 6> tripIsExact;
   llvm::SmallVector<RefInfo, 8> refs;
+  /// Stencil-neighbour reference groups (only groups with >= 2 members are
+  /// recorded).  Purely additive analysis output: no existing footprint /
+  /// reuse-distance / eviction verdict consults it.
+  llvm::SmallVector<RefGroup, 4> groups;
 
   /// Bytes touched by one tile with the given per-loop iteration counts
   /// (tileSizes.size() == band.size(); pass tripCounts for the full band
