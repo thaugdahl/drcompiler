@@ -228,6 +228,57 @@ private:
       }
     }
 
+    llvm::SmallPtrSet<Operation *, 16> unitMember;
+    for (const Unit &u : units)
+      for (unsigned idx : u.opIdx)
+        unitMember.insert(bodyOps[idx]);
+
+    // Profitability ('enabler' mode): fission must DEEPEN some perfect band,
+    // i.e. some loop-unit copy must be a perfect nest rooted at `loop` after
+    // sibling units are erased and dead pure replicas are cleaned.  A copy is
+    // spoiled by any replicated pure op that stays live (feeds the kept
+    // child): it sits at body level and breaks perfect nesting, so the tiler
+    // could not analyze the band anyway and splitting buys nothing.
+    if (mode == "enabler") {
+      bool deepens = false;
+      for (const Unit &u : units) {
+        if (!u.isLoop)
+          continue;
+        Operation *child = bodyOps[u.opIdx.front()];
+        bool clean = true;
+        for (unsigned idx = 0; idx < bodyOps.size() && clean; ++idx) {
+          Operation *op = bodyOps[idx];
+          if (op == child || unitMember.contains(op))
+            continue; // unit members are erased or kept wholesale
+          // Live in this copy iff some transitive user sits inside `child`.
+          SmallVector<Operation *, 8> work(op->getUsers().begin(),
+                                           op->getUsers().end());
+          llvm::SmallPtrSet<Operation *, 8> seen;
+          while (!work.empty()) {
+            Operation *user = work.pop_back_val();
+            if (!seen.insert(user).second)
+              continue;
+            if (child->isAncestor(user)) {
+              clean = false;
+              break;
+            }
+            for (Operation *uu : user->getUsers())
+              work.push_back(uu);
+          }
+        }
+        if (clean) {
+          deepens = true;
+          break;
+        }
+      }
+      if (!deepens) {
+        if (emitRationale)
+          loop->emitRemark(
+              "distribute-rationale: SKIP legal split (no band deepened)");
+        return false;
+      }
+    }
+
     // Transform: clone `loop` (units.size() - 1) times after the original;
     // copy k keeps only unit k's ops (plus replicated pure ops).
     OpBuilder b(loop->getBlock(), std::next(Block::iterator(loop)));
@@ -249,7 +300,27 @@ private:
         for (unsigned idx : llvm::reverse(units[u].opIdx))
           copyOps[idx]->erase();
       }
+      // Sweep dead pure replicas so loop-unit copies become PERFECT nests
+      // (a live-but-unused body-level op would hide the band from the tiler
+      // and from getPerfectlyNestedLoops-based clients).
+      bool swept = true;
+      while (swept) {
+        swept = false;
+        for (Operation &op :
+             llvm::make_early_inc_range(llvm::reverse(*all[k].getBody()))) {
+          if (op.hasTrait<OpTrait::IsTerminator>())
+            continue;
+          if (isMemoryEffectFree(&op) && op.use_empty() &&
+              op.getNumRegions() == 0) {
+            op.erase();
+            swept = true;
+          }
+        }
+      }
     }
+    if (emitRationale)
+      loop->emitRemark("distribute-rationale: SPLIT into " +
+                       std::to_string(all.size()) + " loops");
     // Report only the loop-unit copies for re-examination.
     for (unsigned k = 0; k < all.size(); ++k)
       if (units[k].isLoop)

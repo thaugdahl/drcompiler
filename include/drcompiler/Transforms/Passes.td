@@ -188,6 +188,16 @@ def DrAffineLoopDistributePass
     (Polly) performs before tiling.
   }];
 
+  let options = [
+    Option<"mode", "mode", "std::string", /*default=*/"\"enabler\"",
+           "Profitability mode: 'enabler' splits only when fission deepens "
+           "a perfect band (feeding the tiler / register blocker); 'always' "
+           "splits whenever legal (v1 behavior, kept for A/B runs)">,
+    Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
+           "Emit a remark for every split performed and every legal split "
+           "skipped by the profitability mode">,
+  ];
+
   let dependentDialects = ["mlir::affine::AffineDialect"];
   let constructor = "mlir::createDrAffineLoopDistributePass()";
 }
