@@ -197,6 +197,35 @@ perMemrefFootprintBytes(AffineForOp forOp) {
   return sizes;
 }
 
+/// True if an op with side effects we cannot attribute to a specific memref
+/// (an opaque call such as a benchmark timer) sits between the two nests in
+/// block order.  Fusion would relocate computation across it — legal when
+/// the data doesn't escape, but it dissolves the program's phase structure
+/// (e.g. moving array init into a timed region).  Different blocks are
+/// conservatively treated as separated.
+inline bool sideEffectingOpBetween(mlir::Operation *a, mlir::Operation *b) {
+  if (a == b)
+    return false;
+  if (a->getBlock() != b->getBlock())
+    return true;
+  mlir::Operation *first = a->isBeforeInBlock(b) ? a : b;
+  mlir::Operation *last = first == a ? b : a;
+  for (mlir::Operation *op = first->getNextNode(); op && op != last;
+       op = op->getNextNode()) {
+    if (mlir::isMemoryEffectFree(op))
+      continue;
+    // Effects the MDG models precisely: affine accesses, allocations,
+    // deallocations, and whole affine nests (their accesses carry edges).
+    if (mlir::isa<mlir::affine::AffineForOp, mlir::affine::AffineIfOp,
+                  mlir::affine::AffineReadOpInterface,
+                  mlir::affine::AffineWriteOpInterface, mlir::memref::AllocOp,
+                  mlir::memref::AllocaOp, mlir::memref::DeallocOp>(op))
+      continue;
+    return true;
+  }
+  return false;
+}
+
 /// Bytes of data the two nests both touch: for each memref accessed by both,
 /// the smaller of the two per-nest footprints (a bounding-box overlap upper
 /// bound — good enough for a fraction-of-traffic gate).  std::nullopt when
@@ -1450,6 +1479,22 @@ public:
         gatherProducerConsumerMemrefs(srcId, dstId, *mdg,
                                       producerConsumerMemrefs);
 
+        // DR-DIVERGE (phase barrier): an op with unknown side effects
+        // between the two nests (a call — e.g. polybench_timer_start)
+        // delimits a program phase.  Hoisting the src computation across it
+        // is legal whenever the touched memrefs don't escape, but it
+        // dissolves the phase structure: measured on atax at O0, fusing the
+        // A-init nest (before the timer call) into the kernel (after it)
+        // moved a full array initialization into the timed region — process
+        // cycles identical, reported kernel time 4x.  Such reordering is
+        // never the intent of loop fusion; keep nests on their own side of
+        // any opaque call.
+        if (dr_fusion::sideEffectingOpBetween(srcNode->op, dstNode->op)) {
+          LDBG() << "Skipping fusion: opaque side-effecting op between the "
+                    "nests (phase barrier)";
+          continue;
+        }
+
         // DR-DIVERGE (interleaving guard): fusing relocates the src
         // computation inside the dst loop, interleaving it with the dst
         // body across iterations.  If the dst nest STORES to any memref the
@@ -1778,6 +1823,12 @@ public:
       // TODO: Check that 'sibStoreOpInst' post-dominates all other
       // stores to the same memref in 'sibNode' loop nest.
       auto *sibNode = mdg->getNode(sibId);
+      // DR-DIVERGE (phase barrier): see performFusionsIntoDest.
+      if (dr_fusion::sideEffectingOpBetween(sibNode->op, dstNode->op)) {
+        LDBG() << "Skipping sibling fusion: opaque side-effecting op "
+                  "between the nests (phase barrier)";
+        continue;
+      }
       // Compute an operation list insertion point for the fused loop
       // nest which preserves dependences.
       assert(sibNode->op->getBlock() == dstNode->op->getBlock());
