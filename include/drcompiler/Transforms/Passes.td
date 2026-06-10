@@ -227,6 +227,48 @@ def DrTestReuseAnalysisPass
   let constructor = "mlir::createDrTestReuseAnalysisPass()";
 }
 
+def DrAffineStencilTimeTilePass
+    : Pass<"dr-affine-stencil-time-tile", "mlir::func::FuncOp">
+{
+  let summary = "Skewed time-tiling for ping-pong stencils (jacobi family)";
+
+  let description = [{
+    Matches `for t { B <- f(A); A <- g(B) }` where both space nests are
+    perfect, constant-bound, and every load offset is within +/-1 of the
+    store point (halo 1).  Assigns each half-step a virtual time
+    tau = 2t + phase and skews every space dim by tau; all dependence
+    distances become non-negative, so the skewed band is fully permutable
+    and is tiled rectangularly (tile-t x tile-s^d), emitted in ORIGINAL
+    coordinates as affine max/min iteration windows.  Every (t, point)
+    body instance executes whole, exactly once, in an order consistent
+    with every flow dependence: bit-identical results.
+
+    Profitability: fires only when one time step's working set (both
+    arrays) exceeds l3-size/llc-sharers -- below that the step is already
+    cache-resident and skewed windows only add bound overhead (Polly's
+    jacobi-1d 0.34x is this mistake).  `force-tile` skips the gate (tests).
+  }];
+
+  let options = [
+    Option<"tileT", "tile-t", "unsigned", "0",
+           "Time-tile depth in t iterations (0 = measured per-rank default: 128 for 2-D, 24 for 3-D, 32 for 1-D)">,
+    Option<"tileS", "tile-s", "unsigned", "0",
+           "Space-tile width per dimension, in skewed-space points (0 = derive from l3-size so one (Ts+2Tt)^d tile box fits half the effective LLC)">,
+    Option<"l3Size", "l3-size", "unsigned", "33554432",
+           "Shared last-level cache size in bytes">,
+    Option<"llcSharers", "llc-sharers", "unsigned", "1",
+           "Co-tenants of the LLC; effective cache = l3-size/this">,
+    Option<"forceTile", "force-tile", "bool", "false",
+           "Skip the footprint profitability gate (testing)">
+  ];
+
+  let dependentDialects = [
+    "memref::MemRefDialect", "affine::AffineDialect", "arith::ArithDialect"
+  ];
+
+  let constructor = "mlir::createDrAffineStencilTimeTilePass()";
+}
+
 def DrPinLiveOutPass : Pass<"dr-pin-liveout", "mlir::ModuleOp">
 {
   let summary = "Pin live-out memrefs against dead-code elimination";

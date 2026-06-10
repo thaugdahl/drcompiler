@@ -2,6 +2,7 @@ add_mlir_library(DRCompTransforms
   AffineLoopFusionCostModel/LoopFusion.cpp
   AffineLoopTilingCostModel/LoopTiling.cpp
   AffineRegisterBlock.cpp
+  AffineStencilTimeTile.cpp
   CpuCostModel.cpp
   DataRecomputation.cpp
   DataRecomputation/BufferElim.cpp

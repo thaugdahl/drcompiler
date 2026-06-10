@@ -4,6 +4,7 @@
 #include "drcompiler/Transforms/AffineLoopFusion.h"
 #include "drcompiler/Transforms/AffineLoopTile.h"
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
+#include "drcompiler/Transforms/AffineStencilTimeTile.h"
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/DrAffineLoopDistribute.h"
 #include "drcompiler/Transforms/DrPinLiveOut.h"
