@@ -26,9 +26,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/DrAffineLoopDistribute.h"
+#include "drcompiler/Analysis/ReuseAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -276,6 +278,79 @@ private:
           loop->emitRemark(
               "distribute-rationale: SKIP legal split (no band deepened)");
         return false;
+      }
+
+      // Locality guard: splitting separates units that today execute back to
+      // back per iteration.  If they SHARE data (atax's two j-loops both
+      // read row A[i][:]), the fused form gets that reuse for free from the
+      // cache; the split form refetches it a whole sweep later.  That cost
+      // is only worth paying when the split feeds a downstream win — some
+      // post-split band carrying temporal reuse the tiler can capture
+      // (gemm/2mm: the matmul band).  No such band + shared data => skip.
+      bool reuseBenefit = false;
+      {
+        // Perfect ancestors of `loop` (the post-split copies stay nested in
+        // them, so they are part of every hypothetical band).
+        SmallVector<AffineForOp, 4> ancestors;
+        Operation *cur = loop;
+        while (auto parent = cur->getParentOfType<AffineForOp>()) {
+          Block *pb = parent.getBody();
+          if (std::next(pb->begin()) != std::prev(pb->end()))
+            break; // imperfect above: band stops here
+          ancestors.push_back(parent);
+          cur = parent;
+        }
+        std::reverse(ancestors.begin(), ancestors.end());
+        for (const Unit &u : units) {
+          if (!u.isLoop)
+            continue;
+          SmallVector<AffineForOp, 6> band(ancestors.begin(), ancestors.end());
+          band.push_back(loop);
+          SmallVector<AffineForOp, 6> chain;
+          getPerfectlyNestedLoops(chain,
+                                  cast<AffineForOp>(bodyOps[u.opIdx.front()]));
+          band.append(chain.begin(), chain.end());
+          // Restrict the walk to this unit's nest: the sibling units are
+          // still present under `loop` and would otherwise poison the band.
+          auto infoOr = drcompiler::reuse::analyzeBandReuse(
+              band, bodyOps[u.opIdx.front()]);
+          if (failed(infoOr))
+            continue;
+          for (unsigned l = 0, e = band.size(); l < e && !reuseBenefit; ++l)
+            reuseBenefit = infoOr->loopCarriesEvictedReuse(l, cacheBytes);
+          if (reuseBenefit)
+            break;
+        }
+      }
+      if (!reuseBenefit) {
+        // No tiling fuel anywhere: only split if the units are disjoint.
+        llvm::SmallDenseMap<void *, unsigned, 8> firstUnit;
+        bool shared = false;
+        for (unsigned i = 0; i < units.size() && !shared; ++i) {
+          llvm::SmallPtrSet<void *, 8> mine;
+          for (Operation *a : accesses[i])
+            mine.insert(isa<AffineWriteOpInterface>(a)
+                            ? cast<AffineWriteOpInterface>(a)
+                                  .getMemRef()
+                                  .getAsOpaquePointer()
+                            : cast<AffineReadOpInterface>(a)
+                                  .getMemRef()
+                                  .getAsOpaquePointer());
+          for (void *m : mine) {
+            auto it = firstUnit.find(m);
+            if (it != firstUnit.end() && it->second != i) {
+              shared = true;
+              break;
+            }
+            firstUnit[m] = i;
+          }
+        }
+        if (shared) {
+          if (emitRationale)
+            loop->emitRemark("distribute-rationale: SKIP legal split "
+                             "(shared data, no reuse benefit)");
+          return false;
+        }
       }
     }
 

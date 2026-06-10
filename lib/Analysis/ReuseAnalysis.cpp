@@ -145,7 +145,8 @@ bool BandReuseInfo::anyTemporalReuse() const {
 }
 
 FailureOr<BandReuseInfo>
-drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band) {
+drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band,
+                                    Operation *walkRoot) {
   if (band.empty())
     return failure();
 
@@ -170,7 +171,9 @@ drcompiler::reuse::analyzeBandReuse(ArrayRef<AffineForOp> band) {
   using Key = std::tuple<void *, AffineMap, SmallVector<Value, 4>>;
   llvm::SmallVector<std::pair<Key, unsigned>, 8> seen;
 
-  WalkResult res = band.front()->walk([&](Operation *op) -> WalkResult {
+  AffineForOp bandRoot = band.front();
+  Operation *root = walkRoot ? walkRoot : bandRoot.getOperation();
+  WalkResult res = root->walk([&](Operation *op) -> WalkResult {
     Value memref;
     AffineMap map;
     SmallVector<Value, 4> operands;

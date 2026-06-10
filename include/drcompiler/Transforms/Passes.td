@@ -196,6 +196,9 @@ def DrAffineLoopDistributePass
     Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
            "Emit a remark for every split performed and every legal split "
            "skipped by the profitability mode">,
+    Option<"cacheBytes", "cache-bytes", "int64_t", /*default=*/"524288",
+           "Cache capacity for the locality guard's evicted-reuse test "
+           "(default: half a 1 MiB private L2, matching the tiler's target)">,
   ];
 
   let dependentDialects = ["mlir::affine::AffineDialect"];

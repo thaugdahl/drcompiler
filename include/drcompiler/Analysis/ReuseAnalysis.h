@@ -105,8 +105,14 @@ struct BandReuseInfo {
 
 /// Analyze a perfect band of affine loops with constant bounds.  Fails (see
 /// file header) whenever the constant-coefficient model does not apply.
+/// `walkRoot` restricts which references are collected (default: everything
+/// under the band root) — clients evaluating a HYPOTHETICAL band, e.g. loop
+/// distribution asking "would this child nest, once isolated under these
+/// loops, carry exploitable reuse?", pass the child as walkRoot so sibling
+/// units still present in the IR don't poison the analysis.
 mlir::FailureOr<BandReuseInfo>
-analyzeBandReuse(llvm::ArrayRef<mlir::affine::AffineForOp> band);
+analyzeBandReuse(llvm::ArrayRef<mlir::affine::AffineForOp> band,
+                 mlir::Operation *walkRoot = nullptr);
 
 } // namespace reuse
 } // namespace drcompiler

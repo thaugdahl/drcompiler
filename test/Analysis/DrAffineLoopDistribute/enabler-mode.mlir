@@ -41,3 +41,29 @@ func.func @single_consumer(%A: memref<64x64xf64>, %B: memref<64x64xf64>, %C: mem
   }
   return
 }
+
+// Legal, band-deepening split whose units SHARE a read array with no
+// downstream reuse benefit (atax shape: both j-nests sweep row A[i][:], and
+// nothing in the post-split bands carries evicted temporal reuse).  The
+// fused form gets the row reuse from the cache for free; splitting refetches
+// it a full sweep later — measured distribute-regblock 0.76x on atax at
+// EXTRALARGE.  The locality guard must skip.
+
+func.func @shared_row(%A: memref<64x64xf64>, %t: memref<64xf64>, %y: memref<64xf64>) {
+  // expected-remark @below {{distribute-rationale: SKIP legal split (shared data, no reuse benefit)}}
+  affine.for %i = 0 to 64 {
+    affine.for %j = 0 to 64 {
+      %a = affine.load %A[%i, %j] : memref<64x64xf64>
+      %tv = affine.load %t[%i] : memref<64xf64>
+      %m = arith.mulf %a, %tv : f64
+      affine.store %m, %t[%i] : memref<64xf64>
+    }
+    affine.for %j = 0 to 64 {
+      %a = affine.load %A[%i, %j] : memref<64x64xf64>
+      %yv = affine.load %y[%j] : memref<64xf64>
+      %s = arith.addf %yv, %a : f64
+      affine.store %s, %y[%j] : memref<64xf64>
+    }
+  }
+  return
+}

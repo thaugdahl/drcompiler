@@ -1,4 +1,8 @@
-// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(dr-affine-loop-distribute))' | FileCheck %s
+// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(dr-affine-loop-distribute{cache-bytes=16384}))' | FileCheck %s
+//
+// cache-bytes=16384: the 64x64xf64 working sets here (a 32 KiB matrix) must
+// register as evicted reuse for the locality guard, as the EXTRALARGE-sized
+// real kernels do against the default half-L2 target.
 
 // 2mm-shaped imperfect nest: the init store and the beta-scale statement
 // (load-mul-store) inside the j body must each fission into their own
