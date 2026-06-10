@@ -172,6 +172,31 @@ def RaiseMallocToMemRefPass
   let constructor = "mlir::createRaiseMallocToMemRefPass()";
 }
 
+def DrPinLiveOutPass : Pass<"dr-pin-liveout", "mlir::ModuleOp">
+{
+  let summary = "Pin live-out memrefs against dead-code elimination";
+
+  let description = [{
+    Reads every element of each live-out memref (memref function arguments and
+    memref.alloc results) into an opaque external sink (@__dr_observe), inserted
+    after the kernel's writes (before the first dealloc, else the return).  This
+    keeps the producing stores -- hence the kernel computation -- live when the
+    PolyBench DCE guard has been suppressed for the MLIR path and an aggressive
+    backend would otherwise delete the unobserved output.
+
+    Intended to run after cgeist has preserved the kernel (cgeist -O0) and after
+    the DataRecomputation passes, before lowering.  The sink __dr_observe must be
+    linked in as an opaque function, e.g.  void __dr_observe(double){}.
+  }];
+
+  let dependentDialects = [
+    "affine::AffineDialect", "arith::ArithDialect",
+    "memref::MemRefDialect", "func::FuncDialect"
+  ];
+
+  let constructor = "mlir::createDrPinLiveOutPass()";
+}
+
 def PrintArchHandlerPass : Pass<"print-arch-handler", "mlir::ModuleOp">
 {
   let summary = "Print the architecture handler chosen for this module";

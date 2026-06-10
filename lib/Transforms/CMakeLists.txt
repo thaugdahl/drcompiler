@@ -13,6 +13,7 @@ add_mlir_library(DRCompTransforms
   DataRecomputation/Strategies/FullRemat.cpp
   DataRecomputation/Strategies/InterprocRemat.cpp
   DataRecomputation/Strategies/PartialRemat.cpp
+  DrPinLiveOut.cpp
   MemoryFission.cpp
   PrintArchHandler.cpp
   PrintRegisterPressure.cpp
@@ -36,8 +37,10 @@ add_mlir_library(DRCompTransforms
     MLIRPass
     MLIRRuntimeVerifiableOpInterface
     MLIRSCFDialect
+    MLIRFuncDialect
     MLIRAffineDialect
     MLIRAffineAnalysis
+    MLIRAffineUtils
     MLIRArithDialect
     MLIRMathDialect
     MLIRMemRefDialect

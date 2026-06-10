@@ -25,6 +25,7 @@
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #endif
 
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
@@ -185,6 +186,72 @@ struct DrAffineLoopFusionPass
 
 } // namespace
 
+// DR-DIVERGE (maximality fix): upstream ComputationSliceState::isMaximal()
+// mis-aligns constraint dimensions whenever the slice contains loops that are
+// not single-iteration equalities on destination IVs — e.g. the common outer
+// time loop of two stencil nests fused inside it, whose slice bounds are the
+// full constant range.  Its `consumerIVs` vector then has fewer real entries
+// than slice dims; the padding dims stay unconstrained in the slice set, the
+// integer-set difference src\slice comes out empty, and a NON-maximal slice
+// is reported maximal.  canRemoveSrcNodeAfterFusion then erases the src nest
+// even though the fused slice covers a strict subset of its iteration space —
+// a miscompile.  Observed on PolyBench fdtd-2d: ex-update (i in [0,1000))
+// fused into the hz nest (i in [0,999)) under the time loop loses the last
+// ex row.
+//
+// Conservative replacement used for the removal decision only: maximality is
+// decided purely from constant loop bounds; any non-constant or non-trivial
+// form is "unknown", which blocks src removal (correct, possibly redundant).
+static std::optional<bool> drIsSliceMaximal(const ComputationSliceState &slice) {
+  for (unsigned i = 0, e = slice.lbs.size(); i < e; ++i) {
+    AffineMap lbMap = slice.lbs[i];
+    AffineMap ubMap = slice.ubs[i];
+    AffineForOp srcLoop = getForInductionVarOwner(slice.ivs[i]);
+    if (!srcLoop || !srcLoop.hasConstantLowerBound() ||
+        !srcLoop.hasConstantUpperBound() || srcLoop.getStep() != 1)
+      return std::nullopt;
+    int64_t srcLb = srcLoop.getConstantLowerBound();
+    int64_t srcUb = srcLoop.getConstantUpperBound();
+    if (!lbMap || !ubMap || lbMap.getNumResults() != 1 ||
+        ubMap.getNumResults() != 1)
+      return std::nullopt;
+    AffineExpr lbExpr = lbMap.getResult(0);
+    AffineExpr ubExpr = ubMap.getResult(0);
+
+    if (auto lbConst = dyn_cast<AffineConstantExpr>(lbExpr)) {
+      auto ubConst = dyn_cast<AffineConstantExpr>(ubExpr);
+      if (!ubConst)
+        return std::nullopt;
+      // Constant slice window, executed as-is for every dst iteration:
+      // maximal in this dim iff it covers the whole src loop range.
+      if (lbConst.getValue() > srcLb || ubConst.getValue() < srcUb)
+        return false;
+      continue;
+    }
+
+    if (lbExpr + 1 == ubExpr) {
+      // Single-iteration equality with a dst IV: the union over the dst loop
+      // is the dst loop's range; maximal in this dim iff that range covers
+      // the src loop's.
+      auto dimExpr = dyn_cast<AffineDimExpr>(lbExpr);
+      if (!dimExpr)
+        return std::nullopt;
+      AffineForOp dstLoop = getForInductionVarOwner(
+          slice.lbOperands[i][dimExpr.getPosition()]);
+      if (!dstLoop || !dstLoop.hasConstantLowerBound() ||
+          !dstLoop.hasConstantUpperBound() || dstLoop.getStep() != 1)
+        return std::nullopt;
+      if (dstLoop.getConstantLowerBound() > srcLb ||
+          dstLoop.getConstantUpperBound() < srcUb)
+        return false;
+      continue;
+    }
+
+    return std::nullopt;
+  }
+  return true;
+}
+
 /// Returns true if node 'srcId' can be removed after fusing it with node
 /// 'dstId'. The node can be removed if any of the following conditions are met:
 ///   1. 'srcId' has no output dependences after fusion and no escaping memrefs.
@@ -227,7 +294,10 @@ static bool canRemoveSrcNodeAfterFusion(
   // escaping memref, we can only remove it if the fusion slice is maximal so
   // that all the dependences are preserved.
   if (hasOutDepsAfterFusion || !escapingMemRefs.empty()) {
-    std::optional<bool> isMaximal = fusionSlice.isMaximal();
+    // DR-DIVERGE (maximality fix): use the conservative constant-bounds
+    // check instead of the broken ComputationSliceState::isMaximal() (see
+    // drIsSliceMaximal above).
+    std::optional<bool> isMaximal = drIsSliceMaximal(fusionSlice);
     if (!isMaximal) {
       LDBG() << "Src loop can't be removed: can't determine "
              << "if fusion is maximal";
@@ -344,14 +414,149 @@ static void gatherEscapingMemrefs(unsigned id, const MemRefDependenceGraph &mdg,
   }
 }
 
+// DR-DIVERGE (frame-shift fix): upstream's mlir::affine::sinkSequentialLoops
+// mis-indexes dependence components whenever the band is nested under outer
+// loops.  checkMemrefAccessDependence returns one component per COMMON
+// surrounding loop, outermost first — so for a band under e.g. a stencil time
+// loop, component 0 belongs to the time loop, and every band loop reads its
+// outer neighbour's component.  On PolyBench heat-3d/fdtd-2d the store's
+// write-write self-dependence carried by the time loop (components
+// [t: >=1, i: 0, j: 0, k: 0]) lands on the parallel i-loop, mislabels it
+// sequential, and rotates the nest so the unit-stride dimension goes
+// outermost — 6-10x slowdowns, even when no fusion ends up being performed
+// (this runs unconditionally on every fusion-destination candidate).
+//
+// The local replacement below gathers dependences only at the band's own
+// depths (d in [shift+1, shift+bandDepth]) and indexes components at
+// shift+j.  Dependences carried by the enclosing loops are invariant to any
+// intra-band permutation, so excluding them is exact, not a relaxation.
+// Behaviour for top-level bands (shift == 0) is identical to upstream.
+
+// Checks each dependence component against the permutation to see if the
+// desired loop interchange would violate dependences by making the
+// dependence component lexicographically negative.  Copy of upstream's
+// static checkLoopInterchangeDependences with the band's nesting depth
+// (`shift`) applied to the component index.
+static bool
+drCheckBandInterchangeDependences(
+    const std::vector<SmallVector<DependenceComponent, 2>> &depCompsVec,
+    ArrayRef<AffineForOp> loops, ArrayRef<unsigned> loopPermMap,
+    unsigned shift) {
+  unsigned maxLoopDepth = loops.size();
+  SmallVector<unsigned, 4> loopPermMapInv;
+  loopPermMapInv.resize(maxLoopDepth);
+  for (unsigned i = 0; i < maxLoopDepth; ++i)
+    loopPermMapInv[loopPermMap[i]] = i;
+
+  for (const auto &depComps : depCompsVec) {
+    assert(depComps.size() >= shift + maxLoopDepth);
+    // Check if the first non-zero dependence component is positive.
+    // This iterates through loops in the desired order.
+    for (unsigned j = 0; j < maxLoopDepth; ++j) {
+      unsigned permIndex = loopPermMapInv[j];
+      assert(depComps[shift + permIndex].lb);
+      int64_t depCompLb = *depComps[shift + permIndex].lb;
+      if (depCompLb > 0)
+        break;
+      if (depCompLb < 0)
+        return false;
+    }
+  }
+  return true;
+}
+
+// Gathers dependence components for all load/store pairs in the perfect band
+// rooted at `bandRoot`, at the band's own loop depths only: d in
+// [shift+1, shift+bandDepth].  Dependences carried by the `shift` enclosing
+// loops are deliberately excluded — they are preserved by construction under
+// any permutation that keeps the band inside those loops.
+static void drGetBandDependenceComponents(
+    AffineForOp bandRoot, unsigned shift, unsigned bandDepth,
+    std::vector<SmallVector<DependenceComponent, 2>> *depCompsVec) {
+  SmallVector<Operation *, 8> loadAndStoreOps;
+  bandRoot->walk([&](Operation *op) {
+    if (isa<AffineReadOpInterface, AffineWriteOpInterface>(op))
+      loadAndStoreOps.push_back(op);
+  });
+
+  unsigned numOps = loadAndStoreOps.size();
+  for (unsigned d = shift + 1; d <= shift + bandDepth; ++d) {
+    for (unsigned i = 0; i < numOps; ++i) {
+      MemRefAccess srcAccess(loadAndStoreOps[i]);
+      for (unsigned j = 0; j < numOps; ++j) {
+        MemRefAccess dstAccess(loadAndStoreOps[j]);
+        SmallVector<DependenceComponent, 2> depComps;
+        DependenceResult result = checkMemrefAccessDependence(
+            srcAccess, dstAccess, d, /*dependenceConstraints=*/nullptr,
+            &depComps);
+        if (hasDependence(result))
+          depCompsVec->push_back(depComps);
+      }
+    }
+  }
+}
+
 // Sinks all sequential loops to the innermost levels (while preserving
 // relative order among them) and moves all parallel loops to the
 // outermost (while again preserving relative order among them).
 // This can increase the loop depth at which we can fuse a slice, since we are
 // pushing loop carried dependence to a greater depth in the loop nest.
+// DR-DIVERGE: frame-shift-corrected replacement for
+// mlir::affine::sinkSequentialLoops (see comment block above).
+static AffineForOp drSinkSequentialLoops(AffineForOp forOp) {
+  SmallVector<AffineForOp, 4> loops;
+  getPerfectlyNestedLoops(loops, forOp);
+  if (loops.size() < 2)
+    return forOp;
+
+  // Number of loops enclosing the band: the dependence components of every
+  // access pair inside the band start with one entry per enclosing loop.
+  unsigned shift = getNestingDepth(loops[0]);
+  unsigned maxLoopDepth = loops.size();
+  std::vector<SmallVector<DependenceComponent, 2>> depCompsVec;
+  drGetBandDependenceComponents(loops[0], shift, maxLoopDepth, &depCompsVec);
+
+  // Mark loops as either parallel or sequential.
+  SmallVector<bool, 8> isParallelLoop(maxLoopDepth, true);
+  for (auto &depComps : depCompsVec) {
+    assert(depComps.size() >= shift + maxLoopDepth);
+    for (unsigned j = 0; j < maxLoopDepth; ++j) {
+      DependenceComponent &depComp = depComps[shift + j];
+      assert(depComp.lb.has_value() && depComp.ub.has_value());
+      if (*depComp.lb != 0 || *depComp.ub != 0)
+        isParallelLoop[j] = false;
+    }
+  }
+
+  unsigned numParallelLoops = llvm::count(isParallelLoop, true);
+
+  // Compute permutation of loops that sinks sequential loops (and thus raises
+  // parallel loops) while preserving relative order.
+  SmallVector<unsigned, 4> loopPermMap(maxLoopDepth);
+  unsigned nextSequentialLoop = numParallelLoops;
+  unsigned nextParallelLoop = 0;
+  for (unsigned i = 0; i < maxLoopDepth; ++i) {
+    if (isParallelLoop[i]) {
+      loopPermMap[i] = nextParallelLoop++;
+    } else {
+      loopPermMap[i] = nextSequentialLoop++;
+    }
+  }
+
+  // Check if permutation 'loopPermMap' would violate dependences.
+  if (!drCheckBandInterchangeDependences(depCompsVec, loops, loopPermMap,
+                                         shift))
+    return forOp;
+  // Perform loop interchange according to permutation 'loopPermMap'.
+  unsigned loopNestRootIndex = permuteLoops(loops, loopPermMap);
+  return loops[loopNestRootIndex];
+}
+
 static void sinkSequentialLoops(MemRefDependenceGraph::Node *node) {
   assert(isa<AffineForOp>(node->op));
-  AffineForOp newRootForOp = sinkSequentialLoops(cast<AffineForOp>(node->op));
+  // DR-DIVERGE: call the frame-shift-corrected local version, not
+  // mlir::affine::sinkSequentialLoops.
+  AffineForOp newRootForOp = drSinkSequentialLoops(cast<AffineForOp>(node->op));
   node->op = newRootForOp;
 }
 
@@ -1155,6 +1360,36 @@ public:
         gatherProducerConsumerMemrefs(srcId, dstId, *mdg,
                                       producerConsumerMemrefs);
 
+        // DR-DIVERGE (interleaving guard): fusing relocates the src
+        // computation inside the dst loop, interleaving it with the dst
+        // body across iterations.  If the dst nest STORES to any memref the
+        // src nest accesses, later src-slice iterations read or write data
+        // the dst body already modified — an interleaving the upstream
+        // slice legality analysis demonstrably mishandles.  Observed on
+        // PolyBench lu's init: the `B[r][s] += A[r][t]*A[s][t]`
+        // accumulation (src, reads A) fused into the `A[r][s] = B[r][s]`
+        // copy nest (dst, writes A) makes row r's accumulation read rows
+        // < r of A that were already overwritten — the factorization then
+        // diverges to inf.  Skip such candidates.
+        {
+          DenseSet<Value> srcAccessed;
+          for (Operation *ld : srcNode->loads)
+            srcAccessed.insert(cast<AffineReadOpInterface>(ld).getMemRef());
+          for (Operation *st : srcNode->stores)
+            srcAccessed.insert(cast<AffineWriteOpInterface>(st).getMemRef());
+          bool dstClobbersSrcData =
+              llvm::any_of(dstNode->stores, [&](Operation *st) {
+                return srcAccessed.count(
+                           cast<AffineWriteOpInterface>(st).getMemRef()) > 0;
+              });
+          if (dstClobbersSrcData) {
+            LDBG() << "Skipping fusion: dst nest stores to a memref the src "
+                      "nest accesses; interleaving would change the values "
+                      "the relocated src computation observes";
+            continue;
+          }
+        }
+
         // Skip if 'srcNode' out edge count on any memref is greater than
         // 'maxSrcUserCount'.
         if (any_of(producerConsumerMemrefs, [&](Value memref) {
@@ -1292,6 +1527,33 @@ public:
         bool removeSrcNode = canRemoveSrcNodeAfterFusion(
             srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
             *mdg);
+
+        // DR-DIVERGE (re-execution guard): when the src nest survives
+        // fusion, the inserted slice RE-EXECUTES the src computation after
+        // the original nest already ran.  That is only sound if the slice
+        // reads the same input values the original run saw — false whenever
+        // the src updates a memref in place (reads a memref it also
+        // writes): the re-execution then reads already-updated data.
+        // Example: PolyBench fdtd-2d's `ex[i][j] -= ...` nest fused into
+        // the hz nest recomputes ex from the post-update ex, and hz
+        // consumes garbage that compounds across time steps.  Skip such
+        // candidates outright.
+        if (!removeSrcNode) {
+          DenseSet<Value> srcWrites;
+          for (Operation *st : srcNode->stores)
+            srcWrites.insert(cast<AffineWriteOpInterface>(st).getMemRef());
+          bool srcReadsItsOwnWrites =
+              llvm::any_of(srcNode->loads, [&](Operation *ld) {
+                return srcWrites.count(
+                           cast<AffineReadOpInterface>(ld).getMemRef()) > 0;
+              });
+          if (srcReadsItsOwnWrites) {
+            LDBG() << "Skipping fusion: src nest would survive fusion but "
+                      "updates a memref in place; slice re-execution would "
+                      "read already-updated data";
+            continue;
+          }
+        }
 
         DenseSet<Value> privateMemrefs;
         for (Value memref : producerConsumerMemrefs) {
