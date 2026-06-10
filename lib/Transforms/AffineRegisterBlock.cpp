@@ -172,6 +172,13 @@ static bool accumulatorAliasesInput(Block *body, Value accMemref) {
   return false;
 }
 
+/// Unit attribute the in-place triangular peel sets on the MAIN reduction
+/// loop it emits: the peel has PROVEN (from the loop bounds it constructed)
+/// that every read of the accumulator's memref in that loop is row-disjoint
+/// from the strip's accumulators, so accumulatorAliasesInput may be skipped.
+/// Never set this by hand.
+static const char kAccNoAliasAttr[] = "dr.acc_no_alias";
+
 /// Collect accumulator load/store pairs in the innermost loop `kLoop`.
 static SmallVector<Acc> collectAccumulators(AffineForOp kLoop) {
   Value kIV = kLoop.getInductionVar();
@@ -208,8 +215,11 @@ static SmallVector<Acc> collectAccumulators(AffineForOp kLoop) {
     if (!dependsOn(store.getValueToStore(), matchLoad.getResult(), body))
       continue;
     // The accumulator must not alias a multiplicand (else the reduction is not
-    // independent and reblocking is illegal -- e.g. LU).
-    if (accumulatorAliasesInput(body, store.getMemRef()))
+    // independent and reblocking is illegal -- e.g. LU).  A loop the in-place
+    // peel certified (dr.acc_no_alias) has row-disjointness proven by
+    // construction; skip the syntactic guard there.
+    if (!kLoop->hasAttr(kAccNoAliasAttr) &&
+        accumulatorAliasesInput(body, store.getMemRef()))
       continue;
     accs.push_back({matchLoad, store, store.getMemRef(), store.getAffineMap(),
                     stOps, store.getValueToStore(), store.getLoc()});
@@ -327,7 +337,8 @@ static bool findAccPair(AffineForOp loop, AffineStoreOp &outStore,
       continue;
     if (!dependsOn(store.getValueToStore(), matchLoad.getResult(), body))
       continue;
-    if (accumulatorAliasesInput(body, store.getMemRef()))
+    if (!loop->hasAttr(kAccNoAliasAttr) &&
+        accumulatorAliasesInput(body, store.getMemRef()))
       continue; // aliasing reduction (e.g. LU) -> not register-blockable
     outStore = store;
     outLoad = matchLoad;
@@ -832,6 +843,176 @@ static bool peelTriangularReduction(AffineForOp sOut, unsigned mr,
   return true;
 }
 
+/// In-place triangular reduction band with the reduction INNERMOST (the
+/// PolyBench trmm shape once dr-affine-loop-distribute has fissioned the
+/// trailing alpha-scale into its own nest):
+///     for i { for j { for k = i+c .. N { B[i][j] += A[k][i] * B[k][j] } } }
+/// The accumulator's own memref is read at row k, so accumulatorAliasesInput
+/// rightly refuses to register-block it as-is (rows of one strip read each
+/// other).  Split each mr-strip of i by the k range instead:
+///   CORNER (emitted FIRST, in ORIGINAL coordinates -- ragged bounds on real
+///           IVs, and its i2 loop carries a real dependence so Stage 3's
+///           parallel check provably skips it):
+///     for i2 = ii..ii+mr { for j { for k = i2+c .. ii+mr-1+c { red } } }
+///   MAIN  (k >= ii+mr-1+c > every strip row, so its B[k][j] reads are
+///          row-disjoint from the strip's accumulators; certified with
+///          dr.acc_no_alias so Stage 3 register-blocks it):
+///     for i' = 0..mr { for j { for k = ii+mr-1+c .. N { red(ii+i') } } }
+/// Soundness/bit-identity: per (i,j) the additions stay in ascending k order
+/// (CORNER covers the low k's first), and a row is only ever READ by rows
+/// above it, which run earlier in both schedules, so every read sees exactly
+/// the value the original schedule saw.
+static bool peelInPlaceTriangularInnermost(AffineForOp sOut, unsigned mr,
+                                           IRRewriter &rewriter) {
+  if (mr < 2)
+    return false;
+  AffineForOp sIn = onlyChildFor(sOut);
+  if (!sIn)
+    return false;
+  AffineForOp red = onlyChildFor(sIn);
+  if (!red || !isInnermost(red))
+    return false;
+  if (!sOut.hasConstantLowerBound() || !sOut.hasConstantUpperBound() ||
+      sOut.getStepAsInt() != 1 || sIn.getStepAsInt() != 1 ||
+      red.getStepAsInt() != 1)
+    return false;
+  if (!sIn.hasConstantLowerBound() || !sIn.hasConstantUpperBound())
+    return false;
+  if (!red.hasConstantUpperBound())
+    return false;
+  Value iv = sOut.getInductionVar(), jIV = sIn.getInductionVar(),
+        kIV = red.getInductionVar();
+  // Reduction lower bound must be exactly `i + c` with c >= 1 (c == 0 would
+  // make k == i read the accumulator row itself).
+  AffineMap lbMap = red.getLowerBoundMap();
+  if (lbMap.getNumResults() != 1 || red.getLowerBoundOperands().size() != 1 ||
+      red.getLowerBoundOperands()[0] != iv)
+    return false;
+  int64_t c = -1;
+  if (auto bin = dyn_cast<AffineBinaryOpExpr>(lbMap.getResult(0))) {
+    auto cst = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    if (bin.getKind() != AffineExprKind::Add || !cst ||
+        !isa<AffineDimExpr>(bin.getLHS()))
+      return false;
+    c = cst.getValue();
+  }
+  if (c < 1)
+    return false;
+
+  // Body shape: exactly one store (the accumulator, addressed [i, j]), a
+  // matching load it depends on, optional reads of OTHER memrefs, and any
+  // read of the accumulator's memref addressed EXACTLY [k, j] (the in-place
+  // multiplicand; at least one must exist or the plain peels apply).
+  Block *body = red.getBody();
+  MLIRContext *ctx = sOut.getContext();
+  AffineMap id2 = AffineMap::getMultiDimIdentityMap(2, ctx);
+  AffineStoreOp accSt;
+  for (Operation &op : body->without_terminator()) {
+    if (auto st = dyn_cast<AffineStoreOp>(&op)) {
+      if (accSt)
+        return false;
+      accSt = st;
+    } else if (!isMemoryEffectFree(&op) && !isa<AffineLoadOp>(&op)) {
+      return false;
+    }
+  }
+  if (!accSt || accSt.getAffineMap() != id2)
+    return false;
+  auto stOps = accSt.getMapOperands();
+  if (stOps.size() != 2 || stOps[0] != iv || stOps[1] != jIV)
+    return false;
+  AffineLoadOp accLd;
+  bool sawInPlaceRead = false;
+  for (Operation &op : body->without_terminator()) {
+    auto ld = dyn_cast<AffineLoadOp>(&op);
+    if (!ld || ld.getMemRef() != accSt.getMemRef())
+      continue;
+    auto ldOps = ld.getMapOperands();
+    if (ld.getAffineMap() == id2 && ldOps.size() == 2 && ldOps[0] == iv &&
+        ldOps[1] == jIV) {
+      accLd = ld;
+      continue;
+    }
+    if (ld.getAffineMap() == id2 && ldOps.size() == 2 && ldOps[0] == kIV &&
+        ldOps[1] == jIV) {
+      sawInPlaceRead = true;
+      continue;
+    }
+    return false; // any other access shape to the accumulator memref
+  }
+  if (!accLd || !sawInPlaceRead ||
+      !dependsOn(accSt.getValueToStore(), accLd.getResult(), body))
+    return false;
+
+  int64_t lo = sOut.getConstantLowerBound(), hi = sOut.getConstantUpperBound();
+  int64_t stripHi = lo + ((hi - lo) / (int64_t)mr) * (int64_t)mr;
+  if (stripHi == lo)
+    return false;
+  int64_t jlo = sIn.getConstantLowerBound(), jhi = sIn.getConstantUpperBound();
+
+  Location loc = sOut.getLoc();
+  AffineExpr d0 = getAffineDimExpr(0, ctx), d1 = getAffineDimExpr(1, ctx);
+  AffineMap idMap = AffineMap::get(1, 0, d0);
+  AffineMap addMap = AffineMap::get(2, 0, d0 + d1);
+  AffineMap addMrMap = AffineMap::get(1, 0, d0 + (int64_t)mr);
+  AffineMap mainLbMap = AffineMap::get(1, 0, d0 + (int64_t)(mr - 1) + c);
+  AffineMap kUbMap = red.getUpperBoundMap();
+  SmallVector<Value> kUbOps(red.getUpperBoundOperands());
+
+  rewriter.setInsertionPoint(sOut);
+  auto strip = rewriter.create<AffineForOp>(loc, lo, stripHi, (int64_t)mr);
+  if (stripHi != hi) {
+    rewriter.setInsertionPointAfter(strip);
+    auto epi = cast<AffineForOp>(rewriter.clone(*sOut.getOperation()));
+    epi.setConstantLowerBound(stripHi);
+  }
+  rewriter.setInsertionPointToStart(strip.getBody());
+  Value ii = strip.getInductionVar();
+
+  // CORNER: original coordinates, k = i2+c .. ii+mr-1+c.
+  auto i2L = rewriter.create<AffineForOp>(loc, ValueRange{ii}, idMap,
+                                          ValueRange{ii}, addMrMap, 1);
+  rewriter.setInsertionPointToStart(i2L.getBody());
+  auto jC = rewriter.create<AffineForOp>(loc, jlo, jhi, 1);
+  rewriter.setInsertionPointToStart(jC.getBody());
+  auto kC = rewriter.create<AffineForOp>(loc,
+                                         ValueRange{i2L.getInductionVar()},
+                                         lbMap, ValueRange{ii}, mainLbMap, 1);
+  rewriter.setInsertionPointToStart(kC.getBody());
+  {
+    IRMapping m;
+    m.map(iv, i2L.getInductionVar());
+    m.map(jIV, jC.getInductionVar());
+    m.map(kIV, kC.getInductionVar());
+    for (Operation &op : body->without_terminator())
+      rewriter.clone(op, m);
+  }
+
+  // MAIN: uniform k range, row offset inside the k body (jam-proof shape).
+  rewriter.setInsertionPointAfter(i2L);
+  auto iM = rewriter.create<AffineForOp>(loc, 0, (int64_t)mr, 1);
+  rewriter.setInsertionPointToStart(iM.getBody());
+  auto jM = rewriter.create<AffineForOp>(loc, jlo, jhi, 1);
+  rewriter.setInsertionPointToStart(jM.getBody());
+  auto kM = rewriter.create<AffineForOp>(loc, ValueRange{ii}, mainLbMap,
+                                         ValueRange(kUbOps), kUbMap, 1);
+  kM->setAttr(kAccNoAliasAttr, rewriter.getUnitAttr());
+  rewriter.setInsertionPointToStart(kM.getBody());
+  {
+    Value ni = rewriter.create<affine::AffineApplyOp>(
+        loc, addMap, ValueRange{iM.getInductionVar(), ii});
+    IRMapping m;
+    m.map(iv, ni);
+    m.map(jIV, jM.getInductionVar());
+    m.map(kIV, kM.getInductionVar());
+    for (Operation &op : body->without_terminator())
+      rewriter.clone(op, m);
+  }
+
+  rewriter.eraseOp(sOut);
+  return true;
+}
+
 /// Register-block family, selected from operand layout (OPERAND_PACKING_FINDINGS.md).
 enum class RBFamily { Broadcast, Dot };
 
@@ -1323,6 +1504,30 @@ public:
           break;
         }
       }
+    }
+
+    // In-place triangular reduction bands with the reduction innermost
+    // (PolyBench trmm after distribute fissions its alpha-scale): split each
+    // i-strip into a sequential CORNER (intra-strip k's) and a certified
+    // row-disjoint MAIN that Stage 3 register-blocks.
+    bool ipeeled = true;
+    while (ipeeled) {
+      ipeeled = false;
+      SmallVector<AffineForOp> cands;
+      func.walk([&](AffineForOp s) {
+        AffineForOp sIn = onlyChildFor(s);
+        if (!sIn)
+          return;
+        AffineForOp r = onlyChildFor(sIn);
+        if (r && isInnermost(r) &&
+            llvm::is_contained(r.getLowerBoundOperands(), s.getInductionVar()))
+          cands.push_back(s);
+      });
+      for (AffineForOp s : cands)
+        if (peelInPlaceTriangularInnermost(s, mrEff, rewriter)) {
+          ipeeled = true;
+          break;
+        }
     }
 
 
