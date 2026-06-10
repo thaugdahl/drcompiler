@@ -19,6 +19,7 @@ add_mlir_library(DRCompTransforms
   PrintArchHandler.cpp
   PrintRegisterPressure.cpp
   RaiseMallocToMemRef.cpp
+  TestReuseAnalysis.cpp
   Utils/OpDispatchUtils.cpp
   Utils/MemrefBaseAnalysis.cpp
   Utils/AllocEscapeAnalysis.cpp

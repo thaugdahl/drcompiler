@@ -5,6 +5,7 @@ add_mlir_library(DRCompAnalysis
   ArchHandlers/X86_64_AVX512.cpp
   ArchHandlers/ARM_Neon.cpp
   RegisterPressureAnalysis.cpp
+  ReuseAnalysis.cpp
   SpillStrategy.cpp
   SpillStrategies/ExcessHot.cpp
   SpillStrategies/SumExcess.cpp
@@ -14,6 +15,9 @@ add_mlir_library(DRCompAnalysis
     ${PROJECT_SOURCE_DIR}/include/drcompiler/Analysis
 
   LINK_LIBS PUBLIC
+    MLIRAffineAnalysis
+    MLIRAffineDialect
+    MLIRAffineUtils
     MLIRAnalysis
     MLIRIR
     MLIRSupport

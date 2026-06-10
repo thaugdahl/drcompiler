@@ -192,6 +192,28 @@ def DrAffineLoopDistributePass
   let constructor = "mlir::createDrAffineLoopDistributePass()";
 }
 
+def DrTestReuseAnalysisPass
+    : Pass<"dr-test-reuse-analysis", "mlir::func::FuncOp">
+{
+  let summary = "Print per-reference loop reuse classification (test only)";
+
+  let description = [{
+    Diagnostic printer for drcompiler::reuse::analyzeBandReuse.  For every
+    top-level perfect affine band it emits remarks with the per-reference
+    reuse kinds (invariant / spatial / streaming, per band loop), the
+    per-iteration footprints, and the band-level evicted-reuse verdicts the
+    tiler's profitability gate consumes.
+  }];
+
+  let options = [
+    Option<"cacheBytes", "cache-bytes", "int64_t", /*default=*/"32768",
+           "Cache capacity used for the evicted-reuse verdicts">,
+  ];
+
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+  let constructor = "mlir::createDrTestReuseAnalysisPass()";
+}
+
 def DrPinLiveOutPass : Pass<"dr-pin-liveout", "mlir::ModuleOp">
 {
   let summary = "Pin live-out memrefs against dead-code elimination";
