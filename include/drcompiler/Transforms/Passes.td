@@ -172,6 +172,26 @@ def RaiseMallocToMemRefPass
   let constructor = "mlir::createRaiseMallocToMemRefPass()";
 }
 
+def DrAffineLoopDistributePass
+    : Pass<"dr-affine-loop-distribute", "mlir::func::FuncOp">
+{
+  let summary = "Fission imperfect affine loops into perfectly nestable bands";
+
+  let description = [{
+    Classical loop distribution: an affine.for whose body contains two or
+    more top-level affine.for children (and otherwise only pure scalar ops)
+    is split into consecutive copies, one child per copy, when no dependence
+    is carried backward by the loop.  This turns PolyBench-style imperfect
+    nests (e.g. gemm's `for i { C[i][:] *= beta; for k for j C += ... }`)
+    into maximal perfect bands that affine tiling and register blocking can
+    actually operate on -- the implicit first step a polyhedral scheduler
+    (Polly) performs before tiling.
+  }];
+
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+  let constructor = "mlir::createDrAffineLoopDistributePass()";
+}
+
 def DrPinLiveOutPass : Pass<"dr-pin-liveout", "mlir::ModuleOp">
 {
   let summary = "Pin live-out memrefs against dead-code elimination";

@@ -13,6 +13,7 @@ add_mlir_library(DRCompTransforms
   DataRecomputation/Strategies/FullRemat.cpp
   DataRecomputation/Strategies/InterprocRemat.cpp
   DataRecomputation/Strategies/PartialRemat.cpp
+  DrAffineLoopDistribute.cpp
   DrPinLiveOut.cpp
   MemoryFission.cpp
   PrintArchHandler.cpp

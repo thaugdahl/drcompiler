@@ -5,6 +5,7 @@
 #include "drcompiler/Transforms/AffineLoopTile.h"
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "drcompiler/Transforms/DataRecomputation.h"
+#include "drcompiler/Transforms/DrAffineLoopDistribute.h"
 #include "drcompiler/Transforms/DrPinLiveOut.h"
 #include "drcompiler/Transforms/MemoryFission.h"
 #include "drcompiler/Transforms/PrintArchHandler.h"
