@@ -510,8 +510,15 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
       sOut.getStepAsInt() != 1)
     return false;
   int64_t lo = sOut.getConstantLowerBound(), hi = sOut.getConstantUpperBound();
-  if (mr == 0 || (hi - lo) % (int64_t)mr != 0)
+  if (mr == 0)
     return false;
+  // Strip-mine only the mr-divisible prefix [lo, stripHi); the < mr remainder
+  // rows become a scalar epilogue clone of the ORIGINAL nest (original
+  // coordinates -- the normalized form is jam-bait, see the lb-DIAG comment
+  // below).  An epilogue of a triangular nest is < mr rows: negligible time.
+  int64_t stripHi = lo + ((hi - lo) / (int64_t)mr) * (int64_t)mr;
+  if (stripHi == lo)
+    return false; // trip < mr: nothing to strip
   Value iv = sOut.getInductionVar();
   // Two triangular orientations:
   //  - upper-triangular-in-bound (syrk): `j = LB .. f(i)` — ub depends on i;
@@ -527,8 +534,9 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   if (!ubTriangular && !lbTriangular)
     return false;
   // The HEAD lower bound ii+mr must stay within the j range: require the
-  // strip cover (hi) not to exceed j's constant upper bound.
-  if (lbTriangular && hi > sIn.getConstantUpperBound())
+  // strip cover (stripHi) not to exceed j's constant upper bound (the DIAG's
+  // j runs up to ii+mr <= stripHi).
+  if (lbTriangular && stripHi > sIn.getConstantUpperBound())
     return false;
 
   MLIRContext *ctx = sOut.getContext();
@@ -630,7 +638,15 @@ static bool peelTriangularNest(AffineForOp sOut, unsigned mr,
   };
 
   rewriter.setInsertionPoint(sOut);
-  auto strip = rewriter.create<AffineForOp>(loc, lo, hi, (int64_t)mr);
+  auto strip = rewriter.create<AffineForOp>(loc, lo, stripHi, (int64_t)mr);
+  if (stripHi != hi) {
+    // Remainder epilogue: the original triangular nest over [stripHi, hi).
+    // Cloned verbatim (original IVs, ragged bound on a real IV) so Stage 3
+    // provably skips it, exactly like the pre-peel nest.
+    rewriter.setInsertionPointAfter(strip);
+    auto epi = cast<AffineForOp>(rewriter.clone(*sOut.getOperation()));
+    epi.setConstantLowerBound(stripHi);
+  }
   rewriter.setInsertionPointToStart(strip.getBody());
   Value ii = strip.getInductionVar();
   // Per-row j order stays ascending: ub-triangular runs HEAD (LB..ii) before
@@ -681,8 +697,11 @@ static bool peelTriangularReduction(AffineForOp sOut, unsigned mr,
       sOut.getStepAsInt() != 1)
     return false;
   int64_t lo = sOut.getConstantLowerBound(), hi = sOut.getConstantUpperBound();
-  if ((hi - lo) % (int64_t)mr != 0)
-    return false;
+  // Strip-mine the mr-divisible prefix; the < mr remainder rows become a
+  // scalar epilogue clone of the original nest (see peelTriangularNest).
+  int64_t stripHi = lo + ((hi - lo) / (int64_t)mr) * (int64_t)mr;
+  if (stripHi == lo)
+    return false; // trip < mr
   if (!inner.hasConstantLowerBound() || !inner.hasConstantUpperBound())
     return false;
 
@@ -733,7 +752,12 @@ static bool peelTriangularReduction(AffineForOp sOut, unsigned mr,
   };
 
   rewriter.setInsertionPoint(sOut);
-  auto strip = rewriter.create<AffineForOp>(loc, lo, hi, (int64_t)mr);
+  auto strip = rewriter.create<AffineForOp>(loc, lo, stripHi, (int64_t)mr);
+  if (stripHi != hi) {
+    rewriter.setInsertionPointAfter(strip);
+    auto epi = cast<AffineForOp>(rewriter.clone(*sOut.getOperation()));
+    epi.setConstantLowerBound(stripHi);
+  }
   rewriter.setInsertionPointToStart(strip.getBody());
   Value ii = strip.getInductionVar();
   AffineForOp mainI = buildHalf(ii, /*corner=*/false);
