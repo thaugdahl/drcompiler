@@ -127,12 +127,29 @@ j-window carries the c·i term) in original coordinates.
   + emitter design is preserved here and in git history for any future wavefront
   work. fdtd uses the EXISTING tau-only emitter, so it is unaffected.
 
+## WP3.3 fdtd-2d — WIN (commit costmodel_v4_3)
+
+**fdtd-2d XL 1.00x → 2.51x, SINK bit-identical, beats Polly's 1.35x.** The exact
+contrast with seidel that confirms the diagnosis: fdtd is **memory-bound**
+(arithmetic intensity ~0.15 flop/byte) with **no intra-phase recurrence** (each
+phase reads OTHER arrays), so the inner loops vectorize and time-tiling cuts
+real byte traffic — the win seidel could not have.
+
+New `fdtdTimeTile` path in `dr-affine-stencil-time-tile`: tau-only skew
+(`i'=i+tau, j'=j+tau`, `tau = 4t + phase`, c=0) over 4 phases with per-phase
+bands; the 1-D border (`ey[0][j]=fict[t]`) is a degenerate 2-D phase with i-band
+`[0,1)`. No new schedule math vs jacobi (just P=4). SMALL dump-diff BIT-IDENTICAL;
+lit +1 (jacobi/heat untouched). Measured optimum is small L2-resident tiles
+(Tt=16, Ts=64 → 2.51x; the L3-derived Ts~780 gave only 1.86x — hardcoded as the
+default, as the jacobi emitter does its own measured optima). XL median-of-5:
+none 8.87s, Tt=16/Ts=64 3.53s.
+
 ## Not started
 
-- **WP3.3 fdtd** (≥1.2x): 4-phase ping-pong over 3 arrays, tau-only (f=1,c=0) —
-  uses the EXISTING emitter + per-phase bands. fdtd is NOT in-place (no
-  recurrence), so unlike seidel it should be a genuine locality win. Most
-  promising remaining stencil target.
+- **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
+  says do last (perturbs the most-shared pass). Needs the `canCapture()` helper.
+- **WP6 composed config** `drcomp-v4`: now that fdtd lands, the stencil path is
+  complete enough to attempt the single composed pipeline.
 - **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
   says do last (perturbs the most-shared pass).
 - **WP6 composed config** (`drcomp-v4`): blocked on WP3.3.
