@@ -184,11 +184,11 @@ public:
         llcSharers = mm.llcSharers;
     }
 
-    SmallVector<AffineForOp> tLoops;
+    SmallVector<AffineForOp> tLoops, fdtdLoops;
     func.walk([&](AffineForOp t) {
       if (t->getParentOfType<AffineForOp>())
         return; // only top-level time loops
-      SmallVector<AffineForOp, 2> nests;
+      SmallVector<AffineForOp, 4> nests;
       for (Operation &op : t.getBody()->without_terminator()) {
         if (auto f = dyn_cast<AffineForOp>(&op))
           nests.push_back(f);
@@ -197,10 +197,14 @@ public:
       }
       if (nests.size() == 2)
         tLoops.push_back(t);
+      else if (nests.size() == 4)
+        fdtdLoops.push_back(t); // 4-phase stencil (fdtd-2d)
     });
 
     for (AffineForOp t : tLoops)
       (void)timeTile(t);
+    for (AffineForOp t : fdtdLoops)
+      (void)fdtdTimeTile(t);
   }
 
 private:
@@ -345,6 +349,241 @@ private:
     };
     emitPhase(n1, 0);
     emitPhase(n2, 1);
+
+    rewriter.eraseOp(t);
+    return success();
+  }
+
+  // fdtd-2d (COSTMODEL_V4_SPEC §4.3): a time loop with FOUR phases over three
+  // 2-D arrays + a 1-D source.  All inter-phase dependences have virtual-time
+  // distance >= 1 at halo <= 1, so the tau-ONLY skew (i'=i+tau, j'=j+tau with
+  // tau = P*t + phase, P=4, c=0) makes every distance non-negative -- no new
+  // schedule math vs jacobi, only (a) per-phase space bands and (b) the 1-D
+  // border phase modelled as a degenerate 2-D phase with i-band [row, row+1).
+  // fdtd is memory-bound (arithmetic intensity ~0.15 flop/byte) with no
+  // intra-phase recurrence, so the inner loops vectorize and time-tiling cuts
+  // real byte traffic.  Emitted in ORIGINAL coordinates; windows partition the
+  // skewed space exactly -> BIT-identical.
+  LogicalResult fdtdTimeTile(AffineForOp t) {
+    if (!t.hasConstantLowerBound() || !t.hasConstantUpperBound() ||
+        t.getStepAsInt() != 1)
+      return failure();
+    SmallVector<AffineForOp, 4> roots;
+    for (Operation &op : t.getBody()->without_terminator())
+      if (auto f = dyn_cast<AffineForOp>(&op))
+        roots.push_back(f);
+    if (roots.size() != 4)
+      return failure();
+
+    // A subscript is `IV + c`; record (which IV, c).  Returns false on any
+    // non-affine / symbol / multi-dim subscript.
+    auto decode = [&](AffineExpr e, ValueRange ops, Value &iv,
+                      int64_t &c) -> bool {
+      c = 0;
+      AffineExpr dim = e;
+      if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
+        if (bin.getKind() != AffineExprKind::Add)
+          return false;
+        auto cst = dyn_cast<AffineConstantExpr>(bin.getRHS());
+        if (!cst)
+          return false;
+        c = cst.getValue();
+        dim = bin.getLHS();
+      }
+      if (auto cst = dyn_cast<AffineConstantExpr>(dim)) {
+        iv = nullptr;
+        c = cst.getValue();
+        return true;
+      }
+      auto dd = dyn_cast<AffineDimExpr>(dim);
+      if (!dd)
+        return false;
+      iv = ops[dd.getPosition()];
+      return true;
+    };
+
+    struct Phase {
+      bool border;
+      AffineForOp iLoop, jLoop; // iLoop null for border
+      int64_t slo[2], shi[2];   // per-dim space band
+      Block *body;
+    };
+    SmallVector<Phase, 4> ph;
+    int nBorder = 0;
+    for (AffineForOp r : roots) {
+      SpaceNest n;
+      if (!matchSpaceNest(r, n))
+        return failure();
+      Phase x;
+      if (n.loops.size() == 2) {
+        // 2-D phase: store at (i,j) offset 0, every i/j-indexed load halo <= 1.
+        x.border = false;
+        x.iLoop = n.loops[0];
+        x.jLoop = n.loops[1];
+        x.body = x.jLoop.getBody();
+        Value iIV = x.iLoop.getInductionVar(), jIV = x.jLoop.getInductionVar();
+        AffineStoreOp store;
+        for (Operation &op : x.body->without_terminator()) {
+          if (auto ld = dyn_cast<AffineLoadOp>(&op)) {
+            if (ld.getAffineMap().getNumResults() != 2)
+              return failure();
+            for (unsigned d = 0; d < 2; ++d) {
+              Value iv;
+              int64_t c;
+              if (!decode(ld.getAffineMap().getResult(d), ld.getMapOperands(),
+                          iv, c))
+                return failure();
+              if ((iv == iIV || iv == jIV) && (c < -1 || c > 1))
+                return failure(); // halo > 1 -> tau-only skew illegal
+            }
+          } else if (auto st = dyn_cast<AffineStoreOp>(&op)) {
+            if (store || st.getAffineMap().getNumResults() != 2)
+              return failure();
+            Value iv0, iv1;
+            int64_t c0, c1;
+            if (!decode(st.getAffineMap().getResult(0), st.getMapOperands(),
+                        iv0, c0) ||
+                !decode(st.getAffineMap().getResult(1), st.getMapOperands(),
+                        iv1, c1))
+              return failure();
+            if (iv0 != iIV || iv1 != jIV || c0 != 0 || c1 != 0)
+              return failure();
+            store = st;
+          } else if (!isMemoryEffectFree(&op)) {
+            return failure();
+          }
+        }
+        if (!store)
+          return failure();
+        x.slo[0] = x.iLoop.getConstantLowerBound();
+        x.shi[0] = x.iLoop.getConstantUpperBound();
+        x.slo[1] = x.jLoop.getConstantLowerBound();
+        x.shi[1] = x.jLoop.getConstantUpperBound();
+      } else if (n.loops.size() == 1) {
+        // 1-D border: for j { A[row][j] = f(...) } -- row is a constant.
+        x.border = true;
+        ++nBorder;
+        x.iLoop = nullptr;
+        x.jLoop = n.loops[0];
+        x.body = x.jLoop.getBody();
+        Value jIV = x.jLoop.getInductionVar();
+        AffineStoreOp store;
+        for (Operation &op : x.body->without_terminator())
+          if (auto st = dyn_cast<AffineStoreOp>(&op)) {
+            if (store || st.getAffineMap().getNumResults() != 2)
+              return failure();
+            Value iv0, iv1;
+            int64_t row, c1;
+            if (!decode(st.getAffineMap().getResult(0), st.getMapOperands(),
+                        iv0, row) ||
+                !decode(st.getAffineMap().getResult(1), st.getMapOperands(),
+                        iv1, c1))
+              return failure();
+            if (iv0 != nullptr || iv1 != jIV || c1 != 0)
+              return failure(); // first index must be a constant row
+            store = st;
+            x.slo[0] = row;
+            x.shi[0] = row + 1;
+          }
+        if (!store)
+          return failure();
+        x.slo[1] = x.jLoop.getConstantLowerBound();
+        x.shi[1] = x.jLoop.getConstantUpperBound();
+      } else {
+        return failure();
+      }
+      ph.push_back(x);
+    }
+    if (nBorder != 1)
+      return failure();
+
+    const int64_t P = 4;
+    int64_t minSlo[2] = {INT64_MAX, INT64_MAX}, maxShi[2] = {INT64_MIN,
+                                                             INT64_MIN};
+    for (auto &x : ph)
+      for (int k = 0; k < 2; ++k) {
+        minSlo[k] = std::min(minSlo[k], x.slo[k]);
+        maxShi[k] = std::max(maxShi[k], x.shi[k]);
+      }
+
+    // Profitability: time-tile only when one full sweep (all distinct arrays)
+    // overflows the effective LLC.  Estimate arrays touched = 3 (ex/ey/hz).
+    if (!forceTile) {
+      int64_t pts = (maxShi[0] - minSlo[0]) * (maxShi[1] - minSlo[1]);
+      int64_t sweepBytes = 3 * pts * 8;
+      int64_t effLLC = (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
+      if (sweepBytes <= effLLC)
+        return failure();
+    }
+
+    int64_t tlo = t.getConstantLowerBound(), thi = t.getConstantUpperBound();
+    // Measured XL optima (fdtd-2d 2000x2600x1000): Tt=16, Ts=64 -> 2.51x.
+    // The skew slack is P*Tt = 4*Tt per dim (twice jacobi's), so the tile must
+    // stay L2-resident across the band -- a SMALL Ts (~64) beats the L3-derived
+    // strip (Ts~780 gave only 1.86x: the per-tile working set then fits only the
+    // shared L3, not the private L2, so there is far less reuse).  Hardcoded as
+    // the jacobi emitter does its own measured optima; override with tile-t/-s.
+    int64_t Tt = tileT ? std::max<int64_t>(1, tileT) : 16;
+    int64_t Ts = tileS ? tileS : 64;
+    Ts = std::max<int64_t>(8, Ts);
+
+    MLIRContext *ctx = t.getContext();
+    Location loc = t.getLoc();
+    IRRewriter rewriter(ctx);
+    rewriter.setInsertionPoint(t);
+    AffineExpr d0 = getAffineDimExpr(0, ctx), d1 = getAffineDimExpr(1, ctx);
+    auto C = [&](int64_t v) { return getAffineConstantExpr(v, ctx); };
+
+    // tt = tlo .. thi step Tt
+    auto ttL = rewriter.create<AffineForOp>(loc, tlo, thi, Tt);
+    rewriter.setInsertionPointToStart(ttL.getBody());
+    Value tt = ttL.getInductionVar();
+    // ii = minSloI + P*tt .. maxShiI + P*tt + P*Tt + P step Ts (union band)
+    auto iiL = rewriter.create<AffineForOp>(
+        loc, ValueRange{tt}, AffineMap::get(1, 0, C(minSlo[0]) + P * d0),
+        ValueRange{tt}, AffineMap::get(1, 0, C(maxShi[0] + P * Tt + P) + P * d0),
+        Ts);
+    rewriter.setInsertionPointToStart(iiL.getBody());
+    Value ii = iiL.getInductionVar();
+    auto jjL = rewriter.create<AffineForOp>(
+        loc, ValueRange{tt}, AffineMap::get(1, 0, C(minSlo[1]) + P * d0),
+        ValueRange{tt}, AffineMap::get(1, 0, C(maxShi[1] + P * Tt + P) + P * d0),
+        Ts);
+    rewriter.setInsertionPointToStart(jjL.getBody());
+    Value jj = jjL.getInductionVar();
+    // t' = tt .. min(tt+Tt, thi)
+    auto tL = rewriter.create<AffineForOp>(
+        loc, ValueRange{tt}, AffineMap::get(1, 0, d0), ValueRange{tt},
+        AffineMap::get(1, 0, {d0 + Tt, C(thi)}, ctx), 1);
+    rewriter.setInsertionPointToStart(tL.getBody());
+    Value tnew = tL.getInductionVar();
+    Value tileIV[2] = {ii, jj};
+
+    // Emit each phase at its virtual time tau = P*t' + p, windowed per dim:
+    //   lb = max(slo_pk, tileIV_k - P*t' - p), ub = min(shi_pk, +Ts ...).
+    for (auto [p, x] : llvm::enumerate(ph)) {
+      OpBuilder::InsertionGuard g(rewriter);
+      Value cur[2];
+      for (int k = 0; k < 2; ++k) {
+        AffineMap lb = AffineMap::get(
+            2, 0, {C(x.slo[k]), d0 - P * d1 - (int64_t)p}, ctx);
+        AffineMap ub = AffineMap::get(
+            2, 0, {C(x.shi[k]), d0 + Ts - P * d1 - (int64_t)p}, ctx);
+        auto L = rewriter.create<AffineForOp>(
+            loc, ValueRange{tileIV[k], tnew}, lb, ValueRange{tileIV[k], tnew},
+            ub, 1);
+        cur[k] = L.getInductionVar();
+        rewriter.setInsertionPointToStart(L.getBody());
+      }
+      // Clone the phase body, remapping (t, i?, j) to (tnew, cur[0], cur[1]).
+      IRMapping map;
+      map.map(t.getInductionVar(), tnew);
+      if (!x.border)
+        map.map(x.iLoop.getInductionVar(), cur[0]);
+      map.map(x.jLoop.getInductionVar(), cur[1]);
+      for (Operation &op : x.body->without_terminator())
+        rewriter.clone(op, map);
+    }
 
     rewriter.eraseOp(t);
     return success();
