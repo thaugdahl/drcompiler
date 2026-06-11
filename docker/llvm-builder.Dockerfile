@@ -100,7 +100,8 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
       && cmake --install /build/llvm; \
     else \
       cmake -G Ninja -S /src/llvm/llvm -B /build/llvm \
-        -DLLVM_ENABLE_PROJECTS="clang;mlir" \
+        -DLLVM_ENABLE_PROJECTS="clang;mlir;polly" \
+        -DLLVM_POLLY_LINK_INTO_TOOLS=ON \
         -DLLVM_TARGETS_TO_BUILD="host" \
         -DLLVM_ENABLE_ASSERTIONS=ON \
         -DLLVM_ENABLE_RTTI=ON \
