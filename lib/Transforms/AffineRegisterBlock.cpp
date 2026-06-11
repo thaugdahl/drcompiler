@@ -363,8 +363,21 @@ static AffineForOp findReductionLoopUnder(Operation *root) {
   root->walk([&](AffineForOp loop) {
     if (found || !isInnermost(loop))
       return;
-    if (!collectAccumulators(loop).empty())
-      found = loop;
+    SmallVector<Acc> accs = collectAccumulators(loop);
+    if (accs.empty())
+      return;
+    // Skip purely rank-0 (scalar) reductions.  They are never register-block
+    // targets -- Stage 2 excludes them (addrDependsOnIV is false on a rank-0
+    // store) -- and must not SHADOW a real >=1D reduction during the post-jam
+    // re-find: symm emits a scatter band (rank-2 acc, branch B) next to a
+    // temp2 scalar reduction (rank-0, branch A); walk order hits temp2 first,
+    // so without this guard Stage 3 would re-find temp2 and leave the scatter
+    // band unblocked (the rank-0 slice of the v3 Stage-3 cross-talk bug).
+    if (llvm::all_of(accs, [](const Acc &a) {
+          return cast<MemRefType>(a.memref.getType()).getRank() == 0;
+        }))
+      return;
+    found = loop;
   });
   return found;
 }
@@ -455,6 +468,171 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
   }
   rewriter.eraseOp(iLoop);
   return newLoops;
+}
+
+/// WP4 (COSTMODEL_V4_SPEC §5): raise the PolyBench symm scatter into a
+/// register-blockable triangular reduction.  Matches the j-body
+///   for i { for j {
+///     store 0 -> t (rank-0 acc)                  // temp2 = 0
+///     for k = 0 .. i {                           // triangular ub = i
+///       M[k][j] = M[k][j] + s(i,j,k)             // SCATTER (addr varies in k,
+///       t       = t       + r(i,j,k)             //          invariant in i)
+///     }                                          // t: rank-0 reduction (scalar)
+///     <epilogue ops, incl. M[i][j] = f(t, M[i][j], ...)>
+///   } }
+/// splitting it IN PLACE into:
+///   (A) the original nest with the scatter store + its exclusive feeders
+///       removed -- temp2 and the epilogue stay, unchanged and scalar; and
+///   (B) a fresh, already-i-innermost scatter nest inserted AFTER (A):
+///         for k = 0..N { for j { for i = k+1..N { M[k][j] += s(i,j,k) } } }
+///       which the existing in-place triangular register-blocker (Stage 1c) +
+///       broadcast vectorizer then crush (verified: the hand-interchanged nest
+///       register-blocks to an mr x vl vector micro-kernel).
+/// Bit-identical: a scatter into row r accumulates contributions only from
+/// i>r, which in the original outer-i order all run AFTER row r's epilogue (the
+/// epilogue at i=r reads M[r][j] before any i>r scatter touches row r); so
+/// emitting branch A (all epilogues) before branch B (all scatters) preserves
+/// every M dependence.  temp2 reads only inputs (B,A), so fissioning it from the
+/// scatter is trivially legal.
+static bool raiseSymmScatter(func::FuncOp func, IRRewriter &rewriter) {
+  // Match candidates without mutating during the walk.
+  SmallVector<AffineForOp> iCands;
+  func.walk([&](AffineForOp iLoop) {
+    AffineForOp jLoop = onlyChildFor(iLoop);
+    if (!jLoop)
+      return; // bounds may be parametric (cgeist -O0): only need affine maps
+    // A single inner k-loop, triangular (ub depends on i).
+    AffineForOp kLoop;
+    for (Operation &op : jLoop.getBody()->without_terminator())
+      if (auto f = dyn_cast<AffineForOp>(&op)) {
+        if (kLoop)
+          return; // >1 inner loop -> not the symm shape
+        kLoop = f;
+      }
+    if (!kLoop || !isInnermost(kLoop))
+      return;
+    bool tri = false;
+    for (Value o : kLoop.getUpperBoundOperands())
+      tri |= valueDependsOnIV(o, iLoop.getInductionVar());
+    if (tri)
+      iCands.push_back(iLoop);
+  });
+
+  bool changed = false;
+  for (AffineForOp iLoop : iCands) {
+    AffineForOp jLoop = onlyChildFor(iLoop);
+    AffineForOp kLoop;
+    for (Operation &op : jLoop.getBody()->without_terminator())
+      if (auto f = dyn_cast<AffineForOp>(&op))
+        kLoop = f;
+    Value iIV = iLoop.getInductionVar(), jIV = jLoop.getInductionVar(),
+          kIV = kLoop.getInductionVar();
+    Block *kBody = kLoop.getBody();
+
+    // Find THE scatter store (a >=2D store whose address varies in k but not in
+    // i) with a matching same-address load it reduces into, AND require a
+    // separate rank-0 reduction (temp2) so this fires only on the symm shape.
+    AffineStoreOp scatter;
+    bool hasRank0Reduction = false, twoScatters = false;
+    for (Operation &op : kBody->without_terminator()) {
+      auto st = dyn_cast<AffineStoreOp>(&op);
+      if (!st)
+        continue;
+      auto mrTy = cast<MemRefType>(st.getMemRef().getType());
+      if (mrTy.getRank() == 0) {
+        hasRank0Reduction = true;
+        continue;
+      }
+      if (!addrDependsOnIV(st, kIV) || !addrDependsOnIV(st, jIV) ||
+          addrDependsOnIV(st, iIV))
+        continue;
+      SmallVector<Value> stOps(st.getMapOperands().begin(),
+                               st.getMapOperands().end());
+      AffineLoadOp matchLoad;
+      for (Operation &op2 : kBody->without_terminator())
+        if (auto ld = dyn_cast<AffineLoadOp>(&op2)) {
+          SmallVector<Value> ldOps(ld.getMapOperands().begin(),
+                                   ld.getMapOperands().end());
+          if (sameAccess(ld.getMemRef(), ld.getAffineMap(), ldOps,
+                         st.getMemRef(), st.getAffineMap(), stOps)) {
+            matchLoad = ld;
+            break;
+          }
+        }
+      if (!matchLoad || !dependsOn(st.getValueToStore(), matchLoad.getResult(),
+                                   kBody))
+        continue;
+      if (scatter)
+        twoScatters = true;
+      scatter = st;
+    }
+    if (!scatter || twoScatters || !hasRank0Reduction)
+      continue;
+
+    // --- Build branch B: for k2=lb_i..ub_i { for j2 { for i2=k2+1..ub_i {
+    // scatter } } }.  Bounds may be parametric (cgeist -O0 keeps n/m symbolic):
+    // copy the i- and j-loops' affine bound maps + operands verbatim.  i's
+    // bound operands are defined before the i-loop, so they dominate the new
+    // nest inserted right after it.
+    MLIRContext *ctx = func.getContext();
+    Location loc = scatter.getLoc();
+    rewriter.setInsertionPointAfter(iLoop);
+    auto kB = rewriter.create<AffineForOp>(
+        loc, iLoop.getLowerBoundOperands(), iLoop.getLowerBoundMap(),
+        iLoop.getUpperBoundOperands(), iLoop.getUpperBoundMap(),
+        iLoop.getStepAsInt());
+    rewriter.setInsertionPoint(kB.getBody()->getTerminator());
+    auto jB = rewriter.create<AffineForOp>(
+        loc, jLoop.getLowerBoundOperands(), jLoop.getLowerBoundMap(),
+        jLoop.getUpperBoundOperands(), jLoop.getUpperBoundMap(),
+        jLoop.getStepAsInt());
+    rewriter.setInsertionPoint(jB.getBody()->getTerminator());
+    // i2 lower bound = k2 + 1 (triangular); upper bound = i's upper bound.
+    AffineMap lbMap = AffineMap::get(1, 0, getAffineDimExpr(0, ctx) + 1);
+    auto iB = rewriter.create<AffineForOp>(
+        loc, ValueRange{kB.getInductionVar()}, lbMap,
+        iLoop.getUpperBoundOperands(), iLoop.getUpperBoundMap(),
+        kLoop.getStepAsInt());
+
+    // Backward cone of the scatter within the k-body (value + address feeders).
+    llvm::SmallPtrSet<Operation *, 16> cone;
+    SmallVector<Value> work{scatter.getValueToStore()};
+    work.append(scatter.getMapOperands().begin(),
+                scatter.getMapOperands().end());
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      Operation *d = v.getDefiningOp();
+      if (!d || d->getBlock() != kBody || !cone.insert(d).second)
+        continue;
+      for (Value o : d->getOperands())
+        work.push_back(o);
+    }
+    // Clone the cone (in body order) + the scatter store into i2's body, with
+    // the original (i,j,k) IVs remapped to the new (i2,j2,k2).
+    IRMapping map;
+    map.map(iIV, iB.getInductionVar());
+    map.map(jIV, jB.getInductionVar());
+    map.map(kIV, kB.getInductionVar());
+    rewriter.setInsertionPoint(iB.getBody()->getTerminator());
+    for (Operation &op : kBody->without_terminator())
+      if (cone.count(&op) || &op == scatter.getOperation())
+        rewriter.clone(op, map);
+
+    // --- Prune branch A: erase the scatter store, then its now-dead feeders.
+    rewriter.eraseOp(scatter);
+    bool erased = true;
+    while (erased) {
+      erased = false;
+      for (Operation &op : llvm::make_early_inc_range(
+               kBody->without_terminator()))
+        if (cone.count(&op) && op.use_empty()) {
+          rewriter.eraseOp(&op);
+          erased = true;
+        }
+    }
+    changed = true;
+  }
+  return changed;
 }
 
 /// One canonicalization step: if an innermost loop holds an accumulator whose
@@ -1429,6 +1607,12 @@ public:
       if (!llcSharers.hasValue())
         llcSharers = mm.llcSharers;
     }
+
+    // Stage 0 (WP4): raise the symm scatter into a register-blockable
+    // triangular reduction (fission temp2/epilogue from the scatter + emit the
+    // scatter already interchanged to i-innermost).  No-op on every other
+    // kernel (gated on a rank-0 reduction co-resident with a k-scattered store).
+    raiseSymmScatter(func, rewriter);
 
     // Stage 1: canonicalize reduction nests so the reduction loop is innermost
     // (handles the PolyBench i-k-j order via k<->j interchange).
