@@ -144,12 +144,57 @@ lit +1 (jacobi/heat untouched). Measured optimum is small L2-resident tiles
 default, as the jacobi emitter does its own measured optima). XL median-of-5:
 none 8.87s, Tt=16/Ts=64 3.53s.
 
+## WP5 gramschmidt — spec mechanism OVERTURNED by spike; right lever found
+
+**The spec's prescribed mechanism (block-interleave distribute) is WRONG.**
+Confirmed current state: none 31.6s, distribute+regblock 20.2s = **1.57x**
+(matches v3's 1.56x); distribute fully splits the j-loop into 3 (init / dot /
+A-update), streaming A column-major twice.
+
+Spike (micro-benchmark of the dot + A-update inner kernel, proper timescale):
+
+| variant | inner-kernel | full-kernel (N=1200) |
+|---|---|---|
+| split (column-major, current) | 1.0x | 1.0x |
+| **block-interleave (spec WP5)** | **1.38x** | — |
+| **rowmajor (loop interchange, j inner)** | **3.3x** | **8.4x** |
+| rowmajor + block | 4.5x | — |
+
+The dot `R[k][j] += Q[i][k]*A[i][j]` (sum over i) and A-update
+`A[i][j] -= Q[i][k]*R[k][j]` both stream A with the reduction/inner loop i in
+the ROW position -> column-major, 8 useful bytes per 64-byte line.  Block-
+interleave keeps the same column-major inner loop (only 1.38x); **loop
+interchange to i-outer / j-inner makes A row-major (stride 1)** -> 3.3x on the
+kernel, **8.4x on the full inner work**, and BIT-IDENTICAL (the i-accumulation
+order is unchanged, checksums match).  Even after Amdahl + the norm/normalize,
+this comfortably clears the 1.9x bar.
+
+**Why this isn't yet committed (the real difficulty):** a safe implementation
+must (a) distinguish BLAS-2 (gramschmidt's dot: a SEQUENTIAL outer sweep k, one
+free dim, no register reuse -> row-major streaming wins) from BLAS-3 (GEMM: two
+PARALLEL spatial loops i,j -> column-major-in-k + register-blocking is correct);
+a general "interchange column-major reductions" pass would BREAK GEMM/2mm/3mm.
+The clean gate is "enclosing sweep is NOT loop-parallel"; AND (b) it must
+integrate with `canonicalizeOnce`, which currently FORCES the reduction
+innermost (re-creating the column-major form) -- a naive post-distribute
+interchange is simply reverted.  So the fix is: teach `canonicalizeOnce` (or the
+family-select) to prefer the row-major orientation for a BLAS-2 reduction under
+a sequential sweep, instead of the reduction-innermost orientation.  That is a
+change to the shared register-block canonicalization with GEMM-family blast
+radius -- it needs its own validated session (gramschmidt win + GEMM / 2mm / 3mm
+/ syrk / trmm no-regression + atax / bicg / covariance check), not a rushed edit
+at the end of this one.
+
+Spike artifacts: `/tmp/fuseinv/gs_spike.c` (inner kernel), `gs_full.c` (full
+kernel) -- reproduce the table above.
+
 ## Not started
 
-- **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
-  says do last (perturbs the most-shared pass). Needs the `canCapture()` helper.
-- **WP6 composed config** `drcomp-v4`: now that fdtd lands, the stencil path is
-  complete enough to attempt the single composed pipeline.
+- **WP5 implementation**: BLAS-2 row-major interchange (gate: sequential sweep)
+  woven into `canonicalizeOnce`. Direction validated above; needs a dedicated
+  session for the GEMM-family no-regression sweep.
+- **WP6 composed config** `drcomp-v4`: the stencil + symm paths now land; attempt
+  the single composed pipeline (within 5% of per-kernel best-ours on all 29).
 - **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
   says do last (perturbs the most-shared pass).
 - **WP6 composed config** (`drcomp-v4`): blocked on WP3.3.
