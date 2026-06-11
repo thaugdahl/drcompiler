@@ -635,6 +635,70 @@ static bool raiseSymmScatter(func::FuncOp func, IRRewriter &rewriter) {
   return changed;
 }
 
+/// WP5 (COSTMODEL_V4_SPEC §6 — the spec's block-interleave mechanism, replaced
+/// after a spike showed it only buys 1.38x vs 8.4x for this): interchange a
+/// BLAS-2 column-major streaming nest to row-major.  A perfect 2-loop nest
+///   for outer { for inner: ... M[inner][outer] ... }
+/// reads the 2-D array M with the INNER loop in the ROW position -> stride =
+/// row length (column-major; 8 useful bytes per 64-byte line).  When the nest
+/// sits under a SEQUENTIAL outer sweep it is NOT a register-blockable BLAS-3
+/// tile (GEMM/syrk/covariance have a PARALLEL spatial sweep there and must keep
+/// the reduction innermost for register reuse), so interchanging to
+///   for inner { for outer: ... M[inner][outer] ... }
+/// makes M stride-1 (row-major).  Measured: gramschmidt's dot + A-update go
+/// column->row-major for an 8.4x inner-kernel speedup, BIT-identical (the
+/// reduction's accumulation order over the now-outer loop is preserved).  LLVM
+/// then vectorizes the stride-1 inner loop; the register-block stages leave
+/// these nests alone (after interchange the innermost loop carries no
+/// loop-invariant accumulator).
+static bool interchangeBlas2RowMajor(func::FuncOp func) {
+  SmallVector<std::pair<AffineForOp, AffineForOp>> work; // (outer, inner)
+  func.walk([&](AffineForOp inner) {
+    if (!isInnermost(inner))
+      return;
+    AffineForOp outer = inner->getParentOfType<AffineForOp>();
+    if (!outer || onlyChildFor(outer) != inner)
+      return; // need a perfect 2-loop nest
+    AffineForOp sweep = outer->getParentOfType<AffineForOp>();
+    if (!sweep || affine::isLoopParallel(sweep))
+      return; // a parallel enclosing sweep => BLAS-3 tile; leave for reg-block
+    // The inner (streamed) loop must be rectangular.  A TRIANGULAR inner loop
+    // (bound depends on an outer IV, e.g. trmm/lu's `k = i+1..N`) is an in-place
+    // triangular reduction the peel register-blocks -- interchanging it would
+    // break that 16x path.  gramschmidt's streamed loop is a plain `0..M`.
+    if (!inner.hasConstantLowerBound() || !inner.hasConstantUpperBound())
+      return;
+    Value iIV = inner.getInductionVar(), oIV = outer.getInductionVar();
+    // Look for a 2-D access M[inner][outer]: inner IV in the row dim, outer IV
+    // in the column dim -> the inner loop strides M by a full row.
+    bool colMajor = false;
+    auto check = [&](AffineMap m, ValueRange ops) {
+      if (m.getNumResults() != 2)
+        return;
+      auto r0 = dyn_cast<AffineDimExpr>(m.getResult(0));
+      auto r1 = dyn_cast<AffineDimExpr>(m.getResult(1));
+      if (r0 && r1 && ops[r0.getPosition()] == iIV &&
+          ops[r1.getPosition()] == oIV)
+        colMajor = true;
+    };
+    inner.getBody()->walk([&](Operation *op) {
+      if (auto ld = dyn_cast<AffineLoadOp>(op))
+        check(ld.getAffineMap(), ld.getMapOperands());
+      else if (auto st = dyn_cast<AffineStoreOp>(op))
+        check(st.getAffineMap(), st.getMapOperands());
+    });
+    if (!colMajor)
+      return;
+    SmallVector<AffineForOp, 2> band{outer, inner};
+    if (!affine::isValidLoopInterchangePermutation(band, {1, 0}))
+      return;
+    work.push_back({outer, inner});
+  });
+  for (auto [outer, inner] : work)
+    affine::interchangeLoops(outer, inner);
+  return !work.empty();
+}
+
 /// One canonicalization step: if an innermost loop holds an accumulator whose
 /// address varies in the innermost loop but is invariant in an enclosing loop
 /// (the reduction loop, e.g. the `k` of a PolyBench i-k-j GEMM), interchange
@@ -1618,6 +1682,13 @@ public:
     // (handles the PolyBench i-k-j order via k<->j interchange).
     while (canonicalizeOnce(func))
       ;
+
+    // Stage 1.5 (WP5): interchange BLAS-2 column-major streaming nests under a
+    // SEQUENTIAL outer sweep to row-major (gramschmidt's dot + A-update).  Runs
+    // AFTER canonicalizeOnce (which leaves these already-inner-reduction nests
+    // untouched) so nothing reverts it; the result is inert to the BLAS-3
+    // register-block stages below.
+    interchangeBlas2RowMajor(func);
 
     // Stage 1a: family selection.  The transform is identical for both BLAS-3
     // families, but the operand layout dictates which LLVM vectorization

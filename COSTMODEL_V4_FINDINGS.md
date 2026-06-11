@@ -169,7 +169,21 @@ kernel, **8.4x on the full inner work**, and BIT-IDENTICAL (the i-accumulation
 order is unchanged, checksums match).  Even after Amdahl + the norm/normalize,
 this comfortably clears the 1.9x bar.
 
-**Why this isn't yet committed (the real difficulty):** a safe implementation
+**IMPLEMENTED (commit costmodel_v4_4): gramschmidt 1.56x -> 8.9x, SINK
+bit-identical** — far beyond the 1.9x bar (the real lever was 5x better than the
+spec's block-interleave).  `interchangeBlas2RowMajor` runs as a Stage-1.5 step
+in affine-register-block (after canonicalizeOnce, so nothing reverts it) and
+interchanges the column-major BLAS-2 nest to row-major.  Gate that protects the
+register-blocked BLAS-3 family: (a) enclosing sweep NOT loop-parallel
+(gramschmidt's k is sequential; GEMM/syrk/covariance have a parallel sweep ->
+skipped), (b) inner loop CONSTANT bounds (trmm/lu's triangular inner reduction
+is the peel's 16x path -> skipped), (c) the M[inner][outer] column-major pattern,
+(d) dependence-legal interchange.  No regression: gemm/2mm/3mm/syrk/syr2k/trmm/
+covariance/correlation vector-op counts identical; atax/bicg/mvt untouched.  XL
+median-of-5: none 31.2s -> 3.50s (distribute-RB-tile) / 3.38s (distribute-tile-RB).
+
+Historical note — why the spec's mechanism was abandoned (the real difficulty):
+a safe implementation
 must (a) distinguish BLAS-2 (gramschmidt's dot: a SEQUENTIAL outer sweep k, one
 free dim, no register reuse -> row-major streaming wins) from BLAS-3 (GEMM: two
 PARALLEL spatial loops i,j -> column-major-in-k + register-blocking is correct);
@@ -190,11 +204,11 @@ kernel) -- reproduce the table above.
 
 ## Not started
 
-- **WP5 implementation**: BLAS-2 row-major interchange (gate: sequential sweep)
-  woven into `canonicalizeOnce`. Direction validated above; needs a dedicated
-  session for the GEMM-family no-regression sweep.
-- **WP6 composed config** `drcomp-v4`: the stencil + symm paths now land; attempt
-  the single composed pipeline (within 5% of per-kernel best-ours on all 29).
+- **WP6 composed config** `drcomp-v4`: all the per-kernel paths (symm, fdtd,
+  gramschmidt) now land; attempt the single composed pipeline (within 5% of
+  per-kernel best-ours on all 29 kernels).
+- **WP2** god-pass split: deferred (fails the spec's own §9 litmus; no feature WP
+  consumed it).
 - **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
   says do last (perturbs the most-shared pass).
 - **WP6 composed config** (`drcomp-v4`): blocked on WP3.3.
