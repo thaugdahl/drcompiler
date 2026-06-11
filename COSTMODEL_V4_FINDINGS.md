@@ -94,16 +94,45 @@ an mr×vl micro-kernel.
   WP4). Revisit only if a feature WP forces it or measurement motivates the full
   cross-talk rework.
 
-## Not started (large feature work — next session)
+## WP3.2 seidel — implemented, validated correct, but NO XL WIN (reverted)
 
-- **WP3.1/3.2 seidel** (the biggest prize, 1.09x→≥1.8x): needs the stencil
-  engine generalized to space–space skew (`i'=i+t, j'=j+2t+i`; the existing
-  emitter is tau-only with symmetric bands — substantial new code) AND the
-  jacobi/heat bit-identical refactor bar. Highest miscompile risk of v4
-  (in-place + skewing) — dump-diff FIRST. Staged kernel present
-  (`/tmp/fuseinv/seidel-2d`, IR confirmed to match spec §4.2).
-- **WP3.3 fdtd** (≥1.2x): 4-phase, needs per-phase bands; tau-only suffices
-  (f=1,c=0). After seidel.
+**Honest NO-GO within v4 scope.** Implemented the space–space skewed
+time-tiling (`i'=i+t, j'=j+2t+i`, derived + independently re-verified: all 9
+dependence distances map to component-wise ≥0; the textbook b=1 is illegal,
+b=2 is minimal). Emitted the 6-deep skewed nest (jj-band ties to ii, the
+j-window carries the c·i term) in original coordinates.
+
+- **Correctness PASSED the hardest gate:** SMALL dump-diff (POLYBENCH_DUMP_ARRAYS,
+  tile-t=2 tile-s=4 to exercise multiple tiles + all windows) is **BIT-IDENTICAL**
+  to baseline. The skew + window math is exactly right; lit (jacobi/heat
+  unaffected) green.
+- **XL timing (N=4000, T=1000, single run):** none 94.5s; best tiled config
+  (tile-t=32 tile-s=128) 90.3s = **1.046x**; others 0.99–1.02x. NOT the ≥1.8x bar.
+- **Root cause (measured, not guessed):** seidel is **compute/latency-bound on
+  the serialized Gauss-Seidel recurrence** — `A[i][j]` reads `A[i][j-1]` *just
+  written*, so the inner loop is a scalar dependence chain the backend cannot
+  vectorize. One t-step touches 128 MB ≈ 8.5 s of memory at ~15 GB/s, but the
+  step costs ~94 ms → ~90% of runtime is the serial arithmetic chain, ~10%
+  memory. **Memory-locality time-tiling therefore cannot move the needle** (the
+  4.6% best case is the entire memory share). The spec's premise (§0: "seidel
+  needs full skew — biggest prize", implicitly a locality win like jacobi) is
+  WRONG: jacobi is ping-pong (no recurrence → vectorizable → locality-bound);
+  seidel's in-place recurrence makes it compute-bound.
+- **The actual lever** is wavefront/diamond vectorization (iterate the
+  dependence-free anti-diagonal so the recurrence parallelizes) — which the spec
+  explicitly lists as a **non-goal (§9)**. So seidel ≥1.8x is unreachable within
+  v4's stated scope.
+- **Action:** reverted the (correct but pointless) transform — its only consumer
+  (seidel) gets no win, so it fails the spec's own §9 litmus. The validated skew
+  + emitter design is preserved here and in git history for any future wavefront
+  work. fdtd uses the EXISTING tau-only emitter, so it is unaffected.
+
+## Not started
+
+- **WP3.3 fdtd** (≥1.2x): 4-phase ping-pong over 3 arrays, tau-only (f=1,c=0) —
+  uses the EXISTING emitter + per-phase bands. fdtd is NOT in-place (no
+  recurrence), so unlike seidel it should be a genuine locality win. Most
+  promising remaining stencil target.
 - **WP5 gramschmidt** (1.56x→1.9x): block-interleave mode for distribute; spec
   says do last (perturbs the most-shared pass).
 - **WP6 composed config** (`drcomp-v4`): blocked on WP3.3.
