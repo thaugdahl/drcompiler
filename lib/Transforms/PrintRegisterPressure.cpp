@@ -5,7 +5,7 @@
 #include "drcompiler/Analysis/ArchHandler.h"
 #include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"

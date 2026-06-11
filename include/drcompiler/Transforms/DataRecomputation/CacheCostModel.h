@@ -14,7 +14,7 @@
 #define DRCOMPILER_TRANSFORMS_DATARECOMPUTATION_CACHECOSTMODEL_H
 
 #include "drcompiler/Analysis/ArchHandler.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"

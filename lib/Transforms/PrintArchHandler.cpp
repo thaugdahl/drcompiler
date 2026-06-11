@@ -10,7 +10,7 @@
 #include "drcompiler/Transforms/PrintArchHandler.h"
 
 #include "drcompiler/Analysis/ArchHandler.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"

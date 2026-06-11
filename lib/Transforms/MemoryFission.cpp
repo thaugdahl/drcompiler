@@ -10,7 +10,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "drcompiler/Transforms/MemoryFission.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -245,6 +246,27 @@ void MemoryFissionPass::runOnOperation() {
       cpuCostModelFile.empty()
           ? drcompiler::CpuCostModel::getDefault()
           : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
+
+  // Cache hierarchy from the single source of truth (MachineModel,
+  // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
+  {
+    drcompiler::MachineModel mm =
+        drcompiler::MachineModel::fromJson(cpuCostModelFile);
+    if (!l1Size.hasValue())
+      l1Size = static_cast<unsigned>(mm.l1Size);
+    if (!l2Size.hasValue())
+      l2Size = static_cast<unsigned>(mm.l2Size);
+    if (!l3Size.hasValue())
+      l3Size = static_cast<unsigned>(mm.l3Size);
+    if (!l1Latency.hasValue())
+      l1Latency = mm.l1Lat;
+    if (!l2Latency.hasValue())
+      l2Latency = mm.l2Lat;
+    if (!l3Latency.hasValue())
+      l3Latency = mm.l3Lat;
+    if (!llcSharers.hasValue())
+      llcSharers = mm.llcSharers;
+  }
 
   moduleOp.walk([&](mlir::FunctionOpInterface funcOp) {
     Region *body = funcOp.getCallableRegion();

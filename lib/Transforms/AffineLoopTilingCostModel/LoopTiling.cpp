@@ -32,7 +32,7 @@
 // is found in `mlir::` rather than `mlir::affine::`.
 #include "drcompiler/Transforms/AffineLoopTile.h"
 #include "drcompiler/Analysis/ReuseAnalysis.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 
 namespace mlir {
 using affine::FusionMode;  // unused here but kept for parity with Fusion fork

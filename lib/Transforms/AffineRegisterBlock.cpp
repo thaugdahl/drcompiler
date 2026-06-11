@@ -19,6 +19,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
@@ -1417,6 +1418,17 @@ public:
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     IRRewriter rewriter(&getContext());
+
+    // Cache hierarchy from the single source of truth (MachineModel,
+    // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
+    {
+      drcompiler::MachineModel mm =
+          drcompiler::MachineModel::fromJson(cpuCostModelFile);
+      if (!l3Size.hasValue())
+        l3Size = static_cast<unsigned>(mm.l3Size);
+      if (!llcSharers.hasValue())
+        llcSharers = mm.llcSharers;
+    }
 
     // Stage 1: canonicalize reduction nests so the reduction loop is innermost
     // (handles the PolyBench i-k-j order via k<->j interchange).

@@ -14,7 +14,7 @@
 
 #include "drcompiler/Analysis/ArchHandler.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/RematKernel.h"

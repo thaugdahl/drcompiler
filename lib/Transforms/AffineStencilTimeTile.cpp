@@ -37,6 +37,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/AffineStencilTimeTile.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -171,6 +172,18 @@ public:
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
+
+    // Cache hierarchy from the single source of truth (MachineModel,
+    // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
+    {
+      drcompiler::MachineModel mm =
+          drcompiler::MachineModel::fromJson(cpuCostModelFile);
+      if (!l3Size.hasValue())
+        l3Size = static_cast<unsigned>(mm.l3Size);
+      if (!llcSharers.hasValue())
+        llcSharers = mm.llcSharers;
+    }
+
     SmallVector<AffineForOp> tLoops;
     func.walk([&](AffineForOp t) {
       if (t->getParentOfType<AffineForOp>())

@@ -16,7 +16,7 @@
 #include "drcompiler/Analysis/ArchHandler.h"
 #include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
 #if __has_include("mlir/Dialect/Affine/Passes.h")

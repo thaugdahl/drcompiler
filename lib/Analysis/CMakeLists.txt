@@ -1,5 +1,7 @@
 add_mlir_library(DRCompAnalysis
   ArchHandlerRegistry.cpp
+  CpuCostModel.cpp
+  MachineModel.cpp
   ArchHandlers/Generic.cpp
   ArchHandlers/X86_64_AVX2.cpp
   ArchHandlers/X86_64_AVX512.cpp

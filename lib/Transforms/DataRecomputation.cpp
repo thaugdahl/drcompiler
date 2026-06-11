@@ -28,7 +28,8 @@
 #include "drcompiler/Analysis/ArchHandler.h"
 #include "drcompiler/Analysis/RegisterPressureAnalysis.h"
 #include "drcompiler/Analysis/SpillStrategy.h"
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/DataRecomputation/AnalysisState.h"
 #include "drcompiler/Transforms/DataRecomputation/BufferElim.h"
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
@@ -1390,6 +1391,34 @@ void DataRecomputationPass::runOnOperation() {
           ? drcompiler::CpuCostModel::getDefault()
           : drcompiler::CpuCostModel::loadFromFile(cpuCostModelFile);
 
+  // Resolve the cache hierarchy from the single source of truth (MachineModel,
+  // COSTMODEL_V4_SPEC §2).  Precedence: explicit CLI option > JSON file >
+  // built-in default.  With no JSON and no override these assignments are
+  // value-preserving (MachineModel defaults == the pass option defaults), so
+  // behavior is bit-identical.
+  {
+    drcompiler::MachineModel mm =
+        drcompiler::MachineModel::fromJson(cpuCostModelFile);
+    if (!drL1Size.hasValue())
+      drL1Size = static_cast<unsigned>(mm.l1Size);
+    if (!drL2Size.hasValue())
+      drL2Size = static_cast<unsigned>(mm.l2Size);
+    if (!drL3Size.hasValue())
+      drL3Size = static_cast<unsigned>(mm.l3Size);
+    if (!drL1Latency.hasValue())
+      drL1Latency = mm.l1Lat;
+    if (!drL2Latency.hasValue())
+      drL2Latency = mm.l2Lat;
+    if (!drL3Latency.hasValue())
+      drL3Latency = mm.l3Lat;
+    if (!drMemLatency.hasValue())
+      drMemLatency = mm.memLat;
+    if (!drCacheLineSize.hasValue())
+      drCacheLineSize = static_cast<unsigned>(mm.cacheLine);
+    if (!drLlcSharers.hasValue())
+      drLlcSharers = mm.llcSharers;
+  }
+
   // Resolve the unified cost-model arch/register configuration.  Precedence
   // (highest first): CLI options > JSON file fields > handler defaults.
   std::unique_ptr<drcompiler::ArchHandler> archHandler;
@@ -1915,17 +1944,11 @@ void DataRecomputationPass::runOnOperation() {
                       drMemLatency, drCacheLineSize};
     cache.llcSharers = drLlcSharers; // contention derating of the shared LLC
 
-    // S3-A: optional cache hierarchy parameters from the cost-model JSON
-    // override CLI defaults.  Per-field: only fields the file actually
-    // contained (parsed successfully) are applied.
-    const auto &jsonCache = costModel.cacheParams();
-    if (jsonCache.l1Size)    cache.l1Size    = *jsonCache.l1Size;
-    if (jsonCache.l2Size)    cache.l2Size    = *jsonCache.l2Size;
-    if (jsonCache.l3Size)    cache.l3Size    = *jsonCache.l3Size;
-    if (jsonCache.l1Latency) cache.l1Latency = *jsonCache.l1Latency;
-    if (jsonCache.l2Latency) cache.l2Latency = *jsonCache.l2Latency;
-    if (jsonCache.l3Latency) cache.l3Latency = *jsonCache.l3Latency;
-    if (jsonCache.memLatency) cache.memLatency = *jsonCache.memLatency;
+    // NB: the JSON `cache` block is already folded into the dr* options above
+    // (runOnOperation's MachineModel resolution, COSTMODEL_V4_SPEC §2), with an
+    // explicit CLI option winning over the file.  `cache` therefore reflects the
+    // resolved hierarchy directly — no second, precedence-inverting override
+    // here (the old per-field jsonCache merge let the file beat the CLI).
 
     // Partial remat requires cost model — warn if misconfigured.
     bool partialRematEnabled = drPartialRemat && drCostModel;

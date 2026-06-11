@@ -1,5 +1,5 @@
-#ifndef DRCOMPILER_TRANSFORMS_CPUCOSTMODEL_H
-#define DRCOMPILER_TRANSFORMS_CPUCOSTMODEL_H
+#ifndef DRCOMPILER_ANALYSIS_CPUCOSTMODEL_H
+#define DRCOMPILER_ANALYSIS_CPUCOSTMODEL_H
 
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/StringMap.h"
@@ -22,6 +22,10 @@ struct CpuCacheJsonParams {
   std::optional<unsigned> l2Latency;
   std::optional<unsigned> l3Latency;
   std::optional<unsigned> memLatency;
+  std::optional<unsigned> pageSize;      // NEW (v4): TLB-reach modeling
+  std::optional<unsigned> l2TlbEntries;  // NEW (v4): TLB-reach modeling
+  std::optional<unsigned> cacheLine;     // NEW (v4): unify w/ MachineModel
+  std::optional<unsigned> llcSharers;    // NEW (v4): unify w/ MachineModel
 };
 
 /// Optional architecture-block parameters parsed from a cost-model JSON's
@@ -99,4 +103,4 @@ private:
 
 } // namespace drcompiler
 
-#endif // DRCOMPILER_TRANSFORMS_CPUCOSTMODEL_H
+#endif // DRCOMPILER_ANALYSIS_CPUCOSTMODEL_H

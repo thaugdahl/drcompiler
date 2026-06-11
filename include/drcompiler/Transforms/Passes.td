@@ -259,7 +259,11 @@ def DrAffineStencilTimeTilePass
     Option<"llcSharers", "llc-sharers", "unsigned", "1",
            "Co-tenants of the LLC; effective cache = l3-size/this">,
     Option<"forceTile", "force-tile", "bool", "false",
-           "Skip the footprint profitability gate (testing)">
+           "Skip the footprint profitability gate (testing)">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON cost-model file; sources l3-size/llc-sharers from "
+           "its `cache` block unless overridden by the CLI options above.">
   ];
 
   let dependentDialects = [
@@ -607,6 +611,10 @@ def AffineRegisterBlockPass
            "Vector lane width for the broadcast vector micro-kernel (doubles per "
            "vector; 8 = one AVX-512 zmm). mr x vl accumulators must fit the "
            "vector register file.">,
+    Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
+           /*default=*/"",
+           "Path to a JSON cost-model file; sources l3-size/llc-sharers from "
+           "its `cache` block unless overridden by the CLI options above.">,
     Option<"peelKTile", "peel-k-tile", "unsigned", "128",
            "Target k-chunk size for tiling the reduction loop of a peeled "
            "triangular HEAD (0 = off). Applies only when some multiplicand is "

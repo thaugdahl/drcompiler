@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "drcompiler/Transforms/CpuCostModel.h"
+#include "drcompiler/Analysis/CpuCostModel.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -142,6 +142,10 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
     readUnsigned("l2_latency", m.cache.l2Latency);
     readUnsigned("l3_latency", m.cache.l3Latency);
     readUnsigned("mem_latency", m.cache.memLatency);
+    readUnsigned("page_size", m.cache.pageSize);
+    readUnsigned("l2_tlb_entries", m.cache.l2TlbEntries);
+    readUnsigned("cache_line", m.cache.cacheLine);
+    readUnsigned("llc_sharers", m.cache.llcSharers);
   } else if (root->get("cache")) {
     llvm::errs() << "drcompiler warning: 'cache' in '" << path
                  << "' is not a JSON object; ignoring\n";
