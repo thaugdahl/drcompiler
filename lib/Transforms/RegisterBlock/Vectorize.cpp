@@ -15,6 +15,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallVector.h"
+#include <functional>
 
 #define DEBUG_TYPE "affine-register-block"
 
@@ -33,12 +34,28 @@ bool innermostStrideOne(AffineLoadOp load, Value iv) {
   AffineMap m = load.getAffineMap();
   if (m.getNumResults() == 0)
     return false;
-  auto dim = dyn_cast<AffineDimExpr>(m.getResult(m.getNumResults() - 1));
-  if (!dim)
-    return false;
-  unsigned pos = dim.getPosition();
+  AffineExpr last = m.getResult(m.getNumResults() - 1);
+  // Find which map dim is `iv`.
   auto operands = load.getMapOperands();
-  return pos < operands.size() && operands[pos] == iv;
+  unsigned pos = m.getNumDims();
+  for (unsigned d = 0; d < m.getNumDims(); ++d)
+    if (d < operands.size() && operands[d] == iv) {
+      pos = d;
+      break;
+    }
+  if (pos == m.getNumDims())
+    return false; // `iv` is not a dim of this map
+  // Stride-1 iff `iv` appears in the innermost result with coefficient exactly 1
+  // and nothing else multiplies it: i.e. `last == dim(pos) + g` where g is
+  // independent of dim(pos).  Covers a pure `B[k][j]` (g = 0) AND a conv
+  // `in[ic][oh+kh][ow+kw]` (last = ow + kw, g = kw): incrementing `iv` by 1
+  // moves the address by exactly one element either way.
+  AffineExpr dimP = getAffineDimExpr(pos, m.getContext());
+  // `last - dimP` does not auto-cancel like terms; simplify before testing so a
+  // genuine `dimP + g` (coeff 1) reports stride-1.
+  AffineExpr diff =
+      simplifyAffineExpr(last - dimP, m.getNumDims(), m.getNumSymbols());
+  return !diff.isFunctionOfDim(pos);
 }
 
 /// Classify a reduction band by operand layout.  `red` is the innermost
@@ -291,6 +308,83 @@ LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
     rewriter.create<affine::AffineVectorStoreOp>(
         a.loc, newK.getResult(i), a.memref, a.map, hoistedOps[i]);
   rewriter.eraseOp(red);
+  return success();
+}
+
+/// Vectorize a direct-conv reduction BAND along the spatial loop `sp` (ow).
+/// `bandLoops` is the reduction band outer->inner (e.g. ic, kh, kw); the
+/// innermost loop holds a single memref accumulator Y[.., ow] that is stride-1
+/// in ow and invariant across the whole band.  Re-steps `sp` by VL and rebuilds
+/// the band carrying a `vector<VL>` accumulator through every level: the weight
+/// load (ow-invariant) becomes a broadcast, the input load (stride-1 in ow, e.g.
+/// in[ic][oh+kh][ow+kw]) a contiguous vector load, the accumulator a carried
+/// vector iter_arg loaded once before the band and stored once after.  This is
+/// the GEMM broadcast micro-kernel generalized from a single reduction loop to a
+/// multi-loop contraction band -- the WP-O2 direct-conv kernel.  vl-divisible
+/// ow only (caller leaves a non-divisible remainder to the scalar tail).
+LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
+                                unsigned VL, IRRewriter &rewriter) {
+  if (VL < 2 || sp.getStepAsInt() != 1 || bandLoops.empty())
+    return failure();
+  Value owIV = sp.getInductionVar();
+  AffineForOp inner = bandLoops.back();
+  SmallVector<Acc> accs = collectAccumulators(inner);
+  if (accs.size() != 1)
+    return failure();
+  Acc a = accs[0];
+  if (!innermostStrideOne(a.load, owIV))
+    return failure();
+  llvm::SmallPtrSet<Operation *, 4> accLoads;
+  accLoads.insert(a.load.getOperation());
+  if (!canVectorizeDAG(a.storedVal, accLoads, owIV, inner.getBody()))
+    return failure();
+  std::optional<uint64_t> trip = affine::getConstantTripCount(sp);
+  if (!trip || *trip % VL != 0)
+    return failure();
+
+  Location loc = sp.getLoc();
+  auto elemTy = cast<MemRefType>(a.memref.getType()).getElementType();
+  auto vecTy = VectorType::get({(int64_t)VL}, elemTy);
+
+  // Seed: vector_load the accumulator slab once, before the band.
+  rewriter.setInsertionPoint(bandLoops.front());
+  Value seed = rewriter.create<affine::AffineVectorLoadOp>(loc, vecTy, a.memref,
+                                                           a.map, a.operands);
+
+  Block *oldInnerBody = inner.getBody();
+  // Rebuild the band: one vector iter_arg threaded through every level; the
+  // innermost vectorizes the scalar stored-value DAG along ow.
+  std::function<Value(unsigned, Value, IRMapping &, OpBuilder &)> build =
+      [&](unsigned lvl, Value sd, IRMapping &remap, OpBuilder &bld) -> Value {
+    AffineForOp old = bandLoops[lvl];
+    auto nf = bld.create<AffineForOp>(
+        loc, old.getLowerBoundOperands(), old.getLowerBoundMap(),
+        old.getUpperBoundOperands(), old.getUpperBoundMap(), old.getStepAsInt(),
+        ValueRange{sd}, [&](OpBuilder &b2, Location l2, Value iv, ValueRange args) {
+          IRMapping rm = remap;
+          rm.map(old.getInductionVar(), iv);
+          Value res;
+          if (lvl + 1 < bandLoops.size())
+            res = build(lvl + 1, args[0], rm, b2);
+          else {
+            DenseMap<Value, Value> accToIter;
+            accToIter[a.load.getResult()] = args[0];
+            res = vectorizeReductionValue(a.storedVal, accToIter, rm, owIV, vecTy,
+                                          b2, oldInnerBody);
+          }
+          b2.create<affine::AffineYieldOp>(l2, res);
+        });
+    return nf.getResult(0);
+  };
+  IRMapping remap;
+  Value result = build(0, seed, remap, rewriter);
+
+  // Store the final vector slab once, after the band; then drop the scalar band
+  // and re-step ow by VL.
+  rewriter.create<affine::AffineVectorStoreOp>(loc, result, a.memref, a.map,
+                                               a.operands);
+  rewriter.eraseOp(bandLoops.front());
+  sp.setStep(VL);
   return success();
 }
 

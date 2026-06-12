@@ -1008,6 +1008,46 @@ public:
       }
     }
 
+    // Stage 1d (WP-O2): direct-conv reduction BANDS.  A de-promoted 3x3 conv is
+    // `for oc,oh,ow { for ic,kh,kw { Y[oc,oh,ow] += in[ic,oh+kh,ow+kw]*w[...] }}`
+    // -- a MULTI-loop reduction band (ic/kh/kw) under the spatial loop ow.  The
+    // GEMM stages below need the spatial loop to DIRECTLY enclose a single
+    // reduction loop, so they never fire on conv.  Here we vectorize ow (stride-1
+    // in both Y and `in`) directly, carrying a vector accumulator through the
+    // whole band.  Detected before Stage 2 so the GEMM matcher never sees these.
+    if (vectorize) {
+      SmallVector<std::pair<AffineForOp, SmallVector<AffineForOp>>> convBands;
+      func.walk([&](AffineForOp inner) {
+        if (!isInnermost(inner))
+          return;
+        AffineStoreOp store;
+        AffineLoadOp load;
+        if (!findAccPair(inner, store, load))
+          return;
+        // Grow the band upward through enclosing REDUCTION loops (IVs absent
+        // from the accumulator address), each perfectly enclosing the band.
+        SmallVector<AffineForOp> band{inner};
+        AffineForOp p = inner->getParentOfType<AffineForOp>();
+        while (p && !addrDependsOnIV(store, p.getInductionVar())) {
+          if (onlyChildFor(p) != band.front())
+            break;
+          band.insert(band.begin(), p);
+          p = p->getParentOfType<AffineForOp>();
+        }
+        // A single-loop reduction is a GEMM (Stage 2/3 handles it); only a true
+        // band (>=2 reduction loops) is a conv.
+        if (band.size() < 2 || !p)
+          return;
+        AffineForOp sp = p; // the spatial loop indexing the accumulator (ow)
+        if (!addrDependsOnIV(store, sp.getInductionVar()) ||
+            onlyChildFor(sp) != band.front() || !affine::isLoopParallel(sp))
+          return;
+        convBands.push_back({sp, std::move(band)});
+      });
+      for (auto &cb : convBands)
+        (void)vectorizeConvBand(cb.first, cb.second, vl, rewriter);
+    }
+
     // Stage 2: collect the distinct outer spatial loops of each reduction.
     SmallVector<AffineForOp> sOuts;
     func.walk([&](AffineForOp red) {

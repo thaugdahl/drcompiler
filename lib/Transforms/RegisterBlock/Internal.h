@@ -73,6 +73,9 @@ bool innermostStrideOne(AffineLoadOp load, Value iv);
 RBFamily detectFamily(AffineForOp red, AffineForOp sIn, int &nMul);
 LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
                                      unsigned VL, IRRewriter &rewriter);
+LogicalResult vectorizeConvBand(AffineForOp sp,
+                                llvm::ArrayRef<AffineForOp> bandLoops,
+                                unsigned VL, IRRewriter &rewriter);
 LogicalResult vectorizeDotBand(AffineForOp red, unsigned VL,
                                IRRewriter &rewriter);
 
