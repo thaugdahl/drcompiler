@@ -1055,7 +1055,33 @@ public:
         if (tri)
           continue;
       }
-      if (mrEff > 1 && failed(affine::loopUnrollJamByFactor(sOut, mrEff)))
+      // PER-BAND family selection.  The global familySelect above sets a single
+      // function-wide mode (one PolyBench kernel = one family).  onnx-mlir emits
+      // MANY contractions per function -- a 1x1 conv GEMM (broadcast) and a
+      // genuine rank-k (dot) can coexist, and the global `anyDot` flag would
+      // force every band into dot mode, disabling the broadcast vector kernel
+      // for ALL of them (measured: resnet50's 33 demoted GEMMs all fell to the
+      // scalar 4x4 dot tile -> 0 vector ops).  Detect the family of THIS band's
+      // reduction (before jamming, since the jam factor depends on it).  For a
+      // single-kernel function this is identical to the global decision.
+      unsigned mrB = mrEff, nrB = nrEff;
+      bool reassocB = reassoc;
+      if (familySelect) {
+        if (AffineForOp predRed = findReductionLoopUnder(sOut)) {
+          if (AffineForOp predSin = predRed->getParentOfType<AffineForOp>()) {
+            int nMul = 0;
+            if (detectFamily(predRed, predSin, nMul) == RBFamily::Dot) {
+              reassocB = true;
+              mrB = nrB = (nMul > 2) ? 2u : 4u;
+            } else {
+              reassocB = false;
+              mrB = mr;
+              nrB = nr;
+            }
+          }
+        }
+      }
+      if (mrB > 1 && failed(affine::loopUnrollJamByFactor(sOut, mrB)))
         continue;
       AffineForOp red = findReductionLoopUnder(func);
       if (!red)
@@ -1073,8 +1099,8 @@ public:
           accsForRank.empty()
               ? 2u
               : cast<MemRefType>(accsForRank[0].memref.getType()).getRank();
-      unsigned nrVec = accRank >= 3 ? 1u : (nrEff + vl - 1) / vl;
-      if (vectorize && !reassoc &&
+      unsigned nrVec = accRank >= 3 ? 1u : (nrB + vl - 1) / vl;
+      if (vectorize && !reassocB &&
           succeeded(vectorizeBroadcastBand(red, sIn, vl, rewriter))) {
         // Complete the mr x nrVec register tile explicitly: unroll-jam the (now
         // vl-stepped) inner spatial loop into nrVec vector columns, so the tile
@@ -1089,7 +1115,7 @@ public:
       LLVM_DEBUG(llvm::dbgs() << "affine-register-block: explicit vectorization "
                                  "declined; SLP fallback for band at "
                               << sIn.getLoc() << "\n");
-      if (nrEff > 1 && failed(affine::loopUnrollJamByFactor(sIn, nrEff)))
+      if (nrB > 1 && failed(affine::loopUnrollJamByFactor(sIn, nrB)))
         continue;
       red = findReductionLoopUnder(func);
       if (!red)
@@ -1098,7 +1124,7 @@ public:
       // reliance on LLVM reduction-vec).  Falls back to scalar promotion +
       // reassoc + LLVM when the k-trip isn't vl-divisible or the band isn't
       // cleanly vectorizable along k.
-      if (vectorize && reassoc &&
+      if (vectorize && reassocB &&
           succeeded(vectorizeDotBand(red, vl, rewriter)))
         continue;
       (void)promoteReductions(red, rewriter);

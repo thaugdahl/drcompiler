@@ -12,6 +12,7 @@
 #include "drcompiler/Transforms/PrintArchHandler.h"
 #include "drcompiler/Transforms/PrintRegisterPressure.h"
 #include "drcompiler/Transforms/RaiseMallocToMemRef.h"
+#include "drcompiler/Transforms/ScalarReductionDemote.h"
 #include "drcompiler/Transforms/TestReuseAnalysis.h"
 
 namespace mlir {

@@ -205,6 +205,43 @@ def DrAffineLoopDistributePass
   let constructor = "mlir::createDrAffineLoopDistributePass()";
 }
 
+def DrScalarReductionDemotePass
+    : Pass<"dr-scalar-reduction-demote", "mlir::func::FuncOp">
+{
+  let summary = "Lower SSA iter_args reductions to memref-accumulator form";
+
+  let description = [{
+    onnx-mlir emits every contraction (matmul, 1x1 conv) as an SSA reduction:
+
+      %r = affine.for %k iter_args(%a = %c0) -> f32 {
+             %p = arith.mulf (load A)(load B); %s = arith.addf %a, %p
+             affine.yield %s }
+      affine.store %r, %C[i, j]
+
+    The affine-register-block matcher instead expects the cgeist -O0 shape: a
+    perfect reduction band whose accumulator is carried in MEMORY (load %C
+    before, store %C after, body = just the reduction).  This pass bridges the
+    two by FISSIONING a single-level add-reduction into
+
+      affine.for ... { affine.store %init, %C[i, j] }          // zero/bias init
+      affine.for ... { affine.for %k { %c = load %C; store (%c + A*B), %C } }
+
+    The reduction band is now perfect, so the register-block vector micro-kernel
+    fires (1x1 convs vectorize ~9x on resnet50).  An additive epilogue
+    (`store (%r + bias[i])`) is folded into the init nest, keeping the band
+    perfect.  Only single-level f32/f64 `addf` reductions are handled; nested
+    conv reductions (3x3) and non-add (maxpool/softmax) chains are left intact.
+  }];
+
+  let options = [
+    Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
+           "Emit a remark for every reduction demoted and every match skipped">,
+  ];
+
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+  let constructor = "mlir::createDrScalarReductionDemotePass()";
+}
+
 def DrTestReuseAnalysisPass
     : Pass<"dr-test-reuse-analysis", "mlir::func::FuncOp">
 {
