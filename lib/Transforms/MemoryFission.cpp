@@ -249,6 +249,10 @@ void MemoryFissionPass::runOnOperation() {
 
   // Cache hierarchy from the single source of truth (MachineModel,
   // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
+  // memLatency / cacheLineSize have no CLI option here (fission never needed to
+  // override them), so they come straight from the machine model instead of the
+  // old hardcoded 200/64 literals (CROSSCUTTING.md P0 drift fix).
+  unsigned memLatency = 200, cacheLineSize = 64;
   {
     drcompiler::MachineModel mm =
         drcompiler::MachineModel::fromJson(cpuCostModelFile);
@@ -266,6 +270,8 @@ void MemoryFissionPass::runOnOperation() {
       l3Latency = mm.l3Lat;
     if (!llcSharers.hasValue())
       llcSharers = mm.llcSharers;
+    memLatency = mm.memLat;
+    cacheLineSize = static_cast<unsigned>(mm.cacheLine);
   }
 
   moduleOp.walk([&](mlir::FunctionOpInterface funcOp) {
@@ -393,9 +399,9 @@ void MemoryFissionPass::runOnOperation() {
         //   materialize = computeCost (once) + 1 (store) + N * loadLat(totalWS)
         unsigned sharers = llcSharers ? llcSharers : 1;
         int64_t effL3 = drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
-        dr::CacheParams cp{l1Size, l2Size,   l3Size,      l1Latency,
-                           l2Latency, l3Latency, /*mem*/ 200u, /*line*/ 64u,
-                           sharers, l2OccupancyPct};
+        dr::CacheParams cp{l1Size,    l2Size,    l3Size,        l1Latency,
+                           l2Latency, l3Latency, memLatency,    cacheLineSize,
+                           sharers,   l2OccupancyPct};
         unsigned bufLat = dr::estimateLoadLatency(totalWS, cp);
         int64_t recomputeC = (int64_t)numConsumers * computeCost;
         int64_t materializeC =
