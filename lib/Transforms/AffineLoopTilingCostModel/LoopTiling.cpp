@@ -248,11 +248,17 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
                         ? static_cast<int64_t>(*cm.cacheParams().l2Size)
                         : static_cast<int64_t>(cacheSizeInKiB) * 1024;
   int64_t target = std::max<int64_t>(l2Bytes / 2, 4096);
+  // Cache line for the spatial-reuse gate (>1 line => worth tiling), from the
+  // JSON if present (CROSSCUTTING.md P0: line size no longer hardcoded in the
+  // reuse analysis); 64 B default reproduces the prior constant.
+  int64_t cacheLine = cm.cacheParams().cacheLine
+                          ? static_cast<int64_t>(*cm.cacheParams().cacheLine)
+                          : 64;
 
   // Gate on evicted temporal reuse.
   bool anyEvicted = false;
   for (unsigned l = 0; l < d && !anyEvicted; ++l)
-    anyEvicted = info.loopCarriesEvictedReuse(l, target);
+    anyEvicted = info.loopCarriesEvictedReuse(l, target, cacheLine);
   if (!anyEvicted) {
     rationale("REJECT reason=no-evicted-reuse footprint=" +
               std::to_string(info.footprintBytes(info.tripCounts)) +

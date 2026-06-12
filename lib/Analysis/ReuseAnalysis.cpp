@@ -120,13 +120,12 @@ int64_t BandReuseInfo::reuseDistanceBytes(unsigned loopIdx) const {
   return footprintBytes(sizes);
 }
 
-bool BandReuseInfo::loopCarriesEvictedReuse(unsigned loopIdx,
-                                            int64_t cacheBytes) const {
+bool BandReuseInfo::loopCarriesEvictedReuse(unsigned loopIdx, int64_t cacheBytes,
+                                            int64_t kCacheLineBytes) const {
   // A reference benefits from tiling around `loopIdx` only if (a) the loop
   // carries temporal reuse for it, (b) the reused window is more than one
   // cache line (a scalar accumulator lives in a register; tiling buys
   // nothing), and (c) the data touched between reuses overflows the cache.
-  constexpr int64_t kCacheLineBytes = 64;
   bool anyNonDegenerateInvariant = false;
   for (unsigned r = 0, e = refs.size(); r < e; ++r) {
     if (!refs[r].invariantIn(loopIdx))
@@ -141,8 +140,7 @@ bool BandReuseInfo::loopCarriesEvictedReuse(unsigned loopIdx,
   return reuseDistanceBytes(loopIdx) > cacheBytes;
 }
 
-bool BandReuseInfo::anyTemporalReuse() const {
-  constexpr int64_t kCacheLineBytes = 64;
+bool BandReuseInfo::anyTemporalReuse(int64_t kCacheLineBytes) const {
   for (unsigned l = 0, nl = band.size(); l < nl; ++l)
     for (unsigned r = 0, nr = refs.size(); r < nr; ++r)
       if (refs[r].invariantIn(l) && refIterFootprint(r, l) > kCacheLineBytes)

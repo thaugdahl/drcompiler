@@ -128,10 +128,11 @@ struct BandReuseInfo {
   /// that is evicted at a cache of `cacheBytes` (reuse distance exceeds it).
   /// This is the tiler's profitability gate: tiling the inner loops shrinks
   /// the reuse distance below `cacheBytes` and converts misses to hits.
-  bool loopCarriesEvictedReuse(unsigned loopIdx, int64_t cacheBytes) const;
+  bool loopCarriesEvictedReuse(unsigned loopIdx, int64_t cacheBytes,
+                               int64_t cacheLineBytes = 64) const;
 
   /// True if any loop carries non-degenerate temporal reuse for any ref.
-  bool anyTemporalReuse() const;
+  bool anyTemporalReuse(int64_t cacheLineBytes = 64) const;
 };
 
 /// Analyze a perfect band of affine loops with constant bounds.  Fails (see
