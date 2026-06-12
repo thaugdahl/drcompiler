@@ -25,7 +25,9 @@
 #   --iters N        timed iterations per config (default 5)
 #   --shape D,D,...  input tensor shape (default 1,3,224,224, f32)
 #   --configs LIST   comma-separated subset of none,codegen,o3
-#   --mr/--nr/--vl N register-block parameters (default 8/16/16)
+#   --mr/--nr/--vl N register-block parameters (default mr=8 nr=16; vl is
+#                    DERIVED from the machine model -- 8 on Zen4 -- unless set)
+#   --cpu-cost-model-file F  machine JSON (e.g. a native-512 Xeon -> vl=16)
 #   --workdir DIR    keep intermediates here (default: mktemp, kept)
 # Environment:
 #   ONNX_MLIR_IMAGE  docker image with onnx-mlir + libcruntime
@@ -45,7 +47,10 @@ DR_OPT="${DR_OPT:-$REPO_ROOT/build/tools/dr-opt/dr-opt}"
 OM_BIN=/build/onnx-mlir/build/Release/bin
 
 ITERS=5; SHAPE="1,3,224,224"; CONFIGS="none,codegen,o3"
-MR=8; NR=16; VL=16; WORKDIR=""
+# VL empty => let affine-register-block derive it from the machine model
+# (MachineModel::preferredVectorElems): 8 on this Zen4 host, or whatever a
+# --cpu-cost-model-file describes (a native-512 Xeon -> 16).  --vl pins it.
+MR=8; NR=16; VL=""; CMF=""; WORKDIR=""
 MODEL=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --mr) MR=$2; shift 2;;
     --nr) NR=$2; shift 2;;
     --vl) VL=$2; shift 2;;
+    --cpu-cost-model-file) CMF=$2; shift 2;;
     --workdir) WORKDIR=$2; shift 2;;
     *) MODEL=$1; shift;;
   esac
@@ -161,9 +167,10 @@ build_none() { need_affine; back_half "$WORKDIR/model.affine.mlir" none; }
 
 build_codegen() {
   need_affine
-  echo "[codegen] dr-opt demote + register-block + promote (host)" >&2
+  local rb="mr=$MR nr=$NR${VL:+ vl=$VL}${CMF:+ cpu-cost-model-file=$CMF}"
+  echo "[codegen] dr-opt demote + register-block{$rb} + promote (host)" >&2
   "$DR_OPT" "$WORKDIR/model.affine.mlir" -allow-unregistered-dialect \
-    --pass-pipeline="builtin.module(func.func(dr-scalar-reduction-demote,affine-register-block{mr=$MR nr=$NR vl=$VL},dr-scalar-reduction-promote))" \
+    --pass-pipeline="builtin.module(func.func(dr-scalar-reduction-demote,affine-register-block{$rb},dr-scalar-reduction-promote))" \
     -o "$WORKDIR/codegen.dr.mlir"
   back_half "$WORKDIR/codegen.dr.mlir" codegen
 }

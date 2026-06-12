@@ -2,6 +2,7 @@
 
 #include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Analysis/CpuCostModel.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace drcompiler;
 
@@ -38,6 +39,38 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     mm.cacheLine = static_cast<int64_t>(*c.cacheLine);
   if (c.llcSharers)
     mm.llcSharers = *c.llcSharers;
+
+  // Vector-execution model (WP-G1).  Deriving `vl` from the model is gated on
+  // the JSON having explicitly provided at least one of these, so the default
+  // machine keeps the static vl option default (byte-identical pre-WP-G1 IR).
+  const CpuArchJsonParams &a = cm.archParams();
+  if (a.vectorBitsNative) {
+    mm.vectorBitsNative = static_cast<int64_t>(*a.vectorBitsNative);
+    mm.hasExplicitVectorModel = true;
+  }
+  if (a.vectorBitsArch) {
+    mm.vectorBitsArch = static_cast<int64_t>(*a.vectorBitsArch);
+    mm.hasExplicitVectorModel = true;
+  }
+  if (a.vecRegBudget) {
+    mm.vecRegBudget = static_cast<int64_t>(*a.vecRegBudget);
+    mm.hasExplicitVectorModel = true;
+  }
+  if (a.avx512FreqThrottle) {
+    mm.avx512FreqThrottle = *a.avx512FreqThrottle;
+    mm.hasExplicitVectorModel = true;
+  }
+  // Cross-field sanity: the native datapath cannot be wider than the encodable
+  // vector (a partial JSON that sets only vector_bits_native above the default
+  // vector_bits_arch, or an outright typo).  Correct + warn so preferredVector-
+  // Elems never derives a vl wider than the register file.
+  if (mm.hasExplicitVectorModel && mm.vectorBitsNative > mm.vectorBitsArch) {
+    llvm::errs() << "drcompiler warning: arch.vector_bits_native ("
+                 << mm.vectorBitsNative << ") > vector_bits_arch ("
+                 << mm.vectorBitsArch << ") in '" << path
+                 << "'; clamping native to arch\n";
+    mm.vectorBitsNative = mm.vectorBitsArch;
+  }
 
   return mm;
 }

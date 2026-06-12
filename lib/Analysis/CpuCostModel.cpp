@@ -176,10 +176,22 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
                      << " in '" << path << "'; skipping\n";
       }
     };
+    auto readNumber = [&](llvm::StringRef key, std::optional<double> &dst) {
+      if (auto v = archObj->getNumber(key))
+        dst = *v;
+      else if (archObj->get(key))
+        llvm::errs() << "drcompiler warning: non-numeric arch." << key << " in '"
+                     << path << "'; skipping\n";
+    };
     readString("triplet", m.arch.triplet);
     readString("handler", m.arch.handler);
     readUnsigned("vector_width_bits", m.arch.vectorWidthBits);
     readString("spill_strategy", m.arch.spillStrategy);
+    // Vector-execution model (WP-G1).
+    readUnsigned("vector_bits_native", m.arch.vectorBitsNative);
+    readUnsigned("vector_bits_arch", m.arch.vectorBitsArch);
+    readUnsigned("vec_reg_budget", m.arch.vecRegBudget);
+    readNumber("avx512_freq_throttle", m.arch.avx512FreqThrottle);
 
     if (auto *weights = archObj->getObject("weights")) {
       auto readWeight = [&](llvm::StringRef key,

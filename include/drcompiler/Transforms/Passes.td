@@ -660,20 +660,32 @@ def AffineRegisterBlockPass
            "addressing of tensor contractions (batched matmul) where SLP fails. "
            "Falls back to the scalar+SLP path when a band is not cleanly "
            "vectorizable (non-constant bounds, gather access, etc.).">,
-    // PORTABILITY (vl): `vl` is a fixed ELEMENT count, not ISA-derived. 8 is
-    // the MEASURED optimum on AVX-512 for both f64 and f32 (the broadcast
-    // kernel is ILP-bound, not register-width-bound -- filling the register,
-    // e.g. vl=16 for f32, halves the accumulators and is ~13% slower; see
-    // COSTMODEL_PORTABILITY_FINDINGS.md spike #4). For a non-x86 target an
-    // auto/per-arch scaffold (vl = vectorWidthBits/elemBits, opt-in) was
-    // prototyped and reverted as measured-slower-on-AVX-512 + incomplete (true
-    // NEON/SVE portability also needs mr/nr arch-derivation, since mr*nr=128
-    // accumulator values exceed NEON's 512 B register file at any vl). Re-add
-    // it behind a `vector-width-bits` option when tuning on real ARM hardware.
+    // PORTABILITY (vl): `vl` is an ELEMENT count.  The static default 8 is the
+    // value MachineModel::preferredVectorElems() derives for this dev host (AMD
+    // Zen4: 256-bit native FP datapath -> 8 f32 / 8 f64-after-reg-floor).  When
+    // a cost-model JSON describes the machine's vector-execution model (arch.
+    // vector_bits_native / vector_bits_arch / vec_reg_budget) the pass DERIVES
+    // vl from it instead (a native-512 Xeon -> 16 for f32), unless --vl pins a
+    // value.  WP-G1 finding: vl=8 vs 16 is throughput-neutral for the GEMM
+    // broadcast kernel on Zen4 (-0.008 s); the end-to-end vl=8 win is the
+    // small-extent conv interiors clearing `interiorWidth >= VL` (a coverage
+    // effect -- see conv-vl / WP-G3), NOT register width.  See MachineModel.h
+    // and claude-docs/COSTMODEL_PORTABILITY_FINDINGS.md (WP-G1 + Idun spike).
     Option<"vl", "vl", "unsigned", "8",
-           "Vector lane width for the broadcast vector micro-kernel (doubles per "
-           "vector; 8 = one AVX-512 zmm). mr x vl accumulators must fit the "
-           "vector register file.">,
+           "Vector lane ELEMENT count for the broadcast vector micro-kernel "
+           "(8 = a 256-bit ymm for f32, a 512-bit zmm for f64). mr x ceil(nr/vl) "
+           "accumulators must fit the vector register file. Default 8 is the "
+           "Zen4 value derived by MachineModel::preferredVectorElems; a "
+           "cost-model JSON's vector model overrides it per-machine unless this "
+           "option is set.">,
+    Option<"convVl", "conv-vl", "unsigned", "0",
+           "Per-stage VL override for the direct-conv Stage 1d only (0 = use vl). "
+           "The conv interiors have a SMALLER vectorizable spatial extent than the "
+           "GEMM j-dim (a 14x14 conv interior is 8 wide, below a vl=16 zmm), so "
+           "the throughput-optimal conv VL differs from the GEMM VL. Introduced "
+           "for the WP-G1 attribution (split the vl16->vl8 win between conv "
+           "coverage and GEMM ymm-preference); WP-G3 generalizes this to a "
+           "per-band pickVL(extent).">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string",
            /*default=*/"",
            "Path to a JSON cost-model file; sources l3-size/llc-sharers from "

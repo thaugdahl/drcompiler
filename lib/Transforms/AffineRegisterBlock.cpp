@@ -765,6 +765,32 @@ public:
         l3Size = static_cast<unsigned>(mm.l3Size);
       if (!llcSharers.hasValue())
         llcSharers = mm.llcSharers;
+      // WP-G1: derive the register-block vector width from the machine's
+      // vector-execution model, but ONLY when a cost-model JSON described it
+      // (hasExplicitVectorModel) and the CLI did not pin `vl`.  Otherwise the
+      // static `vl` option default (8 == the Zen4 value) stands, keeping every
+      // pre-WP-G1 lit test byte-identical.  `vl` is a single function-wide
+      // value, so derive it from the WIDEST floating-point accumulator across
+      // all innermost reductions: a vl valid for the widest type (e.g. f64) is
+      // valid for any narrower one (f32@vl=8 is a ymm, f64@vl=8 a zmm), whereas
+      // the narrow type's wider vl would overflow the register file for the
+      // wide type.  Only FP accumulators count (the vector micro-kernels are
+      // FP); a function with none keeps the static default.
+      if (!vl.hasValue() && mm.hasExplicitVectorModel) {
+        int64_t elemBytes = 0; // max over FP reduction accumulators
+        func.walk([&](AffineForOp red) {
+          if (!isInnermost(red))
+            return;
+          SmallVector<Acc> accs = collectAccumulators(red);
+          if (accs.empty())
+            return;
+          Type et = cast<MemRefType>(accs[0].memref.getType()).getElementType();
+          if (isa<FloatType>(et))
+            elemBytes = std::max<int64_t>(elemBytes, et.getIntOrFloatBitWidth() / 8);
+        });
+        if (elemBytes > 0)
+          vl = static_cast<unsigned>(mm.preferredVectorElems(elemBytes, mr, nr));
+      }
     }
 
     // Stage 0 (WP4): raise the symm scatter into a register-blockable
@@ -1056,8 +1082,9 @@ public:
           return;
         convBands.push_back({sp, std::move(band)});
       });
+      unsigned cvl = convVl ? convVl : vl;
       for (auto &cb : convBands)
-        (void)vectorizeConvBand(cb.first, cb.second, vl, rewriter);
+        (void)vectorizeConvBand(cb.first, cb.second, cvl, rewriter);
     }
 
     // Stage 2: collect the distinct outer spatial loops of each reduction.

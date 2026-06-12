@@ -38,6 +38,13 @@ struct CpuArchJsonParams {
   std::optional<double> alphaMem;
   std::optional<double> betaReg;
   std::optional<double> gammaAlu;
+  // Vector-execution model (WP-G1: portable register-block VL selection).
+  // Present only when the JSON's `arch` block sets them; absence keeps the
+  // built-in (Zen4) MachineModel defaults and the static vl option default.
+  std::optional<unsigned> vectorBitsNative; // throughput-effective FP datapath
+  std::optional<unsigned> vectorBitsArch;   // widest ISA-encodable vector
+  std::optional<unsigned> vecRegBudget;     // vector regs usable for accumulators
+  std::optional<double> avx512FreqThrottle; // Intel AVX-512 license downclock
 };
 
 /// Optional register-block parameters parsed from a cost-model JSON's

@@ -1,0 +1,9 @@
+{
+  "arch": {
+    "triplet": "x86_64-xeon-gold",
+    "vector_bits_native": 512,
+    "vector_bits_arch": 512,
+    "vec_reg_budget": 24,
+    "avx512_freq_throttle": 0.88
+  }
+}
