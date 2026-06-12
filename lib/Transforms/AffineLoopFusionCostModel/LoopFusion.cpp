@@ -2242,6 +2242,14 @@ void DrAffineLoopFusionPass::runOnOperation() {
       config.cache.l3Latency = *cj.l3Latency;
     if (cj.memLatency)
       config.cache.memLatency = *cj.memLatency;
+    // CROSSCUTTING.md P0: previously omitted, leaving the fusion fork
+    // line-size-non-portable and permanently contention-blind (llcSharers
+    // pinned 1).  Default literal (64 B line / 1 sharer) is unchanged when the
+    // JSON omits them.
+    if (cj.cacheLine)
+      config.cache.cacheLineSize = *cj.cacheLine;
+    if (cj.llcSharers)
+      config.cache.llcSharers = *cj.llcSharers;
   }
 
   dr_fusion::gActive = &config;
