@@ -102,6 +102,41 @@ it. No axis-selection fix is needed.)
 
 ---
 
+## WP-O2 — Direct-conv register-block (the 3x3 convs): spike PASS, building
+
+### Spike gate (≥2x required before any matcher work): PASS, 11.7x
+
+Hand-wrote two MLIR kernels for a representative resnet50 interior 3x3 layer
+(oc=64, oh=56, ow=64, ic=64, constant bounds — the padded border excluded):
+(A) scalar de-promoted memref form (what LLVM -O2 autovectorizes); (B) an
+ow-vectorized micro-kernel (vectorize ow by VL=16, broadcast `w[oc,ic,kh,kw]`,
+stream `in[ic,oh+kh,ow+kw:+16]` as a contiguous `affine.vector_load`, carry a
+`vector<16>` accumulator through the ic/kh/kw band). Anti-hoist dependency in
+the driver (each rep perturbs `in` from the prior `Y` — else the REPS loop is
+hoisted to one call), REPS=100, best-of-5:
+
+| variant | per-call | GFLOP/s |
+|---|---|---|
+| scalar interior (LLVM -O2) | 72.6 ms | 3.6 |
+| **ow-vectorized micro-kernel** | **6.2 ms** | **42.6** |
+
+**11.7x, checksums identical** (264 MFLOP/call). The kernel is the 1x1 broadcast
+kernel's shape — broadcast the weight, stream the stride-1 spatial operand —
+but over a 3-loop reduction *band* (ic/kh/kw) instead of a single k. Well above
+the gate; im2col (the non-goal fallback) is not needed.
+
+### Build plan (in progress)
+
+1. De-promote the NESTED 3-level conv iter_args (ic→kh→kw threading one
+   accumulator) to a single memref accumulator — WP-O1's pass only handles
+   single-level, so this extends the matcher to a reduction band.
+2. Interior/border split: the kh/kw bounds are `max/min` (padding); split oh/ow
+   so the interior strips get constant `0..K` bounds, borders stay scalar.
+3. Generalize the broadcast vectorizer to vectorize along the spatial loop
+   enclosing a multi-loop reduction band (carry the vector accumulator through
+   every band level), instead of requiring a single innermost reduction.
+   Spike files: `/tmp/onnx_spike/conv3x3_{scalar,vec}.mlir`, `driver3x3.c`.
+
 ## Validation harness (built this session)
 
 - `/tmp/onnx_spike/conv1x1_itargs.mlir` — onnx-mlir iter_args form (the input).
