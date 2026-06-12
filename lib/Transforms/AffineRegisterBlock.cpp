@@ -346,8 +346,13 @@ bool isInnermost(AffineForOp loop) {
 }
 
 /// The innermost reduction loop under `root`: an innermost loop with a
-/// k-invariant accumulator (collectAccumulators non-empty).
-static AffineForOp findReductionLoopUnder(Operation *root) {
+/// k-invariant accumulator (collectAccumulators non-empty).  When `accFilter`
+/// is non-null, only a reduction whose accumulator is exactly that memref
+/// matches -- used by Stage 3 to re-find THIS band's reduction after the jam
+/// (the accumulator alloc uniquely identifies a band and survives the jam),
+/// instead of the global-first reduction, which mispairs across repeated shapes.
+static AffineForOp findReductionLoopUnder(Operation *root,
+                                          Value accFilter = nullptr) {
   AffineForOp found;
   root->walk([&](AffineForOp loop) {
     if (found || !isInnermost(loop))
@@ -355,6 +360,8 @@ static AffineForOp findReductionLoopUnder(Operation *root) {
     SmallVector<Acc> accs = collectAccumulators(loop);
     if (accs.empty())
       return;
+    if (accFilter && accs[0].memref != accFilter)
+      return; // not the band we are re-finding
     // Skip purely rank-0 (scalar) reductions.  They are never register-block
     // targets -- Stage 2 excludes them (addrDependsOnIV is false on a rank-0
     // store) -- and must not SHADOW a real >=1D reduction during the post-jam
@@ -1145,24 +1152,38 @@ public:
       // single-kernel function this is identical to the global decision.
       unsigned mrB = mrEff, nrB = nrEff;
       bool reassocB = reassoc;
-      if (familySelect) {
-        if (AffineForOp predRed = findReductionLoopUnder(sOut)) {
-          if (AffineForOp predSin = predRed->getParentOfType<AffineForOp>()) {
-            int nMul = 0;
-            if (detectFamily(predRed, predSin, nMul) == RBFamily::Dot) {
-              reassocB = true;
-              mrB = nrB = (nMul > 2) ? 2u : 4u;
-            } else {
-              reassocB = false;
-              mrB = mr;
-              nrB = nr;
-            }
+      // Identify THIS band's reduction BEFORE the jam and capture its
+      // accumulator memref -- the stable identity used to re-find the SAME band
+      // after the jam.  Using the global findReductionLoopUnder(func) after the
+      // jam mispairs as soon as any earlier band is left un-vectorized (a
+      // repeated shape -- resnet50's residual blocks emit several 1024x196 /
+      // 256x196 GEMMs): the global walk returns the stranded earlier band, not
+      // this one, so this band's jammed accumulators are never vectorized and
+      // every following sOut then re-targets the same stranded band -- a
+      // cascade that left 16 of 33 GEMMs jammed-scalar in DRAM.
+      AffineForOp preRed = findReductionLoopUnder(sOut);
+      Value bandAcc;
+      if (preRed)
+        if (SmallVector<Acc> pa = collectAccumulators(preRed); !pa.empty())
+          bandAcc = pa[0].memref;
+      if (familySelect && preRed) {
+        if (AffineForOp predSin = preRed->getParentOfType<AffineForOp>()) {
+          int nMul = 0;
+          if (detectFamily(preRed, predSin, nMul) == RBFamily::Dot) {
+            reassocB = true;
+            mrB = nrB = (nMul > 2) ? 2u : 4u;
+          } else {
+            reassocB = false;
+            mrB = mr;
+            nrB = nr;
           }
         }
       }
       if (mrB > 1 && failed(affine::loopUnrollJamByFactor(sOut, mrB)))
         continue;
-      AffineForOp red = findReductionLoopUnder(func);
+      // Re-find THIS band's reduction by its accumulator memref (stable across
+      // the jam, and robust to sOut dangling when its trip count == mr).
+      AffineForOp red = findReductionLoopUnder(func, bandAcc);
       if (!red)
         continue;
       AffineForOp sIn = red->getParentOfType<AffineForOp>();
@@ -1196,7 +1217,7 @@ public:
                               << sIn.getLoc() << "\n");
       if (nrB > 1 && failed(affine::loopUnrollJamByFactor(sIn, nrB)))
         continue;
-      red = findReductionLoopUnder(func);
+      red = findReductionLoopUnder(func, bandAcc);
       if (!red)
         continue;
       // Dot family: EXPLICIT reduction-vectorization over k (vector dialect, no
