@@ -63,9 +63,11 @@ namespace {
 /// ready to demote.
 struct Match {
   AffineForOp red;        // the OUTERMOST iter_args reduction loop (result stored)
-  AffineStoreOp store;    // the store consuming red's result (the accumulator)
-  Value init;             // the iter_args init value (accumulator seed)
+  AffineStoreOp store;    // the store consuming the band's result (the accumulator)
+  Value init;             // the value the init nest stores (seed, or bias for Case B)
   arith::AddFOp addf;     // the INNERMOST reduction add
+  arith::AddFOp epilogue; // Case B: the `band + bias` add to fold away (else null)
+  Operation *epiBiasDef;  // Case B: the bias def to clone into the init nest (or null)
   SmallVector<AffineForOp> redBand; // reduction loops outer->inner (1 = GEMM, 3 = 3x3 conv)
   SmallVector<AffineForOp> spatial; // enclosing perfect spatial loops, outer->inner
 };
@@ -76,6 +78,15 @@ static bool definedOutside(Value v, AffineForOp loop) {
   if (!def)
     return !loop->isAncestor(cast<BlockArgument>(v).getOwner()->getParentOp());
   return !loop->isAncestor(def);
+}
+
+/// True if `v` is a constant +0.0 (the additive identity -- a band seeded with 0
+/// can fold an additive `+ bias` epilogue into a bias-valued init).
+static bool isZeroConst(Value v) {
+  if (auto c = v.getDefiningOp<arith::ConstantOp>())
+    if (auto f = dyn_cast<FloatAttr>(c.getValue()))
+      return f.getValue().isZero();
+  return false;
 }
 
 /// Match a demotable reduction rooted at `red`.  Returns false (no change) on
@@ -124,12 +135,51 @@ static bool matchReduction(AffineForOp red, Match &m) {
       return false;
   }
 
-  // Single use: the result is stored directly (Case A).  A nested conv
-  // reduction's result feeds an outer yield, not a store -> fails here.
+  // The band's result is consumed either by a store DIRECTLY (Case A) or through
+  // a single additive epilogue `band + bias` whose result is stored (Case B --
+  // onnx-mlir's conv+bias).  A nested reduction's inner result feeds an outer
+  // yield, not a store -> fails here.
   if (!red.getResult(0).hasOneUse())
     return false;
-  auto store = dyn_cast<AffineStoreOp>(*red.getResult(0).getUsers().begin());
-  if (!store || store.getValueToStore() != red.getResult(0))
+  Operation *user = *red.getResult(0).getUsers().begin();
+  AffineStoreOp store;
+  arith::AddFOp epilogue;
+  Operation *epiBiasDef = nullptr;
+  Value initVal = red.getInits()[0];
+  if (auto st = dyn_cast<AffineStoreOp>(user)) {
+    if (st.getValueToStore() != red.getResult(0))
+      return false;
+    store = st;
+    if (!definedOutside(initVal, red))
+      return false;
+  } else if (auto ep = dyn_cast<arith::AddFOp>(user)) {
+    // Case B: fold `band + bias` by seeding the accumulator with bias and
+    // dropping the add.  Correct only when the band seed is the additive
+    // identity (0): then result = 0 + sum, and bias + sum = bias-seeded sum.
+    if (!ep.getResult().hasOneUse() || !isZeroConst(initVal))
+      return false;
+    auto st = dyn_cast<AffineStoreOp>(*ep.getResult().getUsers().begin());
+    if (!st || st.getValueToStore() != ep.getResult())
+      return false;
+    Value E = (ep.getLhs() == red.getResult(0)) ? ep.getRhs() : ep.getLhs();
+    if (E == red.getResult(0))
+      return false;
+    // The bias must be clonable into the init nest: either it already dominates
+    // the band, or it is one op (e.g. a bias load) in red's block whose own
+    // operands dominate the band.
+    if (Operation *Edef = E.getDefiningOp()) {
+      if (Edef->getBlock() == red->getBlock()) {
+        for (Value o : Edef->getOperands())
+          if (!definedOutside(o, red))
+            return false;
+        epiBiasDef = Edef;
+      } else if (!definedOutside(E, red))
+        return false;
+    }
+    store = st;
+    epilogue = ep;
+    initVal = E;
+  } else
     return false;
   if (store->getBlock() != red->getBlock())
     return false;
@@ -141,27 +191,31 @@ static bool matchReduction(AffineForOp red, Match &m) {
       if (o == rl.getInductionVar())
         return false;
 
-  // The init must be usable in the init nest (dominates the whole band): a
-  // value defined outside the reduction loop.  Constants and block args qualify.
-  if (!definedOutside(red.getInits()[0], red))
-    return false;
-
   // Collect the enclosing perfect spatial band: each enclosing affine.for must
-  // hold exactly its single inner loop (+ terminator), except the innermost,
-  // whose body is {red, store, terminator}.  Imperfect enclosers are not
-  // cloned (conservative).
+  // hold exactly its single inner loop (+ terminator).  red's own block must
+  // hold ONLY the band, the store, and (Case B) the epilogue add + bias def --
+  // anything else would be duplicated wrongly by the init nest.
   SmallVector<AffineForOp> spatial;
   Operation *innerBody = red->getBlock()->getParentOp();
-  // innermost spatial loop body must be exactly red + store + terminator
-  if (red->getBlock()->getOperations().size() != 3)
-    return false;
+  {
+    llvm::SmallPtrSet<Operation *, 4> allowed{red.getOperation(),
+                                              store.getOperation()};
+    if (epilogue)
+      allowed.insert(epilogue.getOperation());
+    if (epiBiasDef)
+      allowed.insert(epiBiasDef);
+    for (Operation &op : red->getBlock()->without_terminator())
+      if (!allowed.count(&op))
+        return false;
+  }
   for (Operation *cur = red->getParentOp(); auto f = dyn_cast<AffineForOp>(cur);
        cur = cur->getParentOp()) {
-    if (!spatial.empty()) {
-      // f must perfectly enclose the previous spatial loop.
-      if (f.getBody()->getOperations().size() != 2)
-        return false;
-    }
+    // Stop (don't bail) at the first imperfect enclosing loop -- e.g. onnx-mlir
+    // puts a trip-1 group `affine.apply` between oc and oh.  The collected inner
+    // loops are still a clean perfect band; the uncollected outer ones simply
+    // enclose both the init nest and the reduction nest, which is fine.
+    if (!spatial.empty() && f.getBody()->getOperations().size() != 2)
+      break;
     spatial.push_back(f);
   }
   (void)innerBody;
@@ -171,8 +225,10 @@ static bool matchReduction(AffineForOp red, Match &m) {
 
   m.red = red;
   m.store = store;
-  m.init = red.getInits()[0];
+  m.init = initVal;
   m.addf = addf;
+  m.epilogue = epilogue;
+  m.epiBiasDef = epiBiasDef;
   m.redBand = std::move(band);
   m.spatial = std::move(spatial);
   return true;
@@ -203,12 +259,23 @@ static void emitInitNest(Match &m, OpBuilder &b) {
     b.setInsertionPointToStart(nf.getBody());
     innermost = nf;
   }
-  // innermost body: store init at the (remapped) accumulator subscript.
+  // innermost body: store the seed at the (remapped) accumulator subscript.
+  // Case B folds the bias epilogue here: the seed is the bias value, whose def
+  // (e.g. a `load bias[oc]`) lives after the band, so it must be CLONED into the
+  // init body (its operands dominate this point); plain Case A uses the seed
+  // value directly (it already dominates).
+  Value seed = m.init;
+  if (m.epiBiasDef) {
+    // Remap the bias def's operands to the init nest's IVs (e.g. a `load
+    // bias[oc]` must use the init nest's oc, not the original loop's).
+    Operation *cl = b.clone(*m.epiBiasDef, map);
+    seed = cl->getResult(0);
+  }
   SmallVector<Value> idx = llvm::to_vector(m.store.getMapOperands());
   for (Value &v : idx)
     if (Value mv = map.lookupOrNull(v))
       v = mv;
-  b.create<AffineStoreOp>(loc, m.init, m.store.getMemRef(), m.store.getAffineMap(),
+  b.create<AffineStoreOp>(loc, seed, m.store.getMemRef(), m.store.getAffineMap(),
                           idx);
 }
 
@@ -243,9 +310,16 @@ static void demoteReduction(Match &m, OpBuilder &b) {
   Value acc = map.lookupOrDefault(innerYield.getOperand(0));
   b.create<AffineStoreOp>(loc, acc, mem, idxMap, idx);
 
-  // The original direct store of the band's result is now redundant; the
-  // accumulator already holds the final value after the band.
+  // The original store of the band's result is now redundant; the accumulator
+  // already holds the final value after the band.  For Case B the store fed off
+  // the bias-add epilogue, which is folded into the init nest -- erase the store,
+  // the dead epilogue add, and its now-dead bias def.
   m.store.erase();
+  if (m.epilogue) {
+    m.epilogue.erase();
+    if (m.epiBiasDef && m.epiBiasDef->use_empty())
+      m.epiBiasDef->erase();
+  }
   outer.erase();
 }
 
