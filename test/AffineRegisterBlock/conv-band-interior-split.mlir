@@ -61,8 +61,11 @@ func.func @conv3x3_padded(%in: memref<64x58x58xf32>, %w: memref<64x64x3x3xf32>, 
 // CHECK:   affine.for %{{.*}} = max #map{{.*}} to min #map
 // CHECK:     affine.for %{{.*}} = max #map{{.*}} to min #map
 
-// A sub-VL spatial extent (14x14 at VL=16) must NOT be split: the interior
-// would be below VL, so the whole band stays one scalar loop.
+// WP-G3 (per-band VL): a 14x14 interior (width 12) is below the pinned machine
+// VL=16 but >= 8, so pickConvVL drops THIS band's VL to 8 and vectorizes the
+// interior at VL=8 (before WP-G3 the band was left wholly scalar because the
+// interior was sub-VL-16).  56/28 (interior >= 16) keep VL=16; an interior < 4
+// still stays scalar.
 // CHECK-LABEL: func.func @conv3x3_14
 func.func @conv3x3_14(%in: memref<256x16x16xf32>, %w: memref<256x256x3x3xf32>, %Y: memref<256x14x14xf32>) {
   affine.for %oc = 0 to 256 {
@@ -86,6 +89,11 @@ func.func @conv3x3_14(%in: memref<256x16x16xf32>, %w: memref<256x256x3x3xf32>, %
   return
 }
 
-// CHECK: affine.for %{{.*}} = 0 to 14 {
-// CHECK-NOT: affine.for %{{.*}} = 1 to 13
-// CHECK-NOT: vector
+// Interior [1, 13) split into a VL=8 main [1, 9) + scalar tail [9, 13), wrapped
+// by the scalar left/right borders; the accumulator slab is a vector<8> iter_arg.
+// CHECK: affine.for %{{.*}} = 0 to 1 {
+// CHECK: affine.for %{{.*}} = 1 to 9 step 8 {
+// CHECK:   affine.vector_load %{{.*}} : memref<256x14x14xf32>, vector<8xf32>
+// CHECK:   affine.for %{{.*}} = 0 to 256 iter_args({{.*}}) -> (vector<8xf32>)
+// CHECK:     affine.vector_load %{{.*}} : memref<256x16x16xf32>, vector<8xf32>
+// CHECK:     vector.broadcast

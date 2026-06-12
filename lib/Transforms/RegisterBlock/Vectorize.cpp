@@ -407,6 +407,20 @@ static LogicalResult solveClampMap(AffineMap m, unsigned owPos, bool isLower,
   return success();
 }
 
+/// WP-G3: the largest power-of-two vector length in {4, 8, ..., maxVL} that does
+/// not exceed the vectorizable spatial `extent`.  Lets a conv interior narrower
+/// than the machine VL still vectorize at a smaller width (a 7x7 interior of 4
+/// -> VL=4) instead of bailing to scalar, while a wide interior keeps the
+/// machine VL (maxVL, already the per-machine ceiling from WP-G1).  Returns 0
+/// when extent < 4 (a vector kernel is not worth it -- the band is left scalar
+/// and the promote pass keeps its accumulator in a register).
+static unsigned pickConvVL(int64_t extent, unsigned maxVL) {
+  unsigned v = 1;
+  while (v * 2 <= maxVL && (int64_t)(v * 2) <= extent)
+    v *= 2;
+  return v >= 4 ? v : 0;
+}
+
 /// Vectorize a direct-conv reduction BAND along the spatial loop `sp` (ow).
 /// `bandLoops` is the reduction band outer->inner (e.g. ic, kh, kw); the
 /// innermost loop holds a single memref accumulator Y[.., ow] that is stride-1
@@ -519,9 +533,13 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
     }
     clamps.push_back({L, cLb, cUb});
   }
-  // Sub-VL interior (the 14x14 / 7x7 layers at VL=16): nothing to vectorize;
-  // bail BEFORE mutating so the band stays a single scalar loop.
-  if (owHi - owLo < (int64_t)VL)
+  // WP-G3: pick the per-band VL from the vectorizable interior extent instead
+  // of bailing when it is narrower than the machine VL.  A 7x7 conv interior
+  // (4 wide) vectorizes at VL=4; a 14x14 (>=8) keeps VL=8; 56/28 unchanged.
+  // Computed AFTER the interior [owLo, owHi) is solved and BEFORE mutating, so a
+  // too-narrow interior (<4) still leaves the band a single scalar loop.
+  unsigned VLe = pickConvVL(owHi - owLo, VL);
+  if (VLe < 4)
     return failure();
   if (!clamps.empty()) {
     if (owLo > spLb) {
@@ -551,7 +569,7 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
   // clamp-inactive region by construction (mainUb <= owHi).
   {
     int64_t lb = sp.getConstantLowerBound(), ub = sp.getConstantUpperBound();
-    int64_t mainUb = lb + ((ub - lb) / (int64_t)VL) * (int64_t)VL;
+    int64_t mainUb = lb + ((ub - lb) / (int64_t)VLe) * (int64_t)VLe;
     if (mainUb < ub) {
       rewriter.setInsertionPointAfter(sp);
       auto tail = cast<AffineForOp>(rewriter.clone(*sp.getOperation()));
@@ -562,7 +580,7 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
 
   Location loc = sp.getLoc();
   auto elemTy = cast<MemRefType>(a.memref.getType()).getElementType();
-  auto vecTy = VectorType::get({(int64_t)VL}, elemTy);
+  auto vecTy = VectorType::get({(int64_t)VLe}, elemTy);
 
   // Seed: vector_load the accumulator slab once, before the band.
   rewriter.setInsertionPoint(bandLoops.front());
@@ -602,7 +620,7 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
   rewriter.create<affine::AffineVectorStoreOp>(loc, result, a.memref, a.map,
                                                a.operands);
   rewriter.eraseOp(bandLoops.front());
-  sp.setStep(VL);
+  sp.setStep(VLe);
   return success();
 }
 
