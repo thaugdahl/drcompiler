@@ -366,6 +366,18 @@ static AffineForOp findReductionLoopUnder(Operation *root) {
           return cast<MemRefType>(a.memref.getType()).getRank() == 0;
         }))
       return;
+    // Skip a conv-band inner reduction: a multi-loop contraction band (ic/kh/kw)
+    // whose innermost loop's PARENT is itself a reduction loop (its IV does not
+    // index the accumulator).  These are owned by the direct-conv Stage 1d, not
+    // the GEMM stages; without this guard Stage 3's re-find returns a conv kw
+    // loop and derails the 1x1 GEMM processing that coexists in the same fn.
+    if (auto parent = loop->getParentOfType<AffineForOp>()) {
+      AffineStoreOp st;
+      AffineLoadOp ld;
+      if (findAccPair(loop, st, ld) &&
+          !addrDependsOnIV(st, parent.getInductionVar()))
+        return;
+    }
     found = loop;
   });
   return found;

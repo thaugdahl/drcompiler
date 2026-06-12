@@ -338,6 +338,30 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
   accLoads.insert(a.load.getOperation());
   if (!canVectorizeDAG(a.storedVal, accLoads, owIV, inner.getBody()))
     return failure();
+  // SAFETY: canVectorizeDAG treats a load whose direct operands omit `owIV` as
+  // ow-invariant (-> broadcast).  But onnx-mlir precomputes indices via
+  // affine.apply, so `in[.., apply(kw, ow)]` hides ow behind the apply and a
+  // stride-2 stem (in idx = ow*2+kw-3) would be mis-broadcast -> invalid/ wrong
+  // code.  Bail if ANY band load reaches owIV transitively yet is not provably
+  // stride-1 in ow.  (Composing the applies to vectorize such convs is WP-O2
+  // part 3b; until then this keeps the pass correct.)
+  std::function<bool(Value)> reachesOw = [&](Value v) -> bool {
+    if (v == owIV)
+      return true;
+    Operation *d = v.getDefiningOp();
+    if (!d || !isa<affine::AffineApplyOp>(d))
+      return false;
+    for (Value o : d->getOperands())
+      if (reachesOw(o))
+        return true;
+    return false;
+  };
+  for (Operation &op : inner.getBody()->without_terminator())
+    if (auto ld = dyn_cast<AffineLoadOp>(&op))
+      if (!innermostStrideOne(ld, owIV))
+        for (Value o : ld.getMapOperands())
+          if (reachesOw(o))
+            return failure();
   std::optional<uint64_t> trip = affine::getConstantTripCount(sp);
   if (!trip || *trip % VL != 0)
     return failure();
