@@ -22,6 +22,7 @@ add_mlir_library(DRCompTransforms
   PrintRegisterPressure.cpp
   RaiseMallocToMemRef.cpp
   ScalarReductionDemote.cpp
+  ScalarReductionPromote.cpp
   TestReuseAnalysis.cpp
   Utils/OpDispatchUtils.cpp
   Utils/MemrefBaseAnalysis.cpp

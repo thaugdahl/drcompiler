@@ -242,6 +242,32 @@ def DrScalarReductionDemotePass
   let constructor = "mlir::createDrScalarReductionDemotePass()";
 }
 
+def DrScalarReductionPromotePass
+    : Pass<"dr-scalar-reduction-promote", "mlir::func::FuncOp">
+{
+  let summary = "Raise leftover memref accumulators back to iter_args";
+
+  let description = [{
+    Inverse of dr-scalar-reduction-demote, run AFTER affine-register-block.
+    Bands the demote pass rewrote but register-block did not take (sub-VL
+    convs, stride-2 convs, non-vectorizable GEMMs, and the scalar
+    borders/tails the conv splitter creates) are left accumulating into the
+    real output tensor in memory -- one load/store round-trip per innermost
+    iteration, much slower than the original SSA form.  This pass rebuilds
+    every such perfect reduction band carrying the accumulator as a scalar
+    iter_arg threaded through all levels: one load before the band, one
+    store after.
+  }];
+
+  let options = [
+    Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
+           "Emit a remark for every accumulator promoted">,
+  ];
+
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+  let constructor = "mlir::createDrScalarReductionPromotePass()";
+}
+
 def DrTestReuseAnalysisPass
     : Pass<"dr-test-reuse-analysis", "mlir::func::FuncOp">
 {
