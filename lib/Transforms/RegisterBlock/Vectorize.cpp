@@ -541,9 +541,24 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
       cl.loop.setConstantUpperBound(cl.cUb);
     }
   }
-  std::optional<uint64_t> trip = affine::getConstantTripCount(sp);
-  if (!trip || *trip % VL != 0)
-    return failure();
+  // C3: peel the vl-remainder, mirroring vectorizeBroadcastBand: the (possibly
+  // interior-split) ow range is rarely VL-divisible (54, 26, ...), so split it
+  // into a VL-divisible MAIN loop (vectorized below) + a scalar tail clone.
+  // The conv accumulator is a disjoint output column per ow (like the
+  // broadcast kernel, NOT the dot kernel), so the tail is an independent
+  // scalar copy -- no ordering constraint.  In-bounds: the main loop's last
+  // lane reads in[.., mainUb-1 + cUb-1 + offset], within the interior's
+  // clamp-inactive region by construction (mainUb <= owHi).
+  {
+    int64_t lb = sp.getConstantLowerBound(), ub = sp.getConstantUpperBound();
+    int64_t mainUb = lb + ((ub - lb) / (int64_t)VL) * (int64_t)VL;
+    if (mainUb < ub) {
+      rewriter.setInsertionPointAfter(sp);
+      auto tail = cast<AffineForOp>(rewriter.clone(*sp.getOperation()));
+      tail.setConstantLowerBound(mainUb);
+      sp.setConstantUpperBound(mainUb);
+    }
+  }
 
   Location loc = sp.getLoc();
   auto elemTy = cast<MemRefType>(a.memref.getType()).getElementType();

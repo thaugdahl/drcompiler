@@ -37,10 +37,21 @@ func.func @conv3x3_padded(%in: memref<64x58x58xf32>, %w: memref<64x64x3x3xf32>, 
 // CHECK:   affine.for %{{.*}} = max #map{{.*}} to min #map
 // CHECK:     affine.for %{{.*}} = max #map{{.*}} to min #map
 
-// Interior [1, 55): kw bounds replaced by the constants [0, 3); kh keeps its
-// oh-clamp.  (Still scalar here -- 54 is not VL-divisible; the vl-remainder
-// peel is C3.)
-// CHECK: affine.for %{{.*}} = 1 to 55 {
+// Interior main [1, 49): kw bounds replaced by the constants [0, 3), kh keeps
+// its oh-clamp, and the VL-divisible main is vectorized (C3 peel): the
+// accumulator slab is carried as a vector<16> iter_arg through the whole band,
+// the input load is contiguous in ow, the weight a broadcast.
+// CHECK: affine.for %{{.*}} = 1 to 49 step 16 {
+// CHECK:   affine.vector_load %arg2[{{.*}}] : memref<64x56x56xf32>, vector<16xf32>
+// CHECK:   affine.for %{{.*}} = 0 to 64 iter_args({{.*}}) -> (vector<16xf32>)
+// CHECK:     affine.for %{{.*}} = max #map{{.*}} to min #map{{.*}} iter_args({{.*}}) -> (vector<16xf32>)
+// CHECK:       affine.for %{{.*}} = 0 to 3 iter_args({{.*}}) -> (vector<16xf32>)
+// CHECK:         affine.vector_load %arg0[{{.*}}] : memref<64x58x58xf32>, vector<16xf32>
+// CHECK:         vector.broadcast
+// CHECK:   affine.vector_store
+
+// Scalar vl-remainder tail [49, 55): constant kw bounds, no vector ops.
+// CHECK: affine.for %{{.*}} = 49 to 55 {
 // CHECK:   affine.for %{{.*}} = 0 to 64 {
 // CHECK:     affine.for %{{.*}} = max #map{{.*}} to min #map
 // CHECK:       affine.for %{{.*}} = 0 to 3 {
