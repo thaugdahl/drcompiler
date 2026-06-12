@@ -350,6 +350,63 @@ static void composeBandMemOps(AffineForOp sp, IRRewriter &rewriter) {
   }
 }
 
+/// C2 (WP-O2 part 3b): solve one clamped bound map of a padded conv's inner
+/// reduction loop for the spatial interior.  `m` is a max (lower, isLower) or
+/// min (upper) bound map whose dim `owPos` is the spatial IV; supported (v1)
+/// shape: exactly two results, one constant `cst` and one `a*ow + b` with
+/// a in {+1,-1} and no other dims/symbols (all stride-1 onnx convs).  The
+/// clamp is inactive -- the constant result dominates -- where `e(ow) <= cst`
+/// (max) resp. `e(ow) >= cst` (min); tighten the interior `[lo, hi)` by that
+/// half-line and return `cst`.  Anything else fails (band stays scalar).
+static LogicalResult solveClampMap(AffineMap m, unsigned owPos, bool isLower,
+                                   int64_t &lo, int64_t &hi, int64_t &cst) {
+  if (m.getNumResults() != 2)
+    return failure();
+  std::optional<int64_t> c;
+  std::optional<std::pair<int64_t, int64_t>> lin; // (a, b)
+  for (AffineExpr e : m.getResults()) {
+    if (auto ce = dyn_cast<AffineConstantExpr>(e)) {
+      if (c)
+        return failure();
+      c = ce.getValue();
+      continue;
+    }
+    for (unsigned d = 0; d < m.getNumDims(); ++d)
+      if (d != owPos && e.isFunctionOfDim(d))
+        return failure();
+    for (unsigned s = 0; s < m.getNumSymbols(); ++s)
+      if (e.isFunctionOfSymbol(s))
+        return failure();
+    AffineExpr dOw = getAffineDimExpr(owPos, m.getContext());
+    AffineExpr bP = simplifyAffineExpr(e - dOw, m.getNumDims(), m.getNumSymbols());
+    AffineExpr bN = simplifyAffineExpr(e + dOw, m.getNumDims(), m.getNumSymbols());
+    if (lin)
+      return failure();
+    if (auto bc = dyn_cast<AffineConstantExpr>(bP))
+      lin = {{1, bc.getValue()}};
+    else if (auto bc = dyn_cast<AffineConstantExpr>(bN))
+      lin = {{-1, bc.getValue()}};
+    else
+      return failure();
+  }
+  if (!c || !lin)
+    return failure();
+  auto [a, b] = *lin;
+  if (isLower) { // max(a*ow+b, c): inactive where a*ow+b <= c
+    if (a < 0)
+      lo = std::max(lo, b - *c); // ow >= b - c
+    else
+      hi = std::min(hi, *c - b + 1); // ow <= c - b
+  } else { // min(a*ow+b, c): inactive where a*ow+b >= c
+    if (a < 0)
+      hi = std::min(hi, b - *c + 1); // ow <= b - c
+    else
+      lo = std::max(lo, *c - b); // ow >= c - b
+  }
+  cst = *c;
+  return success();
+}
+
 /// Vectorize a direct-conv reduction BAND along the spatial loop `sp` (ow).
 /// `bandLoops` is the reduction band outer->inner (e.g. ic, kh, kw); the
 /// innermost loop holds a single memref accumulator Y[.., ow] that is stride-1
@@ -407,6 +464,83 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
         for (Value o : ld.getMapOperands())
           if (reachesOw(o))
             return failure();
+  // C2: a padded conv clamps the inner reduction bounds by ow (kw in
+  // [max(eLb(ow),cLb), min(eUb(ow),cUb))), which is un-vectorizable: the VL
+  // ow-lanes would each need a different kw trip count.  Solve the INTERIOR
+  // [owLo, owHi) where both clamps are provably inactive, split ow into
+  // [scalar left border | interior | scalar right border], and rewrite the
+  // interior's clamped bounds to their constants.  The borders keep the
+  // original band verbatim (a pure index-set split, no FP reorder).  Loops
+  // clamped by some OTHER IV (kh by oh) are identical across ow-lanes and are
+  // left alone.
+  if (!sp.hasConstantLowerBound() || !sp.hasConstantUpperBound())
+    return failure();
+  int64_t spLb = sp.getConstantLowerBound(), spUb = sp.getConstantUpperBound();
+  int64_t owLo = spLb, owHi = spUb;
+  struct Clamp {
+    AffineForOp loop;
+    int64_t cLb, cUb;
+  };
+  SmallVector<Clamp> clamps;
+  for (AffineForOp L : bandLoops) {
+    auto owDim = [&](Operation::operand_range ops, AffineMap m) -> int {
+      for (unsigned d = 0; d < m.getNumDims(); ++d)
+        if (ops[d] == owIV)
+          return (int)d;
+      return -1;
+    };
+    AffineMap lbM = L.getLowerBoundMap(), ubM = L.getUpperBoundMap();
+    int lbPos = owDim(L.getLowerBoundOperands(), lbM);
+    int ubPos = owDim(L.getUpperBoundOperands(), ubM);
+    bool lbDep = lbPos >= 0 && llvm::any_of(lbM.getResults(), [&](AffineExpr e) {
+                   return e.isFunctionOfDim(lbPos);
+                 });
+    bool ubDep = ubPos >= 0 && llvm::any_of(ubM.getResults(), [&](AffineExpr e) {
+                   return e.isFunctionOfDim(ubPos);
+                 });
+    if (!lbDep && !ubDep)
+      continue;
+    int64_t cLb, cUb;
+    if (lbDep) {
+      if (failed(solveClampMap(lbM, lbPos, /*isLower=*/true, owLo, owHi, cLb)))
+        return failure();
+    } else if (L.hasConstantLowerBound()) {
+      cLb = L.getConstantLowerBound();
+    } else {
+      return failure();
+    }
+    if (ubDep) {
+      if (failed(solveClampMap(ubM, ubPos, /*isLower=*/false, owLo, owHi, cUb)))
+        return failure();
+    } else if (L.hasConstantUpperBound()) {
+      cUb = L.getConstantUpperBound();
+    } else {
+      return failure();
+    }
+    clamps.push_back({L, cLb, cUb});
+  }
+  // Sub-VL interior (the 14x14 / 7x7 layers at VL=16): nothing to vectorize;
+  // bail BEFORE mutating so the band stays a single scalar loop.
+  if (owHi - owLo < (int64_t)VL)
+    return failure();
+  if (!clamps.empty()) {
+    if (owLo > spLb) {
+      rewriter.setInsertionPoint(sp);
+      auto left = cast<AffineForOp>(rewriter.clone(*sp.getOperation()));
+      left.setConstantUpperBound(owLo);
+    }
+    if (owHi < spUb) {
+      rewriter.setInsertionPointAfter(sp);
+      auto right = cast<AffineForOp>(rewriter.clone(*sp.getOperation()));
+      right.setConstantLowerBound(owHi);
+    }
+    sp.setConstantLowerBound(owLo);
+    sp.setConstantUpperBound(owHi);
+    for (Clamp &cl : clamps) {
+      cl.loop.setConstantLowerBound(cl.cLb);
+      cl.loop.setConstantUpperBound(cl.cUb);
+    }
+  }
   std::optional<uint64_t> trip = affine::getConstantTripCount(sp);
   if (!trip || *trip % VL != 0)
     return failure();
