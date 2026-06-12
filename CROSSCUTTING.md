@@ -224,22 +224,41 @@ it is single-thread.
 ## III.1 Pre-req: finish the single-thread unification (P0, do first)
 
 A cross-thread layer on top of a forked single-thread model just multiplies the
-forks. Land these first (each is small, byte-identical, and independently
-useful):
+forks. Split into byte-identical *refactors* (landed) and *design changes* that
+are NOT byte-identical and belong in the implementation phases.
 
-- **Route every contention site through `MachineModel::effectiveLLC()`** (kill
-  the 6 open-coded `l3/sharers` copies); make the fusion/tiling forks resolve
-  geometry from `MachineModel` so they *can* see `llcSharers`/`cacheLine`.
-- **Unify the register budgets.** Collapse `vecRegBudget(24)` /
-  `RegisterParams.vecBudget(16/32)` to one resolved Vec budget with a single JSON
-  key; have `preferredVectorElems` and `RegisterPressureAnalysis` read the same
-  number. Make register-block *consult* `RegisterPressureAnalysis` (or at least
-  cross-check the tile against it) instead of the lone inequality.
-- **Unify vector width.** One `vectorBitsArch` notion feeding both `classifyType`
-  and the VL model; `vectorBitsNative` stays the throughput knob.
-- **Read `mm.memLat`/`mm.cacheLine` in fission**; thread `cacheLine` into
-  `ReuseAnalysis` so the tiler/fusion reuse path is line-portable.
-- **Wire or delete `avx512FreqThrottle`** (III.6 wires it).
+**Landed — byte-identical refactors (lit 218/0 throughout):**
+- ✅ `costmodel_p0a` — route all 6 open-coded `l3/sharers` sites through the new
+  static `MachineModel::effectiveLLC(l3,sharers)` (the dead canonical API now has
+  one definition and all callers; the single place to make the share per-thread).
+- ✅ `costmodel_p0d` — fission sources `memLatency`/`cacheLine` from `MachineModel`
+  instead of the hardcoded `200`/`64` literals.
+- ✅ `costmodel_p0e` — thread `cacheLine` through `ReuseAnalysis`
+  (`loopCarriesEvictedReuse`/`anyTemporalReuse` gain a `cacheLineBytes` param,
+  default 64); the tiler passes the JSON-resolved line.
+- ✅ `costmodel_p0f` — the LoopFusion fork's JSON merge now folds `cacheLineSize`
+  and `llcSharers` (was line-non-portable + contention-blind, sharers pinned 1).
+
+**Deferred — NOT byte-identical; these are design changes, do in P1/P2:**
+- **Register-budget merge** (`vecRegBudget=24` vs `RegisterParams.vecBudget=16/32`)
+  is NOT a rename: they are *different concepts* — `vecRegBudget` is
+  "accumulator slots usable by the tile" (= total − ~8 stream/broadcast reserve),
+  `vecBudget` is the *full* vector file for spill counting. The right unification
+  is to **derive** `vecRegBudget = archVecBudget − reserve` from one source, which
+  couples `MachineModel` to `ArchHandler`/`RegisterParams` and *changes* the VL
+  decision under a JSON that sets `registers.vec_budget`. → P1 (with the
+  SMT-split, which is the cross-thread reason to touch it).
+- **register-block ↔ `RegisterPressureAnalysis`.** Making register-block *consult*
+  the liveness/graph-coloring pressure model (instead of the lone
+  `mr·⌈nr/vl⌉ ≤ vecRegBudget` inequality) can change tile/VL decisions → not a
+  refactor. P2; a byte-identical first step is a *diagnostic-only* cross-check.
+- **Vector-width merge** (`vectorBitsArch` vs `ArchParams.vectorWidthBits`): same
+  physical quantity, different defaults (512 vs 128-generic) and different
+  consumers; collapsing them changes register-pressure counts on the generic
+  arch. → P1, behind the gate.
+- **`avx512FreqThrottle`**: not dead (it triggers `hasExplicitVectorModel`) but
+  feeds no *decision*. Wiring it is the all-core-throttle of III.6 → P2 (a
+  behavior change by design).
 
 ## III.2 The `ThreadModel` (new `MachineModel` section)
 
