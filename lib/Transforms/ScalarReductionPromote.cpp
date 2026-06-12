@@ -13,10 +13,14 @@
 // splitter creates).  The WP-O1 assumption that backend mem2reg cleans these
 // up does not hold: the accumulator is a real heap buffer, not an alloca.
 //
-// This pass walks innermost loops with a memory accumulator (same-address
-// load/store pair, address invariant across the enclosing perfect reduction
-// band), and rebuilds the band carrying the accumulator as a scalar iter_arg
-// threaded through every level: one load before the band, one store after.
+// This pass walks innermost loops with one or more memory accumulators
+// (same-address load/store pairs, addresses invariant across the enclosing
+// perfect reduction band), and rebuilds the band carrying each accumulator as a
+// scalar iter_arg threaded through every level: one load before the band, one
+// store after.  N>1 (WP-G2 safety net) is the register-block mr-jam leftover --
+// a band that slipped vectorization keeps `mr` same-shape accumulators in the
+// innermost body; promoting all of them is what keeps a missed vectorization in
+// registers instead of DRAM.
 //
 //   for kw { %c = load Y[oh,ow]; store %c + in*w, Y[oh,ow] }
 //     ==>
@@ -53,13 +57,16 @@ using drcompiler::rb::Acc;
 namespace {
 
 /// A promotable band: perfectly nested reduction loops outer->inner whose
-/// innermost body carries exactly one memory accumulator with an address
-/// invariant to every level and available above the band.
+/// innermost body carries N independent memory accumulators, each with an
+/// address invariant to every band level and available above the band.  N>1 is
+/// the register-block mr-jam leftover (the WP-G2 safety net): a band that slips
+/// vectorization keeps `mr` same-shape accumulators in the innermost body; each
+/// becomes its own iter_arg so the band degrades to registers, not DRAM.
 struct Match {
   SmallVector<AffineForOp> band; // outer -> inner
-  Acc acc;
-  Match(SmallVector<AffineForOp> b, Acc a)
-      : band(std::move(b)), acc(std::move(a)) {}
+  SmallVector<Acc> accs;
+  Match(SmallVector<AffineForOp> b, SmallVector<Acc> a)
+      : band(std::move(b)), accs(std::move(a)) {}
 };
 
 /// True if `v` is defined outside `loop` (i.e. usable before it).
@@ -77,48 +84,65 @@ static std::optional<Match> matchBand(AffineForOp inner) {
   if (inner.getNumResults() != 0)
     return std::nullopt;
   SmallVector<Acc> accs = drcompiler::rb::collectAccumulators(inner);
-  if (accs.size() != 1)
+  if (accs.empty())
     return std::nullopt;
-  Acc &a = accs[0];
   // Every other effectful op in the body must be a load (cloned verbatim);
-  // a second store or a call would be reordered illegally by the rebuild.
+  // a store or call NOT belonging to one of the accumulators would be reordered
+  // illegally by the rebuild.
+  llvm::SmallPtrSet<Operation *, 16> accOps;
+  for (Acc &a : accs) {
+    accOps.insert(a.load.getOperation());
+    accOps.insert(a.store.getOperation());
+  }
   for (Operation &op : inner.getBody()->without_terminator()) {
-    if (&op == a.load.getOperation() || &op == a.store.getOperation())
+    if (accOps.contains(&op))
       continue;
     if (isMemoryEffectFree(&op) || isa<AffineLoadOp>(op))
       continue;
     return std::nullopt;
   }
-  // Grow the band upward through perfectly-nesting loops whose IV the
-  // accumulator address does not depend on (the reduction band demote
-  // created, or the conv splitter's scalar border/tail clones).
+  // Grow the band upward through perfectly-nesting loops whose IV NO
+  // accumulator address depends on (the reduction band demote created, the conv
+  // splitter's scalar border/tail clones, or an mr-jam's reduction loop).
   SmallVector<AffineForOp> band{inner};
   AffineForOp p = inner->getParentOfType<AffineForOp>();
   while (p && p.getNumResults() == 0 &&
          drcompiler::rb::onlyChildFor(p) == band.front() &&
-         !drcompiler::rb::addrDependsOnIV(a.store, p.getInductionVar())) {
+         llvm::none_of(accs, [&](const Acc &a) {
+           return drcompiler::rb::addrDependsOnIV(a.store, p.getInductionVar());
+         })) {
     band.insert(band.begin(), p);
     p = p->getParentOfType<AffineForOp>();
   }
-  // The accumulator address must be computable BEFORE the band.
-  for (Value o : a.operands)
-    if (!availableAbove(o, band.front()))
-      return std::nullopt;
-  return Match(std::move(band), std::move(a));
+  // Every accumulator address must be computable BEFORE the band.
+  for (Acc &a : accs)
+    for (Value o : a.operands)
+      if (!availableAbove(o, band.front()))
+        return std::nullopt;
+  return Match(std::move(band), std::move(accs));
 }
 
-/// Rebuild `m.band` carrying the accumulator as a scalar iter_arg through
-/// every level; load once before, store once after, erase the old band.
+/// Rebuild `m.band` carrying the N accumulators as scalar iter_args through
+/// every level; load each once before, store each once after, erase the old
+/// band.
 static void promoteBand(Match &m, OpBuilder &b) {
   AffineForOp outer = m.band.front();
-  Acc &a = m.acc;
   Location loc = outer.getLoc();
+  llvm::SmallPtrSet<Operation *, 16> accOps;
+  for (Acc &a : m.accs) {
+    accOps.insert(a.load.getOperation());
+    accOps.insert(a.store.getOperation());
+  }
 
   b.setInsertionPoint(outer);
-  Value init = b.create<AffineLoadOp>(a.loc, a.memref, a.map, a.operands);
+  SmallVector<Value> inits;
+  for (Acc &a : m.accs)
+    inits.push_back(b.create<AffineLoadOp>(a.loc, a.memref, a.map, a.operands));
 
-  std::function<Value(unsigned, Value, IRMapping &, OpBuilder &)> build =
-      [&](unsigned lvl, Value seed, IRMapping &remap, OpBuilder &bld) -> Value {
+  std::function<SmallVector<Value>(unsigned, ValueRange, IRMapping &,
+                                   OpBuilder &)>
+      build = [&](unsigned lvl, ValueRange seeds, IRMapping &remap,
+                  OpBuilder &bld) -> SmallVector<Value> {
     AffineForOp old = m.band[lvl];
     SmallVector<Value> lbOps = llvm::to_vector(old.getLowerBoundOperands());
     SmallVector<Value> ubOps = llvm::to_vector(old.getUpperBoundOperands());
@@ -128,29 +152,32 @@ static void promoteBand(Match &m, OpBuilder &b) {
       v = remap.lookupOrDefault(v);
     auto nf = bld.create<AffineForOp>(
         loc, lbOps, old.getLowerBoundMap(), ubOps, old.getUpperBoundMap(),
-        old.getStepAsInt(), ValueRange{seed},
+        old.getStepAsInt(), seeds,
         [&](OpBuilder &b2, Location l2, Value iv, ValueRange args) {
           IRMapping rm = remap;
           rm.map(old.getInductionVar(), iv);
-          Value res;
+          SmallVector<Value> res;
           if (lvl + 1 < m.band.size())
-            res = build(lvl + 1, args[0], rm, b2);
+            res = build(lvl + 1, args, rm, b2);
           else {
-            // Innermost: clone the body, the accumulator load becoming the
-            // iter_arg and its store becoming the yield.
-            rm.map(a.load.getResult(), args[0]);
+            // Innermost: each accumulator load becomes its iter_arg; clone the
+            // shared body; each accumulator's stored value becomes its yield.
+            for (auto [i, a] : llvm::enumerate(m.accs))
+              rm.map(a.load.getResult(), args[i]);
             for (Operation &op : old.getBody()->without_terminator())
-              if (&op != a.load.getOperation() && &op != a.store.getOperation())
+              if (!accOps.contains(&op))
                 b2.clone(op, rm);
-            res = rm.lookupOrDefault(a.storedVal);
+            for (Acc &a : m.accs)
+              res.push_back(rm.lookupOrDefault(a.storedVal));
           }
           b2.create<AffineYieldOp>(l2, res);
         });
-    return nf.getResult(0);
+    return SmallVector<Value>(nf.getResults().begin(), nf.getResults().end());
   };
   IRMapping remap;
-  Value result = build(0, init, remap, b);
-  b.create<AffineStoreOp>(a.loc, result, a.memref, a.map, a.operands);
+  SmallVector<Value> results = build(0, inits, remap, b);
+  for (auto [i, a] : llvm::enumerate(m.accs))
+    b.create<AffineStoreOp>(a.loc, results[i], a.memref, a.map, a.operands);
   outer.erase();
 }
 
