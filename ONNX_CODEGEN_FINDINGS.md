@@ -125,17 +125,40 @@ kernel's shape — broadcast the weight, stream the stride-1 spatial operand —
 but over a 3-loop reduction *band* (ic/kh/kw) instead of a single k. Well above
 the gate; im2col (the non-goal fallback) is not needed.
 
-### Build plan (in progress)
+### Landed
 
-1. De-promote the NESTED 3-level conv iter_args (ic→kh→kw threading one
-   accumulator) to a single memref accumulator — WP-O1's pass only handles
-   single-level, so this extends the matcher to a reduction band.
-2. Interior/border split: the kh/kw bounds are `max/min` (padding); split oh/ow
-   so the interior strips get constant `0..K` bounds, borders stay scalar.
-3. Generalize the broadcast vectorizer to vectorize along the spatial loop
-   enclosing a multi-loop reduction band (carry the vector accumulator through
-   every band level), instead of requiring a single innermost reduction.
-   Spike files: `/tmp/onnx_spike/conv3x3_{scalar,vec}.mlir`, `driver3x3.c`.
+**Part 1 — nested-band de-promotion** (commit `onnx_codegen_2a`).
+`dr-scalar-reduction-demote` generalized from a single-level reduction to a
+nested add-reduction BAND (ic→kh→kw threading one accumulator). The matcher
+descends the band; the rewrite rebuilds every level as a plain loop with the
+accumulator in memory + the separate zero-init nest. On the interior 3x3 spike
+the demoted form is byte-for-byte the hand-written scalar kernel and runs
+checksum-identical. Single-level (1x1/GEMM) unchanged.
+
+**Part 2 — direct-conv band vectorizer** (commit `onnx_codegen_2b`).
+New Stage 1d in affine-register-block detects the conv band (innermost
+accumulator loop grown upward through reduction loops to the spatial loop ow)
+and `vectorizeConvBand` re-steps ow by VL, rebuilding the band with a
+`vector<VL>` accumulator: weight→broadcast, input (stride-1 in ow)→vector load,
+accumulator→vector iter_arg. `innermostStrideOne` generalized to "coefficient of
+the IV in the innermost result == 1" (so `in[..][ow+kw]` is stride-1 in ow) — a
+strict superset, full lit unchanged. **Measured 11.4x** on the interior spike
+(matches the hand-written 11.7x), max rel-err 1e-6, lit 211/0, PolyBench
+byte-identical, resnet50 1x1 path unchanged.
+
+### Part 3 (remaining) — make it fire on real resnet50 3x3
+
+The interior spike works; real resnet50 3x3 convs do NOT yet, for two reasons:
+- **ow not vl-divisible** (ow ∈ {56,28,14,7}): needs the vl-remainder ow-peel
+  (main vl-divisible loop + scalar tail), like the broadcast kernel already has.
+- **padded kw bounds depend on ow** (`kw: max(0,1-ow)..min(3,57-ow)`): the 16
+  ow-lanes would need different kw bounds — unvectorizable. Requires the
+  interior/border split of ow into `[0,pad) ∪ [pad,W-pad) ∪ [W-pad,W)`; the
+  interior strip gets constant `kw ∈ [0,K)` and vectorizes (kh may keep its
+  oh-dependent bounds — same across all ow-lanes, so it does not block), borders
+  stay scalar.
+
+Spike files: `/tmp/onnx_spike/conv3x3_{scalar,vec,itargs}.mlir`, `driver3x3.c`.
 
 ## Validation harness (built this session)
 
