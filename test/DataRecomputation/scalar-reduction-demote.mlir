@@ -63,8 +63,9 @@ func.func @maxpool(%X: memref<64xf32>, %Y: memref<1xf32>) {
 
 // -----
 
-// A nested reduction (the result feeds an OUTER loop's yield, not a store) is
-// NOT demoted at the inner level -- the inner result has no store use.
+// A NESTED reduction band (k -> l threading one accumulator, the conv shape) is
+// demoted: the whole band is rebuilt with NO iter_args, accumulating into C in
+// memory, with a separate zero-init nest.
 
 // CHECK-LABEL: func.func @nested
 func.func @nested(%A: memref<8x8x8xf32>, %B: memref<8x8x8xf32>, %C: memref<8x8xf32>) {
@@ -86,6 +87,15 @@ func.func @nested(%A: memref<8x8x8xf32>, %B: memref<8x8x8xf32>, %C: memref<8x8xf
   }
   return
 }
-// The inner l-loop's result feeds the k-loop yield -> not stored -> left as
-// iter_args.  At least one iter_args loop must remain.
-// CHECK: iter_args
+// Init nest first (store seed, no reduction loop):
+// CHECK:      affine.for %{{.*}} = 0 to 8 {
+// CHECK-NEXT:   affine.for %{{.*}} = 0 to 8 {
+// CHECK-NEXT:     affine.store %cst, %arg2[%{{.*}}, %{{.*}}]
+// The rebuilt band: both k and l loops present, NO iter_args, memref accumulate.
+// CHECK:      affine.for %[[I:.*]] = 0 to 8 {
+// CHECK-NEXT:   affine.for %[[J:.*]] = 0 to 8 {
+// CHECK-NEXT:     affine.for %{{.*}} = 0 to 8 {
+// CHECK-NEXT:       affine.for %{{.*}} = 0 to 8 {
+// CHECK-NOT:          iter_args
+// CHECK:              affine.load %arg2[%[[I]], %[[J]]]
+// CHECK:              affine.store %{{.*}}, %arg2[%[[I]], %[[J]]]

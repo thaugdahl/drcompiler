@@ -59,12 +59,14 @@ using namespace mlir::affine;
 
 namespace {
 
-/// A matched single-level add-reduction ready to demote.
+/// A matched add-reduction (single-level GEMM, or a nested ic/kh/kw conv band)
+/// ready to demote.
 struct Match {
-  AffineForOp red;        // the iter_args reduction loop
+  AffineForOp red;        // the OUTERMOST iter_args reduction loop (result stored)
   AffineStoreOp store;    // the store consuming red's result (the accumulator)
   Value init;             // the iter_args init value (accumulator seed)
-  arith::AddFOp addf;     // the reduction add inside the body
+  arith::AddFOp addf;     // the INNERMOST reduction add
+  SmallVector<AffineForOp> redBand; // reduction loops outer->inner (1 = GEMM, 3 = 3x3 conv)
   SmallVector<AffineForOp> spatial; // enclosing perfect spatial loops, outer->inner
 };
 
@@ -85,25 +87,42 @@ static bool matchReduction(AffineForOp red, Match &m) {
   if (!et.isF32() && !et.isF64())
     return false;
 
-  // Body terminator must yield an addf(acc, product) where acc is the region
-  // iter arg and product is independent of it.
-  auto yield = cast<AffineYieldOp>(red.getBody()->getTerminator());
-  auto addf = yield.getOperand(0).getDefiningOp<arith::AddFOp>();
-  if (!addf)
-    return false;
-  Value iterArg = red.getRegionIterArgs()[0];
-  Value other;
-  if (addf.getLhs() == iterArg)
-    other = addf.getRhs();
-  else if (addf.getRhs() == iterArg)
-    other = addf.getLhs();
-  else
-    return false;
-  // The product must not (transitively) reuse the accumulator: a genuine
-  // reduction.  A defining op inside the body that is the iterArg is the only
-  // way to reuse it; cheap conservative check on the immediate addf operand.
-  if (other == iterArg)
-    return false;
+  // Descend the (possibly nested) reduction band: each level is a single-iter_arg
+  // loop that threads the accumulator; the innermost yields addf(acc, product).
+  // GEMM/1x1-conv = one level; a 3x3 conv threads ic -> kh -> kw.
+  SmallVector<AffineForOp> band;
+  arith::AddFOp addf;
+  for (AffineForOp cur = red;;) {
+    if (cur.getNumResults() != 1 || cur.getInits().size() != 1)
+      return false;
+    band.push_back(cur);
+    auto yield = cast<AffineYieldOp>(cur.getBody()->getTerminator());
+    Value yv = yield.getOperand(0);
+    if (auto a = yv.getDefiningOp<arith::AddFOp>()) {
+      Value ia = cur.getRegionIterArgs()[0];
+      Value other;
+      if (a.getLhs() == ia)
+        other = a.getRhs();
+      else if (a.getRhs() == ia)
+        other = a.getLhs();
+      else
+        return false;
+      if (other == ia) // product must not reuse the accumulator
+        return false;
+      addf = a;
+      break;
+    }
+    // An interior band level: its body is exactly the next reduction loop (whose
+    // init is this level's iter arg) plus the yield of that loop's result.
+    auto inner = yv.getDefiningOp<AffineForOp>();
+    if (!inner || inner.getInits()[0] != cur.getRegionIterArgs()[0])
+      return false;
+    if (cur.getBody()->getOperations().size() != 2)
+      return false;
+    cur = inner;
+    if (band.size() > 4) // bound the descent (ic/kh/kw is 3)
+      return false;
+  }
 
   // Single use: the result is stored directly (Case A).  A nested conv
   // reduction's result feeds an outer yield, not a store -> fails here.
@@ -115,12 +134,12 @@ static bool matchReduction(AffineForOp red, Match &m) {
   if (store->getBlock() != red->getBlock())
     return false;
 
-  // The accumulator address must be independent of the reduction IV (a true
-  // reduction, not a scatter).
-  Value kIV = red.getInductionVar();
-  for (Value o : store.getMapOperands())
-    if (o == kIV)
-      return false;
+  // The accumulator address must be independent of EVERY reduction-band IV (a
+  // true reduction, not a scatter).
+  for (AffineForOp rl : band)
+    for (Value o : store.getMapOperands())
+      if (o == rl.getInductionVar())
+        return false;
 
   // The init must be usable in the init nest (dominates the whole band): a
   // value defined outside the reduction loop.  Constants and block args qualify.
@@ -154,6 +173,7 @@ static bool matchReduction(AffineForOp red, Match &m) {
   m.store = store;
   m.init = red.getInits()[0];
   m.addf = addf;
+  m.redBand = std::move(band);
   m.spatial = std::move(spatial);
   return true;
 }
@@ -192,41 +212,41 @@ static void emitInitNest(Match &m, OpBuilder &b) {
                           idx);
 }
 
-/// Rewrite the reduction loop in place to accumulate into the memref: replace
-/// the iter_args carry with a load-before / store-after of the accumulator.
+/// Rewrite the reduction band in place to accumulate into the memref: rebuild
+/// the band loops with NO iter_args, and in the innermost body load / add /
+/// store the accumulator.  For a 3x3 conv the whole ic/kh/kw nest is rebuilt.
 static void demoteReduction(Match &m, OpBuilder &b) {
-  AffineForOp red = m.red;
-  Location loc = red.getLoc();
+  AffineForOp outer = m.redBand.front();
+  AffineForOp innerOld = m.redBand.back();
+  Location loc = outer.getLoc();
   Value mem = m.store.getMemRef();
   AffineMap idxMap = m.store.getAffineMap();
   SmallVector<Value> idx = llvm::to_vector(m.store.getMapOperands());
 
-  // New reduction loop with NO iter args, same bounds.
-  b.setInsertionPoint(red);
-  auto nf = b.create<AffineForOp>(
-      loc, red.getLowerBoundOperands(), red.getLowerBoundMap(),
-      red.getUpperBoundOperands(), red.getUpperBoundMap(), red.getStepAsInt());
-
-  b.setInsertionPointToStart(nf.getBody());
-  // Load the accumulator seed from memory (subscripts are the live spatial IVs).
-  auto c = b.create<AffineLoadOp>(loc, mem, idxMap, idx);
-
-  // Clone the old body (minus the yield) mapping kIV->new kIV and acc->loaded.
+  // Rebuild each band level as a plain loop, nesting inward; map old IV -> new.
+  b.setInsertionPoint(outer);
   IRMapping map;
-  map.map(red.getInductionVar(), nf.getInductionVar());
-  map.map(red.getRegionIterArgs()[0], c.getResult());
-  auto yield = cast<AffineYieldOp>(red.getBody()->getTerminator());
-  for (Operation &op : red.getBody()->without_terminator())
+  for (AffineForOp rl : m.redBand) {
+    auto nf = b.create<AffineForOp>(
+        loc, rl.getLowerBoundOperands(), rl.getLowerBoundMap(),
+        rl.getUpperBoundOperands(), rl.getUpperBoundMap(), rl.getStepAsInt());
+    map.map(rl.getInductionVar(), nf.getInductionVar());
+    b.setInsertionPointToStart(nf.getBody());
+  }
+  // Innermost body: load the accumulator (subscripts are the live spatial IVs),
+  // clone the product DAG (acc -> loaded), store the sum back.
+  auto c = b.create<AffineLoadOp>(loc, mem, idxMap, idx);
+  map.map(innerOld.getRegionIterArgs()[0], c.getResult());
+  auto innerYield = cast<AffineYieldOp>(innerOld.getBody()->getTerminator());
+  for (Operation &op : innerOld.getBody()->without_terminator())
     b.clone(op, map);
-  Value acc = map.lookupOrDefault(yield.getOperand(0));
-
-  // Store the updated accumulator back.
+  Value acc = map.lookupOrDefault(innerYield.getOperand(0));
   b.create<AffineStoreOp>(loc, acc, mem, idxMap, idx);
 
-  // The original direct store of red's result is now redundant; the accumulator
-  // already holds the final value after the loop.
+  // The original direct store of the band's result is now redundant; the
+  // accumulator already holds the final value after the band.
   m.store.erase();
-  red.erase();
+  outer.erase();
 }
 
 struct DrScalarReductionDemotePass
@@ -249,8 +269,8 @@ struct DrScalarReductionDemotePass
     OpBuilder b(fn.getContext());
     for (Match &m : matches) {
       if (emitRationale)
-        m.red.emitRemark("demoting single-level add-reduction to memref "
-                         "accumulator");
+        m.red.emitRemark("demoting ")
+            << m.redBand.size() << "-level add-reduction to memref accumulator";
       emitInitNest(m, b);
       demoteReduction(m, b);
     }
