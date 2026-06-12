@@ -98,10 +98,16 @@ struct MachineModel {
   bool hasExplicitVectorModel = false;
 
   /// Effective last-level cache after dividing by co-tenant sharers.  A reuse
-  /// distance beyond this is priced as a memory access, not an L3 hit.
-  int64_t effectiveLLC() const {
+  /// distance beyond this is priced as a memory access, not an L3 hit.  The
+  /// static form is the ONE definition of the contention derate: every consumer
+  /// that has already resolved l3Size/llcSharers into local values (the pass
+  /// options, possibly CLI-overridden) routes through it instead of re-deriving
+  /// `l3 / sharers` inline, so there is a single place to make the share
+  /// per-thread (CROSSCUTTING.md P0/ThreadModel).
+  static int64_t effectiveLLC(int64_t l3Size, unsigned llcSharers) {
     return l3Size / static_cast<int64_t>(llcSharers ? llcSharers : 1u);
   }
+  int64_t effectiveLLC() const { return effectiveLLC(l3Size, llcSharers); }
 
   /// Bytes addressable without a second-level TLB miss: pageSize * entries.
   /// The natural ceiling for a streaming slab's k-chunk before page-walk cost

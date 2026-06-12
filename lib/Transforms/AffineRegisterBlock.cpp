@@ -871,7 +871,7 @@ public:
         if (r && isInnermost(r))
           cands.push_back(s);
       });
-      int64_t effLLC = (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
+      int64_t effLLC = drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
       for (AffineForOp s : cands)
         if (peelTriangularNest(s, mrEff, peelKTile, effLLC, rewriter)) {
           peeled = true;
@@ -1021,7 +1021,7 @@ public:
         // scalarizes the kernel (observed: small-N collapse to ~0.1x).  Higher
         // llcSharers => tile sooner and smaller (can't rely on the shared L3).
         unsigned sharers = llcSharers ? llcSharers : 1u;
-        int64_t effLLC = (int64_t)l3Size / (int64_t)sharers;
+        int64_t effLLC = drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
         int64_t ws = (ie * ke + ke * je + ie * je) * eb;
         if (effLLC <= 0 || ws <= effLLC)
           continue;

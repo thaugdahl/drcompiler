@@ -4,6 +4,7 @@
 
 #include "drcompiler/Transforms/DataRecomputation/CacheCostModel.h"
 
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/Utils/OpDispatchUtils.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -154,8 +155,8 @@ unsigned estimateLoadLatency(int64_t bufferSizeBytes,
     return cache.l2Latency;
   // The shared LLC is contended: a reuse only counts on the fraction we are
   // guaranteed, l3Size / llcSharers. Beyond that, assume evicted (memLatency).
-  unsigned sharers = cache.llcSharers ? cache.llcSharers : 1;
-  int64_t effectiveL3 = (int64_t)cache.l3Size / sharers;
+  int64_t effectiveL3 =
+      drcompiler::MachineModel::effectiveLLC(cache.l3Size, cache.llcSharers);
   if (cache.l3Size > 0 && bufferSizeBytes <= effectiveL3)
     return cache.l3Latency;
   return cache.memLatency;

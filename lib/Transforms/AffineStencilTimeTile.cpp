@@ -252,7 +252,8 @@ private:
       for (unsigned k = 0; k < d; ++k)
         pts *= shi[k] - slo[k];
       int64_t stepBytes = 2 * pts * elemBytes;
-      int64_t effLLC = (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
+      int64_t effLLC =
+          drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
       if (stepBytes <= effLLC)
         return failure();
     }
@@ -269,7 +270,7 @@ private:
     int64_t Ts = tileS;
     if (Ts == 0) {
       int64_t effLLC =
-          (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
+          drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
       double box = (double)effLLC / 2.0 / 16.0; // 2 arrays x 8 B
       double side = std::pow(box, 1.0 / (double)d);
       Ts = (int64_t)side - 2 * Tt;
@@ -511,7 +512,8 @@ private:
     if (!forceTile) {
       int64_t pts = (maxShi[0] - minSlo[0]) * (maxShi[1] - minSlo[1]);
       int64_t sweepBytes = 3 * pts * 8;
-      int64_t effLLC = (int64_t)l3Size / (int64_t)(llcSharers ? llcSharers : 1u);
+      int64_t effLLC =
+          drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
       if (sweepBytes <= effLLC)
         return failure();
     }

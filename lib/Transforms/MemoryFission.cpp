@@ -392,7 +392,7 @@ void MemoryFissionPass::runOnOperation() {
         //   recompute   = N * computeCost
         //   materialize = computeCost (once) + 1 (store) + N * loadLat(totalWS)
         unsigned sharers = llcSharers ? llcSharers : 1;
-        int64_t effL3 = (int64_t)l3Size / sharers;
+        int64_t effL3 = drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
         dr::CacheParams cp{l1Size, l2Size,   l3Size,      l1Latency,
                            l2Latency, l3Latency, /*mem*/ 200u, /*line*/ 64u,
                            sharers, l2OccupancyPct};
