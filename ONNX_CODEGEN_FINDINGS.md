@@ -146,19 +146,47 @@ strict superset, full lit unchanged. **Measured 11.4x** on the interior spike
 (matches the hand-written 11.7x), max rel-err 1e-6, lit 211/0, PolyBench
 byte-identical, resnet50 1x1 path unchanged.
 
-### Part 3 (remaining) — make it fire on real resnet50 3x3
+**Part 3a — fold the bias epilogue (Case B)** (commit `onnx_codegen_2c`).
+onnx-mlir emits conv+bias as `store (band + bias[oc]), Y`, so the band result is
+not stored directly and every 3x3 conv was skipped (all 40 padded convs stayed
+iter_args). Case B seeds the accumulator with `bias[oc]` in the init nest and
+drops the add (correct because the band seed is +0.0). The spatial collection
+now STOPS, instead of bailing, at onnx-mlir's trip-1 group `affine.apply`.
+**resnet50: demotions 33 → 53, iter_args 93 → 0** — every conv/matmul reduction
+is now in memref-accumulator form.
 
-The interior spike works; real resnet50 3x3 convs do NOT yet, for two reasons:
-- **ow not vl-divisible** (ow ∈ {56,28,14,7}): needs the vl-remainder ow-peel
-  (main vl-divisible loop + scalar tail), like the broadcast kernel already has.
-- **padded kw bounds depend on ow** (`kw: max(0,1-ow)..min(3,57-ow)`): the 16
-  ow-lanes would need different kw bounds — unvectorizable. Requires the
-  interior/border split of ow into `[0,pad) ∪ [pad,W-pad) ∪ [W-pad,W)`; the
-  interior strip gets constant `kw ∈ [0,K)` and vectorizes (kh may keep its
-  oh-dependent bounds — same across all ow-lanes, so it does not block), borders
-  stay scalar.
+**Regression fix** (commit `onnx_codegen_2d`).  De-promoting the 3x3s exposed the
+direct-conv bands to register-block at scale and surfaced two bugs lit missed
+(no whole-resnet50 lit case): (1) the stride-2 7x7 stem produced INVALID IR —
+onnx-mlir hides ow behind `affine.apply`, so the ow-stride analysis was fooled
+into broadcasting a stride-2 load; vectorizeConvBand now bails when a band load
+reaches ow transitively through an apply yet isn't provably stride-1. (2) the
+1x1 GEMMs silently fell to scalar — findReductionLoopUnder returned conv-band
+inner (kw) loops; it now skips reductions whose parent is itself a band loop.
+resnet50 is valid again, 1x1 path restored (136 broadcasts), lit 212/0.
 
-Spike files: `/tmp/onnx_spike/conv3x3_{scalar,vec,itargs}.mlir`, `driver3x3.c`.
+### State of play
+
+- **1x1 convs vectorize on real resnet50** (136 broadcasts ≈ half the conv
+  FLOPs) — the WP-O1 win, intact.
+- **3x3 direct-conv kernel proven** at 11.4x on clean interiors, and all 3x3
+  convs now de-promote — but they do NOT yet vectorize on real resnet50.
+
+### Part 3b (remaining) — vectorize real resnet50 3x3
+
+Three things, all on the demoted-but-padded 3x3 band:
+1. **Compose affine.apply into the load maps** so ow is a direct dim (onnx-mlir
+   precomputes `in[.., apply(kw,ow)]`; the safety guard currently bails on it).
+   `fullyComposeAffineMapAndOperands` on the band loads. This alone also makes
+   the stride-2 stem correctly rejected (coeff 2, not 1).
+2. **Interior/border split** of ow into `[0,pad) ∪ [pad,W-pad) ∪ [W-pad,W)` — the
+   interior gets constant `kw ∈ [0,K)` (kh may keep oh-dependent bounds; same
+   across all ow-lanes), borders stay scalar.
+3. **vl-remainder ow-peel** in vectorizeConvBand (ow ∈ {56,28,14,7}; 14 and 7 are
+   below VL=16 — those layers need VL=8/4 or stay scalar; log the coverage lost).
+
+Spike files: `/tmp/onnx_spike/conv3x3_{scalar,vec,itargs,bias}.mlir`,
+`conv_{padded,group}.mlir`, `driver3x3*.c`, `bench_conv_e2e.sh`.
 
 ## Validation harness (built this session)
 
