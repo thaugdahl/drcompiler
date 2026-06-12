@@ -311,6 +311,45 @@ LogicalResult vectorizeBroadcastBand(AffineForOp red, AffineForOp sIn,
   return success();
 }
 
+/// C1 (WP-O2 part 3b): fold producer `affine.apply`s into every affine
+/// load/store map under `sp`, so an onnx-mlir precomputed index (`%b =
+/// apply(kw, ow); load in[.., %b]`) exposes `ow` as a real dim of the op's own
+/// map and the stride-1 test becomes exact: `in[.., ow+kw-1]` composes to a
+/// last result `d_ow + d_kw - 1` (stride-1, vector load), while a stride-2
+/// stem composes to `d_ow*2 + d_kw - 3` (correctly NOT stride-1, bails).
+/// Scoped to the one conv band being vectorized -- canonicalizing the whole
+/// function could perturb the 1x1 GEMM path that already works.
+static void composeBandMemOps(AffineForOp sp, IRRewriter &rewriter) {
+  SmallVector<Operation *> memOps;
+  sp.walk([&](Operation *op) {
+    if (isa<AffineLoadOp, AffineStoreOp>(op))
+      memOps.push_back(op);
+  });
+  for (Operation *op : memOps) {
+    if (auto ld = dyn_cast<AffineLoadOp>(op)) {
+      AffineMap map = ld.getAffineMap();
+      SmallVector<Value> ops(ld.getMapOperands());
+      affine::fullyComposeAffineMapAndOperands(&map, &ops);
+      affine::canonicalizeMapAndOperands(&map, &ops);
+      if (map == ld.getAffineMap() && ValueRange(ops) == ld.getMapOperands())
+        continue;
+      rewriter.setInsertionPoint(ld);
+      rewriter.replaceOpWithNewOp<AffineLoadOp>(ld, ld.getMemRef(), map, ops);
+    } else {
+      auto st = cast<AffineStoreOp>(op);
+      AffineMap map = st.getAffineMap();
+      SmallVector<Value> ops(st.getMapOperands());
+      affine::fullyComposeAffineMapAndOperands(&map, &ops);
+      affine::canonicalizeMapAndOperands(&map, &ops);
+      if (map == st.getAffineMap() && ValueRange(ops) == st.getMapOperands())
+        continue;
+      rewriter.setInsertionPoint(st);
+      rewriter.replaceOpWithNewOp<AffineStoreOp>(st, st.getValueToStore(),
+                                                 st.getMemRef(), map, ops);
+    }
+  }
+}
+
 /// Vectorize a direct-conv reduction BAND along the spatial loop `sp` (ow).
 /// `bandLoops` is the reduction band outer->inner (e.g. ic, kh, kw); the
 /// innermost loop holds a single memref accumulator Y[.., ow] that is stride-1
@@ -326,6 +365,12 @@ LogicalResult vectorizeConvBand(AffineForOp sp, ArrayRef<AffineForOp> bandLoops,
                                 unsigned VL, IRRewriter &rewriter) {
   if (VL < 2 || sp.getStepAsInt() != 1 || bandLoops.empty())
     return failure();
+  // Fold precomputed-index applies into the band's own load/store maps FIRST,
+  // so every check below (stride-1, DAG, the reaches-ow guard) sees the real
+  // ow dependence instead of bailing on (or worse, mis-broadcasting) an
+  // apply-hidden index.  Composing is semantics-preserving, so a band that
+  // still bails afterwards is left composed-but-scalar -- harmless.
+  composeBandMemOps(sp, rewriter);
   Value owIV = sp.getInductionVar();
   AffineForOp inner = bandLoops.back();
   SmallVector<Acc> accs = collectAccumulators(inner);
