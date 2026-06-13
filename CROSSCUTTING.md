@@ -385,10 +385,18 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
   is currently *additive* to fission's `sourceThrashes` clause, not yet a
   replacement — fully deriving `sourceThrashes` from the bandwidth term (so it
   stops being a separate special-case) needs the recompute side's source re-read
-  priced in bytes too, a P1.5 follow-up. EMPIRICAL validation (that the modelled
-  reversal is *correct* on real hardware) needs a parallel runtime/harness — a
-  spike, like the Idun one; the lit tests prove the model *fires*, not that the
-  flip is measured.
+  priced in bytes too, a P1.5 follow-up. EMPIRICAL validation: **DONE on this
+  host** — `scripts/crossthread-roofline-bench.{c,sh}` measures the
+  MATERIALIZE-vs-RECOMPUTE crossover directly (OpenMP, independent per-thread
+  problems contending only for shared bandwidth) and confirms the reversal the
+  roofline term predicts: at compute intensity fops≈4–16 the verdict flips from
+  MATERIALIZE (single-thread, compute-bound) to RECOMPUTE (all-core,
+  bandwidth-bound). LESSON: the working set must exceed the shared LLC — the
+  7950X3D's 128 MiB (2× 3D V-cache) L3 hid the reversal at small array sizes
+  (all buffers cached → MATERIALIZE always won); only at ≥256 MiB aggregate does
+  the buffer reload miss to DRAM and the bandwidth reversal appear. This is the
+  decision the thread-blind model gets wrong; the `streamCycles` term gets it
+  right per thread-count.
 - **P2** — `ParallelContext` per-thread WS (gap-#2 double-count fix) across
   fission/DR/tiling/register-block; `avx512` all-core throttle (III.6).
 - **P3** — false-sharing padding (fission), SMT L1/L2 split.
