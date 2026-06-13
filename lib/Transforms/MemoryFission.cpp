@@ -422,16 +422,33 @@ void MemoryFissionPass::runOnOperation() {
         double bwCycles =
             beyondPrivate ? mm.streamCycles(totalWS, fromDRAM) : 0.0;
         double bufLat = std::max<double>(tierLat, bwCycles);
-        double recomputeC = (double)numConsumers * computeCost;
+        // P1.5 (symmetric roofline): recompute RE-READS the source ~perConsumerFP
+        // bytes in each of the N consumers, which under contended bandwidth costs
+        // too -- pricing ONLY the buffer reload (above) biased every threaded
+        // decision toward recompute and erased the compute-vs-bandwidth crossover
+        // the bench measures.  Add the source's bandwidth EXCESS (over the latency
+        // tier the old model already charged via computeCost's free loads) to the
+        // recompute side.  Zero without a thread JSON -> byte-identical; with one,
+        // a cheap recompute that re-streams a >L2 source is correctly penalized,
+        // so a high-compute candidate stays fission-worthy where a low-compute one
+        // flips to recompute -- matching the measured crossover.
+        double srcBW = (perConsumerFP > (int64_t)l2Size)
+                           ? mm.streamCycles(perConsumerFP,
+                                             l3Size > 0 && perConsumerFP > effL3)
+                           : 0.0;
+        double recomputeC =
+            (double)numConsumers * computeCost + (double)numConsumers * srcBW;
         double materializeC =
             (double)computeCost + 1.0 + (double)numConsumers * bufLat;
         bool materializeWins = materializeC < recomputeC;
         // The source-reread REVERSAL (WS4.6M): when recompute would re-read the
         // source past the effective LLC N times, fission (reading it once into a
-        // just-produced, warm buffer) wins even though the per-tier load cost of
-        // buffer vs source looks equal.  A tier-latency cost cannot express that
-        // warm-vs-evicted asymmetry without a per-level BANDWIDTH term (the still-
-        // missing roofline currency), so it stays a separate clause.
+        // just-produced, warm buffer) wins.  This is the always-on CAPACITY clause
+        // (no thread JSON needed); the P1.5 srcBW term above is its BANDWIDTH
+        // refinement (active only with a thread model), so the two are
+        // complementary -- capacity covers the default machine, bandwidth the
+        // parallel one.  (Fully folding this clause into materializeWins would
+        // need a default, always-on bandwidth, which would not be byte-identical.)
         bool sourceThrashes = l3Size > 0 && perConsumerFP > effL3;
         shouldFission = materializeWins || sourceThrashes;
 
