@@ -375,14 +375,24 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
 
 **Phasing** (each phase byte-identical at `nThreads=1`, gated on
 `hasExplicitThreadModel`):
-- **P0** — the III.1 single-thread unification cleanups (no behavior change).
-- **P1** — `ThreadModel` fields + `effectiveCache()` + `moveCycles()` bandwidth
-  term, wired into fission + DR (the memory-bound consumers, highest value). The
-  `sourceThrashes` clause becomes derived.
+- ✅ **P0** — the III.1 single-thread unification cleanups (no behavior change).
+  Landed: `costmodel_p0a/d/e/f`.
+- ✅ **P1** — `ThreadModel` fields + `effectiveCache()` + `streamCycles()`
+  bandwidth term, wired into fission (`costmodel_p1a`) and DR (`costmodel_p1b`),
+  the memory-bound consumers. Gated, byte-identical at default. Validated at the
+  *decision* level by `test/MemoryFission/fission-roofline-bandwidth.mlir` (the
+  clean keep→recompute flip) and the DR cost mechanism test. NOTE: the roofline
+  is currently *additive* to fission's `sourceThrashes` clause, not yet a
+  replacement — fully deriving `sourceThrashes` from the bandwidth term (so it
+  stops being a separate special-case) needs the recompute side's source re-read
+  priced in bytes too, a P1.5 follow-up. EMPIRICAL validation (that the modelled
+  reversal is *correct* on real hardware) needs a parallel runtime/harness — a
+  spike, like the Idun one; the lit tests prove the model *fires*, not that the
+  flip is measured.
 - **P2** — `ParallelContext` per-thread WS (gap-#2 double-count fix) across
   fission/DR/tiling/register-block; `avx512` all-core throttle (III.6).
 - **P3** — false-sharing padding (fission), SMT L1/L2 split.
-- **P4** — NUMA (remote tier in `moveCycles`/`effectiveCache`); the largest,
+- **P4** — NUMA (remote tier in `streamCycles`/`effectiveCache`); the largest,
   lowest-priority piece.
 
 **Validation** (mirror `CONTENTION_AWARE_COSTMODEL.md`): a parallel
