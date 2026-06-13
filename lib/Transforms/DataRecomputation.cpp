@@ -1396,9 +1396,11 @@ void DataRecomputationPass::runOnOperation() {
   // built-in default.  With no JSON and no override these assignments are
   // value-preserving (MachineModel defaults == the pass option defaults), so
   // behavior is bit-identical.
+  // Hoisted to function scope so the thread model (roofline term in the
+  // per-buffer decision below) is reachable; the resolution block stays.
+  drcompiler::MachineModel mm =
+      drcompiler::MachineModel::fromJson(cpuCostModelFile);
   {
-    drcompiler::MachineModel mm =
-        drcompiler::MachineModel::fromJson(cpuCostModelFile);
     if (!drL1Size.hasValue())
       drL1Size = static_cast<unsigned>(mm.l1Size);
     if (!drL2Size.hasValue())
@@ -2096,6 +2098,23 @@ void DataRecomputationPass::runOnOperation() {
         int64_t sizeBytes = bufSize.value_or((int64_t)cache.l2Size + 1);
 
         unsigned loadLat = estimateLoadLatency(sizeBytes, cache);
+        // Roofline (CROSSCUTTING.md III): a KEPT buffer is reloaded numConsumers
+        // times; when it spills the private L2 each reload streams sizeBytes from
+        // the shared LLC/DRAM, which under a parallel workload is bandwidth-bound.
+        // Lift loadLat to the per-thread bandwidth floor so keeping a buffer
+        // correctly loses to per-thread recompute (pure ALU here, leafLoadCost=0)
+        // under contention.  No-op (== latency tier) without a `thread` JSON.
+        if (sizeBytes > (int64_t)cache.l2Size) {
+          bool fromDRAM =
+              cache.l3Size > 0 &&
+              sizeBytes > drcompiler::MachineModel::effectiveLLC(
+                              cache.l3Size, cache.llcSharers);
+          double bw = mm.streamCycles(sizeBytes, fromDRAM);
+          // Cap so numConsumers*loadLat cannot overflow unsigned; any BW floor
+          // above the ALU recompute cost already decides the comparison.
+          if (bw > (double)loadLat)
+            loadLat = static_cast<unsigned>(std::min<double>(bw, 1.0e6));
+        }
 
         int64_t storeToLoadFP = bufferStoreToLoadFP.lookup(allocRoot);
         unsigned opPenalty = bufferOperandPenalty.lookup(allocRoot);
