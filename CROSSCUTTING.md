@@ -361,15 +361,28 @@ time stays high under load). So `activeThreads` in the shipped code is really
 "bandwidth co-tenants", the BW analogue of `llcSharers` for capacity — coherent
 and measured.
 
-**Interpretation #2 is the real gap-#2 / `ParallelContext` work, and it is NOT a
-no-op refactor:** it divides the WS by `activeThreads` for a genuinely
-data-parallel candidate (`affine::isLoopParallel`), which *changes* the
-P1-validated numbers (e.g. the DR test's `load=1000000` would drop to the
-WS/BW value) and needs its OWN bench (one problem split across threads) to
-validate. Which interpretation is the DEFAULT is a workload-model decision for
-the compiler's target use; until that is set, P1 ships the tenants model (the
-conservative, measured one) and `ParallelContext.isParallelLoop` is the opt-in
-for #2. **This is the open design decision blocking a clean P2.**
+**RESOLVED — DUAL MODE (`costmodel_p2dual`).** Both interpretations ship,
+selected by `thread.exclusive` in the cost-model JSON; `streamCycles` differs
+only in the bandwidth divisor:
+
+```
+effBW = exclusive ? bw : bw / activeThreads;   // owns vs shares the bandwidth
+streamCycles = bytes / effBW;
+```
+
+- `exclusive: false` (default) = **interspersed**: `bytes·N/BW` (shared BW;
+  pair with `llc_sharers=N`). The P1 behaviour, byte-identical, bench #1.
+- `exclusive: true` = **exclusive**: `bytes/BW` (owns BW; pair with
+  `llc_sharers=1`). The single-big-parallel-job deployment.
+
+The same 2 MiB buffer's keep cost is then `load=40` serial / `1e6` interspersed
+/ `131072` exclusive (16× cheaper than interspersed) — pinned by
+`recompute-roofline-bandwidth.mlir`. And the dual model is **empirically
+justified**: the extended bench (`...-bench` now measures BOTH — N independent
+problems vs ONE problem split across N cores) shows that at compute intensity
+fops≈4–16 the optimal **DIFFERS by mode** — interspersed → RECOMPUTE, exclusive →
+MATERIALIZE (same kernel, opposite decision). A single-mode model gets one wrong;
+the dual model gets both right.
 
 ## III.5 Per-consumer cross-thread analysis (the deliverable)
 
@@ -430,15 +443,18 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
   the buffer reload miss to DRAM and the bandwidth reversal appear. This is the
   decision the thread-blind model gets wrong; the `streamCycles` term gets it
   right per thread-count.
-- **P2** — `ParallelContext` per-thread WS (gap-#2 double-count fix) across
-  fission/DR/tiling/register-block; `avx512` all-core throttle (III.6).
-  **BLOCKED on the III.4a workload-model decision** (independent-tenants vs
-  parallelized-loop): P1 shipped + measured the tenants model; #2 changes the
-  validated numbers and needs its own split-loop bench, so it must be an explicit
-  choice, not a default flip. `avx512FreqThrottle` resolves to "descriptive
-  field that informs `vectorBitsNative`" (a heavily-throttled all-core Xeon sets
-  `vectorBitsNative=256`), not a separate runtime knob — so there is no extra
-  decision wiring to add, just the Idun measurement that sets the value.
+- ✅ **P2** — the III.4a workload-model fork is RESOLVED as **dual mode**
+  (`costmodel_p2dual`): `thread.exclusive` selects shared-BW (interspersed) vs
+  owned-BW (exclusive) in `streamCycles`; empirically justified (the modes have
+  opposite optimal at fops≈4–16). The gap-#2 *capacity* double-count is handled
+  by the same pairing — exclusive mode pairs with `llc_sharers=1` (the
+  parallelized loop's `WS/N` vs `L3/N` cancels to `WS` vs full `L3`, no derate),
+  interspersed with `llc_sharers=N`. `avx512FreqThrottle` resolves to a
+  descriptive field that informs `vectorBitsNative` (a heavily-throttled all-core
+  Xeon sets it to 256), not a separate runtime knob — just the Idun measurement
+  that sets the value. Remaining P2 nicety: a per-candidate `isParallelLoop`
+  auto-detect (`affine::isLoopParallel`) so the mode need not be machine-global —
+  optional.
 - **P3** — false-sharing padding (fission), SMT L1/L2 split.
 - **P4** — NUMA (remote tier in `streamCycles`/`effectiveCache`); the largest,
   lowest-priority piece.

@@ -64,6 +64,28 @@ static double recompute(const double *x, int fops) {
   return acc;
 }
 
+// EXCLUSIVE variants: ONE problem parallelized across all cores (the workload
+// owns the machine -> full bandwidth; per-thread WS/N and BW/N cancel).
+static double materialize_excl(const double *x, double *buf, int fops) {
+#pragma omp parallel for schedule(static)
+  for (long i = 0; i < NELEM; i++)
+    buf[i] = f(x[i], fops);
+  double acc = 0.0;
+#pragma omp parallel for reduction(+ : acc) schedule(static)
+  for (long i = 0; i < NELEM; i++)
+    for (int c = 0; c < NCONS; c++)
+      acc += buf[i] * (c + 1);
+  return acc;
+}
+static double recompute_excl(const double *x, int fops) {
+  double acc = 0.0;
+#pragma omp parallel for reduction(+ : acc) schedule(static)
+  for (long i = 0; i < NELEM; i++)
+    for (int c = 0; c < NCONS; c++)
+      acc += f(x[i], fops) * (c + 1);
+  return acc;
+}
+
 static volatile double g_sink = 0.0;
 
 // Per-problem time (ms) of a variant at T threads, min over ITERS.
@@ -90,6 +112,23 @@ static double run(int T, int fops, int materializeVariant, double **xs,
   return best / T * 1e3; // per-problem ms
 }
 
+// EXCLUSIVE per-problem time (ms): ONE problem parallelized across all cores.
+static double runExcl(int maxT, int fops, int materializeVariant, double *x,
+                      double *buf) {
+  omp_set_num_threads(maxT);
+  double best = 1e30;
+  for (int it = 0; it < ITERS; it++) {
+    double t0 = omp_get_wtime();
+    double a = materializeVariant ? materialize_excl(x, buf, fops)
+                                  : recompute_excl(x, fops);
+    double dt = omp_get_wtime() - t0;
+    g_sink += a;
+    if (dt < best)
+      best = dt;
+  }
+  return best * 1e3; // one problem, all cores
+}
+
 int main(void) {
   int maxT = omp_get_max_threads();
   double **xs = (double **)malloc(sizeof(double *) * maxT);
@@ -109,36 +148,52 @@ int main(void) {
          maxT);
   int fopsSweep[] = {1, 2, 4, 8, 16, 32, 64};
   int nf = (int)(sizeof(fopsSweep) / sizeof(fopsSweep[0]));
-  printf("%-6s | %-26s | %-26s\n", "fops", "1 thread (mat / rec)",
-         "max thread (mat / rec)");
-  int reversals = 0, loFlip = 0, hiFlip = 0;
+  printf("Winner per deployment.  INTERSPERSED = %d independent problems on %d "
+         "threads (shared BW);\nEXCLUSIVE = ONE problem parallelized across %d "
+         "cores (owns BW).  '!=' marks where the\nbest choice DIFFERS by mode "
+         "-- the case for the dual cost model.\n\n",
+         maxT, maxT, maxT);
+  printf("%-6s | %-12s | %-16s | %-16s | %s\n", "fops", "1 thread",
+         "interspersed(N)", "exclusive(N)", "mode-matters");
+  int reversals = 0, loFlip = 0, hiFlip = 0, modeDiffs = 0;
   for (int i = 0; i < nf; i++) {
     int fo = fopsSweep[i];
     double m1 = run(1, fo, 1, xs, bufs), r1 = run(1, fo, 0, xs, bufs);
     double mN = run(maxT, fo, 1, xs, bufs), rN = run(maxT, fo, 0, xs, bufs);
-    int flip = (m1 < r1) && (rN < mN); // MAT single-thread, REC many-thread
-    printf("%-6d | %7.3f /%7.3f  %-8s | %7.3f /%7.3f  %-8s%s\n", fo, m1, r1,
-           m1 < r1 ? "[MAT]" : "[REC]", mN, rN, mN < rN ? "[MAT]" : "[REC]",
-           flip ? "  <== ROOFLINE REVERSAL" : "");
+    double me = runExcl(maxT, fo, 1, xs[0], bufs[0]);
+    double re = runExcl(maxT, fo, 0, xs[0], bufs[0]);
+    int interMat = mN < rN, exclMat = me < re;
+    int flip = (m1 < r1) && !interMat; // MAT 1-thread, REC interspersed
+    int modeDiff = interMat != exclMat;
+    printf("%-6d | %-12s | %7.3f/%7.3f %-4s | %7.3f/%7.3f %-4s | %s%s\n", fo,
+           m1 < r1 ? "[MAT]" : "[REC]", mN, rN, interMat ? "[MAT]" : "[REC]", me,
+           re, exclMat ? "[MAT]" : "[REC]",
+           modeDiff ? "!= (exclusive favors keep)" : "same",
+           flip ? "  <reversal" : "");
     if (flip) {
       reversals++;
       if (!loFlip)
         loFlip = fo;
       hiFlip = fo;
     }
+    if (modeDiff)
+      modeDiffs++;
   }
   printf("\n%s",
          reversals
              ? "VALIDATED: the keep->recompute reversal the cost-model roofline "
-               "term predicts is MEASURED on this host"
-             : "no reversal observed (working set may fit the V-cache, or no "
-               "compute intensity hit the bandwidth-bound window)");
+               "term predicts is MEASURED"
+             : "no reversal observed (working set may fit the V-cache)");
   if (reversals)
-    printf(" (reversal window fops=%d..%d: MATERIALIZE single-thread, "
-           "RECOMPUTE all-core).\n",
-           loFlip, hiFlip);
+    printf(" (window fops=%d..%d).\n", loFlip, hiFlip);
   else
     printf(".\n");
+  printf("%s\n",
+         modeDiffs ? "DUAL MODE JUSTIFIED: at some compute intensities the best "
+                     "choice DIFFERS between interspersed and exclusive "
+                     "deployment (exclusive's full bandwidth favors keeping the "
+                     "buffer where shared bandwidth favors recompute)."
+                   : "(no mode difference at the sampled intensities)");
   if (g_sink == 12345.6789)
     printf("");
   return 0;

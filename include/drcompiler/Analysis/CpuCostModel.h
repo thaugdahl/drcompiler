@@ -58,6 +58,7 @@ struct CpuThreadJsonParams {
   std::optional<bool> l1Shared;
   std::optional<bool> l2Shared;
   std::optional<bool> l3Shared;
+  std::optional<bool> exclusive; // workload mode (III.4a)
 };
 
 /// Optional register-block parameters parsed from a cost-model JSON's

@@ -1,0 +1,8 @@
+{
+  "thread": {
+    "active_threads": 16,
+    "exclusive": true,
+    "llc_bytes_per_cycle": 16.0,
+    "dram_bytes_per_cycle": 8.0
+  }
+}

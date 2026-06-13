@@ -105,6 +105,10 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     mm.thread.l3Shared = *t.l3Shared;
     markThread();
   }
+  if (t.exclusive) {
+    mm.thread.exclusive = *t.exclusive;
+    markThread();
+  }
 
   return mm;
 }

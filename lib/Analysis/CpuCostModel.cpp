@@ -273,6 +273,7 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
     readBool("l1_shared", m.thread.l1Shared);
     readBool("l2_shared", m.thread.l2Shared);
     readBool("l3_shared", m.thread.l3Shared);
+    readBool("exclusive", m.thread.exclusive);
   } else if (root->get("thread")) {
     llvm::errs() << "drcompiler warning: 'thread' in '" << path
                  << "' is not a JSON object; ignoring\n";

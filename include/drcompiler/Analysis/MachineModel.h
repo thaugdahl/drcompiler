@@ -114,6 +114,17 @@ struct MachineModel {
     double dramBytesPerCycle = 0.0;
     double llcBytesPerCycle = 0.0;
     bool l1Shared = false, l2Shared = false, l3Shared = true;
+    // Workload deployment mode (the III.4a fork), the per-level bandwidth share:
+    //   * INTERSPERSED (default): the kernel is one of `activeThreads` co-equal
+    //     tenants sharing the machine -- each gets BW/activeThreads, so a reload
+    //     costs bytes * activeThreads / BW (cost RISES with load). Pairs with a
+    //     shared, derated LLC (llcSharers). This is what the P1 roofline bench
+    //     measured.
+    //   * EXCLUSIVE: the kernel OWNS the machine and is parallelized across the
+    //     cores -- it gets the full BW (the per-thread WS/N and per-thread BW/N
+    //     cancel), so a reload costs bytes / BW. Pairs with an un-derated LLC
+    //     (set llc_sharers=1). The single-big-parallel-job deployment.
+    bool exclusive = false;
   };
   ThreadModel thread;
   // True once a cost-model JSON explicitly set any thread-model field; the
@@ -148,8 +159,15 @@ struct MachineModel {
     double bw = fromDRAM ? thread.dramBytesPerCycle : thread.llcBytesPerCycle;
     if (bw <= 0.0)
       return 0.0;
-    double perThread = bw / static_cast<double>(thread.activeThreads ? thread.activeThreads : 1u);
-    return static_cast<double>(bytes) / perThread;
+    // INTERSPERSED: the kernel shares the level's bandwidth with activeThreads
+    // co-tenants (effective BW = BW/activeThreads).  EXCLUSIVE: it owns the full
+    // bandwidth (the parallelized work's per-thread WS/N and BW/N cancel).
+    double effBW =
+        thread.exclusive
+            ? bw
+            : bw / static_cast<double>(thread.activeThreads ? thread.activeThreads
+                                                            : 1u);
+    return static_cast<double>(bytes) / effBW;
   }
 
   /// Effective last-level cache after dividing by co-tenant sharers.  A reuse

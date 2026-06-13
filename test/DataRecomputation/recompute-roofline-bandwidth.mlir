@@ -7,17 +7,23 @@
 // streamCycles() mechanism the fission roofline test exercises end-to-end.
 //
 // The 2 MiB buffer (262144 x f64) spills L2, so the keep-side load cost reflects
-// the bandwidth floor: 40 cycles (L3 latency tier) single-thread, vs the capped
-// 1e6 under 16 threads at 16 B/cycle LLC bandwidth. Without a `thread` block the
-// term is disabled and the cost is the latency tier (byte-identical).
+// the bandwidth floor, and it differs by DEPLOYMENT MODE (III.4a):
+//   SERIAL       no thread JSON  -> 40 cycles (L3 latency tier, byte-identical)
+//   INTERSPERSED shared BW/16    -> 2 MiB / (16 B/cyc / 16) = capped 1e6
+//   EXCLUSIVE    owns full BW    -> 2 MiB / 16 B/cyc = 131072 (16x cheaper)
+// i.e. the same buffer is far cheaper to keep when the workload owns the machine
+// (exclusive) than when it competes with co-tenants (interspersed).
 
 // RUN: dr-opt %s --pass-pipeline='builtin.module(data-recomputation{dr-cost-model dr-recompute dr-summary})' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=SERIAL
 // RUN: dr-opt %s --pass-pipeline='builtin.module(data-recomputation{dr-cost-model dr-recompute dr-summary cpu-cost-model-file=%S/../MemoryFission/Inputs/threads-bw.json})' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=THREADED
+// RUN: dr-opt %s --pass-pipeline='builtin.module(data-recomputation{dr-cost-model dr-recompute dr-summary cpu-cost-model-file=%S/../MemoryFission/Inputs/threads-bw-exclusive.json})' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=EXCLUSIVE
 
-// SERIAL:   DRSUM: buffer {{.*}}compute=100, load=40,
-// THREADED: DRSUM: buffer {{.*}}compute=100, load=1000000,
+// SERIAL:    DRSUM: buffer {{.*}}compute=100, load=40,
+// THREADED:  DRSUM: buffer {{.*}}compute=100, load=1000000,
+// EXCLUSIVE: DRSUM: buffer {{.*}}compute=100, load=131072,
 
 func.func @dr(%x: memref<262144xf64>, %out: memref<8xf64>) {
   %buf = memref.alloc() : memref<262144xf64>
