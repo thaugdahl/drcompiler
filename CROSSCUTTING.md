@@ -455,9 +455,25 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
   that sets the value. Remaining P2 nicety: a per-candidate `isParallelLoop`
   auto-detect (`affine::isLoopParallel`) so the mode need not be machine-global —
   optional.
-- **P3** — false-sharing padding (fission), SMT L1/L2 split.
-- **P4** — NUMA (remote tier in `streamCycles`/`effectiveCache`); the largest,
-  lowest-priority piece.
+- **P1.5** ✅ (`costmodel_p1_5`) — symmetric roofline: recompute's source
+  re-reads are bandwidth-priced too, so the model gains the compute-vs-bandwidth
+  crossover the bench measures (instead of always favoring recompute under a
+  thread JSON). The always-on `sourceThrashes` capacity clause stays as its
+  complement.
+- **P3** — SMT L1/L2 split ✅ (`costmodel_p3smt`: `effectivePrivateCache`,
+  fission + DR L2 gates, makes `effectiveCache` live). **False-sharing padding is
+  BLOCKED on missing infrastructure**: drcompiler emits SERIAL code (the cost
+  model reasons about parallel *deployment* to pick the best serial code, but no
+  pass emits OpenMP/pthreads), so there is no multi-thread write to the fission
+  buffer to false-share yet. Wire it WITH a parallel-emission backend, not before.
+- **P4** — NUMA (remote tier in `streamCycles`/`effectiveCache`): **unvalidatable
+  on this single-socket host** and large; deferred until a multi-socket target
+  (the model shape is a per-node BW + a remote-latency multiplier on
+  `streamCycles`/the tier).
+- **`isParallelLoop` auto-detect** (`affine::isLoopParallel` per candidate):
+  low-value now that the workload mode is a machine-global JSON property
+  (deployment is whole-program, not per-loop); revisit only if a single binary
+  must mix exclusive and interspersed regions.
 
 **Validation** (mirror `CONTENTION_AWARE_COSTMODEL.md`): a parallel
 PolyBench/GEMM kernel swept over `activeThreads` ∈ {1, cores/2, cores}, on the
