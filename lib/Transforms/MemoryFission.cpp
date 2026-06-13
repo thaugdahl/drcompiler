@@ -417,8 +417,12 @@ void MemoryFissionPass::runOnOperation() {
         bool fromDRAM = l3Size > 0 && totalWS > effL3;
         // The bandwidth floor applies only when the working set spills the
         // private L2 (so it actually streams from the shared LLC or DRAM); an
-        // L1/L2-resident reload is latency-bound, not bandwidth-shared.
-        bool beyondPrivate = totalWS > (int64_t)l2Size;
+        // L1/L2-resident reload is latency-bound, not bandwidth-shared.  Under
+        // SMT the private L2 is split with the sibling (effectivePrivateCache);
+        // default smt=1 / l2-private reproduces the full size (byte-identical).
+        int64_t privL2 = drcompiler::MachineModel::effectivePrivateCache(
+            l2Size, mm.thread.l2Shared, mm.thread.smtPerCore);
+        bool beyondPrivate = totalWS > privL2;
         double bwCycles =
             beyondPrivate ? mm.streamCycles(totalWS, fromDRAM) : 0.0;
         double bufLat = std::max<double>(tierLat, bwCycles);
@@ -432,7 +436,7 @@ void MemoryFissionPass::runOnOperation() {
         // a cheap recompute that re-streams a >L2 source is correctly penalized,
         // so a high-compute candidate stays fission-worthy where a low-compute one
         // flips to recompute -- matching the measured crossover.
-        double srcBW = (perConsumerFP > (int64_t)l2Size)
+        double srcBW = (perConsumerFP > privL2)
                            ? mm.streamCycles(perConsumerFP,
                                              l3Size > 0 && perConsumerFP > effL3)
                            : 0.0;

@@ -134,16 +134,24 @@ struct MachineModel {
 
   enum CacheLevel { L1, L2, L3 };
 
+  /// SMT-aware private-cache share: an SMT sibling sharing a physical L1/L2
+  /// halves the capacity a thread can count on; `shared=false` (no sibling) or
+  /// `smt<=1` reproduces the full size.  Static so consumers can pass their
+  /// already-resolved (CLI-overridable) cache size.
+  static int64_t effectivePrivateCache(int64_t size, bool shared,
+                                       unsigned smt) {
+    return shared ? size / static_cast<int64_t>(smt ? smt : 1u) : size;
+  }
+
   /// Per-thread share of cache level `lv` under the current topology: a shared
   /// LLC is divided by co-tenants (llcSharers); a private L1/L2 is divided by
   /// SMT siblings; default smtPerCore=1 / llcSharers=1 reproduces full size.
   int64_t effectiveCache(CacheLevel lv) const {
-    unsigned smt = thread.smtPerCore ? thread.smtPerCore : 1u;
     switch (lv) {
     case L1:
-      return thread.l1Shared ? l1Size / smt : l1Size;
+      return effectivePrivateCache(l1Size, thread.l1Shared, thread.smtPerCore);
     case L2:
-      return thread.l2Shared ? l2Size / smt : l2Size;
+      return effectivePrivateCache(l2Size, thread.l2Shared, thread.smtPerCore);
     case L3:
       return thread.l3Shared ? effectiveLLC() : l3Size;
     }

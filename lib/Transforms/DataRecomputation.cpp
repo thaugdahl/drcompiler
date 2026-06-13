@@ -2104,7 +2104,9 @@ void DataRecomputationPass::runOnOperation() {
         // Lift loadLat to the per-thread bandwidth floor so keeping a buffer
         // correctly loses to per-thread recompute (pure ALU here, leafLoadCost=0)
         // under contention.  No-op (== latency tier) without a `thread` JSON.
-        if (sizeBytes > (int64_t)cache.l2Size) {
+        if (sizeBytes > drcompiler::MachineModel::effectivePrivateCache(
+                            (int64_t)cache.l2Size, mm.thread.l2Shared,
+                            mm.thread.smtPerCore)) {
           bool fromDRAM =
               cache.l3Size > 0 &&
               sizeBytes > drcompiler::MachineModel::effectiveLLC(
