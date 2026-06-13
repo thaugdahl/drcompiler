@@ -338,6 +338,39 @@ sets (`WS/threads` for a parallel loop) and compare against
 `effectiveCache(L3)` — fixing the gap-#2 double-count. At `threads=1` this is a
 no-op.
 
+### III.4a — the two workload interpretations (decided by the P1 bench)
+
+Building + measuring the roofline (`scripts/crossthread-roofline-bench`) exposed
+a fork that the spec above glossed: `activeThreads` means two different things,
+and the cost is different in each.
+
+1. **Independent tenants** (SPEC-rate, batch inference, N processes): each of N
+   threads runs the WHOLE problem; the only coupling is bandwidth contention.
+   Per-thread bytes = `WS` (full), per-thread BW = `BW/N` →
+   **time = `WS / (BW/N)` = `WS·N/BW`** (the cost rises with load). Capacity:
+   `WS` (full) vs `effectiveCache = L3/N`.
+2. **Parallelized loop** (one inference split across cores): each thread does a
+   SLICE; per-thread bytes = `WS/N`, per-thread BW = `BW/N` → the divisors
+   **cancel**: **time = `WS/BW`** (independent of N). Capacity: `WS/N` vs `L3/N`
+   = `WS` vs `L3` (the sharing cancels — no net derate).
+
+**What is implemented + validated today (P1a/P1b): interpretation #1.**
+`streamCycles(bytes, …) = bytes / (BW/activeThreads)` is the tenants model, and
+the bench measures exactly that (independent per-thread problems → per-problem
+time stays high under load). So `activeThreads` in the shipped code is really
+"bandwidth co-tenants", the BW analogue of `llcSharers` for capacity — coherent
+and measured.
+
+**Interpretation #2 is the real gap-#2 / `ParallelContext` work, and it is NOT a
+no-op refactor:** it divides the WS by `activeThreads` for a genuinely
+data-parallel candidate (`affine::isLoopParallel`), which *changes* the
+P1-validated numbers (e.g. the DR test's `load=1000000` would drop to the
+WS/BW value) and needs its OWN bench (one problem split across threads) to
+validate. Which interpretation is the DEFAULT is a workload-model decision for
+the compiler's target use; until that is set, P1 ships the tenants model (the
+conservative, measured one) and `ParallelContext.isParallelLoop` is the opt-in
+for #2. **This is the open design decision blocking a clean P2.**
+
 ## III.5 Per-consumer cross-thread analysis (the deliverable)
 
 | consumer | single-thread assumption (file:line) | cross-thread query it needs |
@@ -399,6 +432,13 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
   right per thread-count.
 - **P2** — `ParallelContext` per-thread WS (gap-#2 double-count fix) across
   fission/DR/tiling/register-block; `avx512` all-core throttle (III.6).
+  **BLOCKED on the III.4a workload-model decision** (independent-tenants vs
+  parallelized-loop): P1 shipped + measured the tenants model; #2 changes the
+  validated numbers and needs its own split-loop bench, so it must be an explicit
+  choice, not a default flip. `avx512FreqThrottle` resolves to "descriptive
+  field that informs `vectorBitsNative`" (a heavily-throttled all-core Xeon sets
+  `vectorBitsNative=256`), not a separate runtime knob — so there is no extra
+  decision wiring to add, just the Idun measurement that sets the value.
 - **P3** — false-sharing padding (fission), SMT L1/L2 split.
 - **P4** — NUMA (remote tier in `streamCycles`/`effectiveCache`); the largest,
   lowest-priority piece.
