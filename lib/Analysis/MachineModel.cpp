@@ -72,5 +72,39 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     mm.vectorBitsNative = mm.vectorBitsArch;
   }
 
+  // Thread / parallel-execution model (CROSSCUTTING.md III).  Gated on any field
+  // being present so the default machine keeps the 1-thread, bandwidth-disabled
+  // no-op (byte-identical).
+  const CpuThreadJsonParams &t = cm.threadParams();
+  auto markThread = [&] { mm.hasExplicitThreadModel = true; };
+  if (t.activeThreads) {
+    mm.thread.activeThreads = *t.activeThreads;
+    markThread();
+  }
+  if (t.smtPerCore) {
+    mm.thread.smtPerCore = *t.smtPerCore;
+    markThread();
+  }
+  if (t.dramBytesPerCycle) {
+    mm.thread.dramBytesPerCycle = *t.dramBytesPerCycle;
+    markThread();
+  }
+  if (t.llcBytesPerCycle) {
+    mm.thread.llcBytesPerCycle = *t.llcBytesPerCycle;
+    markThread();
+  }
+  if (t.l1Shared) {
+    mm.thread.l1Shared = *t.l1Shared;
+    markThread();
+  }
+  if (t.l2Shared) {
+    mm.thread.l2Shared = *t.l2Shared;
+    markThread();
+  }
+  if (t.l3Shared) {
+    mm.thread.l3Shared = *t.l3Shared;
+    markThread();
+  }
+
   return mm;
 }

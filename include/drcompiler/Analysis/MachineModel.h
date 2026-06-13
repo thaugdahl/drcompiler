@@ -97,6 +97,61 @@ struct MachineModel {
   // value) and every pre-WP-G1 lit test stays byte-identical.
   bool hasExplicitVectorModel = false;
 
+  // --- Thread / parallel-execution model (NEW: CROSSCUTTING.md III.2-III.3) --
+  // Every field defaults to a 1-thread, bandwidth-disabled NO-OP: with no
+  // explicit thread block the cost is bit-for-bit the single-thread model.
+  //   * activeThreads  - parallel workers actually running (roofline divisor).
+  //   * smtPerCore     - SMT siblings sharing a physical private L1/L2.
+  //   * coresPerLLC    - co-tenants of the shared LLC; an alias of llcSharers
+  //                      (the existing field stays the source so old JSON works).
+  //   * dram/llcBytesPerCycle - sustained streaming bandwidth in BYTES/CYCLE,
+  //                      0 => disabled (latency-only, byte-identical to today).
+  //   * lNShared       - cache-sharing topology (default: L1/L2 private, L3
+  //                      shared -- correct for Zen4/SKX).
+  struct ThreadModel {
+    unsigned activeThreads = 1;
+    unsigned smtPerCore = 1;
+    double dramBytesPerCycle = 0.0;
+    double llcBytesPerCycle = 0.0;
+    bool l1Shared = false, l2Shared = false, l3Shared = true;
+  };
+  ThreadModel thread;
+  // True once a cost-model JSON explicitly set any thread-model field; the
+  // roofline term and per-thread cache split fire ONLY then, so the default
+  // machine is byte-identical.
+  bool hasExplicitThreadModel = false;
+
+  enum CacheLevel { L1, L2, L3 };
+
+  /// Per-thread share of cache level `lv` under the current topology: a shared
+  /// LLC is divided by co-tenants (llcSharers); a private L1/L2 is divided by
+  /// SMT siblings; default smtPerCore=1 / llcSharers=1 reproduces full size.
+  int64_t effectiveCache(CacheLevel lv) const {
+    unsigned smt = thread.smtPerCore ? thread.smtPerCore : 1u;
+    switch (lv) {
+    case L1:
+      return thread.l1Shared ? l1Size / smt : l1Size;
+    case L2:
+      return thread.l2Shared ? l2Size / smt : l2Size;
+    case L3:
+      return thread.l3Shared ? effectiveLLC() : l3Size;
+    }
+    return l3Size;
+  }
+
+  /// Bandwidth-bound cycles to STREAM `bytes` from DRAM (or the shared LLC),
+  /// given the per-thread share of that level's bandwidth.  The roofline arm of
+  /// the cost: real move time = max(latency-estimate, this).  Returns 0 when the
+  /// bandwidth is unmodelled (no thread JSON) so the caller's existing latency
+  /// estimate stands unchanged -- the byte-identical gate.
+  double streamCycles(int64_t bytes, bool fromDRAM) const {
+    double bw = fromDRAM ? thread.dramBytesPerCycle : thread.llcBytesPerCycle;
+    if (bw <= 0.0)
+      return 0.0;
+    double perThread = bw / static_cast<double>(thread.activeThreads ? thread.activeThreads : 1u);
+    return static_cast<double>(bytes) / perThread;
+  }
+
   /// Effective last-level cache after dividing by co-tenant sharers.  A reuse
   /// distance beyond this is priced as a memory access, not an L3 hit.  The
   /// static form is the ONE definition of the contention derate: every consumer

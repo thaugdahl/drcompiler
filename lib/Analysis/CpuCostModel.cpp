@@ -238,6 +238,46 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
                  << "' is not a JSON object; ignoring\n";
   }
 
+  // Read optional thread block (CROSSCUTTING.md III: parallel-execution model).
+  if (auto *th = root->getObject("thread")) {
+    auto readUnsigned = [&](llvm::StringRef key, std::optional<unsigned> &dst) {
+      if (auto v = th->getInteger(key)) {
+        if (*v < 0) {
+          llvm::errs() << "drcompiler warning: negative thread." << key << " in '"
+                       << path << "'; skipping\n";
+          return;
+        }
+        dst = static_cast<unsigned>(*v);
+      } else if (th->get(key))
+        llvm::errs() << "drcompiler warning: non-integer thread." << key << " in '"
+                     << path << "'; skipping\n";
+    };
+    auto readNumber = [&](llvm::StringRef key, std::optional<double> &dst) {
+      if (auto v = th->getNumber(key))
+        dst = *v;
+      else if (th->get(key))
+        llvm::errs() << "drcompiler warning: non-numeric thread." << key << " in '"
+                     << path << "'; skipping\n";
+    };
+    auto readBool = [&](llvm::StringRef key, std::optional<bool> &dst) {
+      if (auto v = th->getBoolean(key))
+        dst = *v;
+      else if (th->get(key))
+        llvm::errs() << "drcompiler warning: non-boolean thread." << key << " in '"
+                     << path << "'; skipping\n";
+    };
+    readUnsigned("active_threads", m.thread.activeThreads);
+    readUnsigned("smt_per_core", m.thread.smtPerCore);
+    readNumber("dram_bytes_per_cycle", m.thread.dramBytesPerCycle);
+    readNumber("llc_bytes_per_cycle", m.thread.llcBytesPerCycle);
+    readBool("l1_shared", m.thread.l1Shared);
+    readBool("l2_shared", m.thread.l2Shared);
+    readBool("l3_shared", m.thread.l3Shared);
+  } else if (root->get("thread")) {
+    llvm::errs() << "drcompiler warning: 'thread' in '" << path
+                 << "' is not a JSON object; ignoring\n";
+  }
+
   m.fromFile = true;
   LLVM_DEBUG(llvm::dbgs() << "DRCOMP-COST: Loaded CPU cost model from '"
                           << path << "' (" << m.table.size() << " ops)\n");

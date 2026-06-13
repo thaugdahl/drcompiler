@@ -47,6 +47,19 @@ struct CpuArchJsonParams {
   std::optional<double> avx512FreqThrottle; // Intel AVX-512 license downclock
 };
 
+/// Optional thread / parallel-execution parameters parsed from a cost-model
+/// JSON's `thread` object (CROSSCUTTING.md III).  Absence keeps the 1-thread,
+/// bandwidth-disabled MachineModel defaults (byte-identical).
+struct CpuThreadJsonParams {
+  std::optional<unsigned> activeThreads;
+  std::optional<unsigned> smtPerCore;
+  std::optional<double> dramBytesPerCycle;
+  std::optional<double> llcBytesPerCycle;
+  std::optional<bool> l1Shared;
+  std::optional<bool> l2Shared;
+  std::optional<bool> l3Shared;
+};
+
 /// Optional register-block parameters parsed from a cost-model JSON's
 /// `registers` object.  Each field is std::nullopt unless present.
 struct CpuRegisterJsonParams {
@@ -97,6 +110,9 @@ public:
   /// Optional `registers` block parameters parsed from the JSON file.
   const CpuRegisterJsonParams &registerParams() const { return registers; }
 
+  /// Optional `thread` block parameters parsed from the JSON file.
+  const CpuThreadJsonParams &threadParams() const { return thread; }
+
 private:
   llvm::StringMap<unsigned> table;
   unsigned defaultCost = 5;
@@ -104,6 +120,7 @@ private:
   CpuCacheJsonParams cache;
   CpuArchJsonParams arch;
   CpuRegisterJsonParams registers;
+  CpuThreadJsonParams thread;
 
   void populateDefaults();
 };

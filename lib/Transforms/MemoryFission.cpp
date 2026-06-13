@@ -253,9 +253,11 @@ void MemoryFissionPass::runOnOperation() {
   // override them), so they come straight from the machine model instead of the
   // old hardcoded 200/64 literals (CROSSCUTTING.md P0 drift fix).
   unsigned memLatency = 200, cacheLineSize = 64;
+  // Hoisted to function scope so the thread model (roofline term below) is
+  // reachable at the materialize-vs-recompute decision.
+  drcompiler::MachineModel mm =
+      drcompiler::MachineModel::fromJson(cpuCostModelFile);
   {
-    drcompiler::MachineModel mm =
-        drcompiler::MachineModel::fromJson(cpuCostModelFile);
     if (!l1Size.hasValue())
       l1Size = static_cast<unsigned>(mm.l1Size);
     if (!l2Size.hasValue())
@@ -402,10 +404,27 @@ void MemoryFissionPass::runOnOperation() {
         dr::CacheParams cp{l1Size,    l2Size,    l3Size,        l1Latency,
                            l2Latency, l3Latency, memLatency,    cacheLineSize,
                            sharers,   l2OccupancyPct};
-        unsigned bufLat = dr::estimateLoadLatency(totalWS, cp);
-        int64_t recomputeC = (int64_t)numConsumers * computeCost;
-        int64_t materializeC =
-            (int64_t)computeCost + 1 + (int64_t)numConsumers * bufLat;
+        unsigned tierLat = dr::estimateLoadLatency(totalWS, cp);
+        // Roofline (CROSSCUTTING.md III.3): each of the N consumers RELOADS the
+        // materialized buffer (totalWS bytes).  Under a parallel workload that
+        // streaming competes for shared DRAM bandwidth, so the real per-reload
+        // cost is max(latency tier, bytes / per-thread bandwidth).  Without a
+        // thread/bandwidth JSON streamCycles() returns 0 and bufLat == tierLat
+        // (byte-identical).  The effect is in the correct direction: a buffer
+        // streamed N times under contended bandwidth makes materialization LESS
+        // attractive, i.e. recompute (per-thread ALU, which scales) wins more as
+        // threads rise.
+        bool fromDRAM = l3Size > 0 && totalWS > effL3;
+        // The bandwidth floor applies only when the working set spills the
+        // private L2 (so it actually streams from the shared LLC or DRAM); an
+        // L1/L2-resident reload is latency-bound, not bandwidth-shared.
+        bool beyondPrivate = totalWS > (int64_t)l2Size;
+        double bwCycles =
+            beyondPrivate ? mm.streamCycles(totalWS, fromDRAM) : 0.0;
+        double bufLat = std::max<double>(tierLat, bwCycles);
+        double recomputeC = (double)numConsumers * computeCost;
+        double materializeC =
+            (double)computeCost + 1.0 + (double)numConsumers * bufLat;
         bool materializeWins = materializeC < recomputeC;
         // The source-reread REVERSAL (WS4.6M): when recompute would re-read the
         // source past the effective LLC N times, fission (reading it once into a
