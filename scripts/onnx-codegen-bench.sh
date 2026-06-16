@@ -210,8 +210,20 @@ build_codegen() {
 }
 
 build_o3() {
-  echo "[o3] onnx-mlir --O3 --EmitObj" >&2
-  dock onnx-mlir --O3 --EmitObj -o "$WORKDIR/o3" "$MODEL_ABS"
+  # FAIRNESS (publishability): onnx-mlir --EmitObj defaults to a GENERIC x86-64
+  # target (baseline SSE2 -- 0 AVX/FMA), while our host path uses `clang
+  # -march=native` (AVX-512+FMA).  onnx-mlir's bundled LLVM CANNOT target the
+  # Zen4 host (`--march=native` => "invalid target 'znver4'"), and even
+  # `--mcpu=skylake-avx512` yields no AVX-512 -- its realistic best on this host
+  # is AVX2+FMA via `--mcpu=znver3` (8.7K ymm, 1.1K vfmadd).  Use that as the
+  # fairest "onnx-mlir --O3 at its best" through its OWN backend.  (On Zen4
+  # AVX-512 is double-pumped over 2x256 pipes, so our AVX-512 ~= this AVX2 in FP
+  # throughput; see COSTMODEL_PORTABILITY_FINDINGS.)  The cleanest, fully
+  # backend-matched comparison is `o3host` (onnx-mlir --O3 krnl through the SAME
+  # host clang -march=native).
+  O3MCPU="${O3MCPU:-znver3}"
+  echo "[o3] onnx-mlir --O3 --mcpu=$O3MCPU --EmitObj" >&2
+  dock onnx-mlir --O3 --mcpu="$O3MCPU" --EmitObj -o "$WORKDIR/o3" "$MODEL_ABS"
   link_bin "$WORKDIR/o3.o" "$WORKDIR/o3.bin"
 }
 
