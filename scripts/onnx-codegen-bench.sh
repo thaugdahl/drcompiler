@@ -51,11 +51,18 @@ ITERS=5; SHAPE="1,3,224,224"; CONFIGS="none,codegen,o3"
 # (MachineModel::preferredVectorElems): 8 on this Zen4 host, or whatever a
 # --cpu-cost-model-file describes (a native-512 Xeon -> 16).  --vl pins it.
 MR=8; NR=16; VL=""; CMF=""; WORKDIR=""
+# INPUTS: semicolon-separated typed tensors "DTYPE:D,D,...;DTYPE:D,D,..."
+# DTYPE in {f32,i64}.  Empty => single f32 tensor of --shape (back-compat,
+# the classification case).  Transformers need "i64:1,128;f32:1,128"
+# (input_ids + attention_mask).  Fill is deterministic per dtype so the three
+# configs see identical inputs -- correctness is RELATIVE (codegen vs none).
+INPUTS=""
 MODEL=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --iters) ITERS=$2; shift 2;;
     --shape) SHAPE=$2; shift 2;;
+    --inputs) INPUTS=$2; shift 2;;
     --configs) CONFIGS=$2; shift 2;;
     --mr) MR=$2; shift 2;;
     --nr) NR=$2; shift 2;;
@@ -86,9 +93,35 @@ if [[ ! -f "$WORKDIR/rt/libcruntime.a" ]]; then
   docker rm "$C" >/dev/null
 fi
 
-# ---- harness (shape baked in) ----
-NDIM=$(awk -F, '{print NF}' <<<"$SHAPE")
-NELEM=$(awk -F, '{p=1; for(i=1;i<=NF;i++) p*=$i; print p}' <<<"$SHAPE")
+# ---- harness (inputs + shapes baked in) ----
+# Build per-input C from the INPUTS spec (default: single f32 of --shape).
+[[ -n "$INPUTS" ]] || INPUTS="f32:$SHAPE"
+INPUT_DECLS=""; INPUT_ARRAY=""; NIN=0
+IFS=';' read -ra SPECS <<<"$INPUTS"
+for spec in "${SPECS[@]}"; do
+  dtype="${spec%%:*}"; dims="${spec#*:}"
+  ndim=$(awk -F, '{print NF}' <<<"$dims")
+  nelem=$(awk -F, '{p=1; for(i=1;i<=NF;i++) p*=$i; print p}' <<<"$dims")
+  case "$dtype" in
+    f32) ctype=float;   otype=ONNX_TYPE_FLOAT;
+         fill='((int)(i % 255) - 127) * 0.0078431f';;
+    f1)  ctype=float;   otype=ONNX_TYPE_FLOAT;
+         fill='1.0f';;  # f32 all-ones, e.g. attention_mask (random mask -> NaN softmax)
+    i64) ctype=int64_t; otype=ONNX_TYPE_INT64;
+         fill='(int64_t)(i % 100)';;  # small valid token ids
+    *) echo "unknown input dtype: $dtype" >&2; exit 1;;
+  esac
+  INPUT_DECLS+="  int64_t shape$NIN[$ndim] = {${dims}};
+  size_t n$NIN = $nelem;
+  $ctype *data$NIN = malloc(n$NIN * sizeof($ctype));
+  for (size_t i = 0; i < n$NIN; i++) data$NIN[i] = $fill;
+  OMTensor *in$NIN = omTensorCreate(data$NIN, shape$NIN, $ndim, $otype);
+"
+  [[ $NIN -gt 0 ]] && INPUT_ARRAY+=", "
+  INPUT_ARRAY+="in$NIN"
+  NIN=$((NIN+1))
+done
+
 cat > "$WORKDIR/harness.c" <<EOF
 #include <OnnxMlirRuntime.h>
 #include <stdio.h>
@@ -98,27 +131,29 @@ extern OMTensorList *run_main_graph(OMTensorList *);
 int main(int argc, char **argv) {
   const char *logits_path = argc > 1 ? argv[1] : NULL;
   int iters = argc > 2 ? atoi(argv[2]) : 5;
-  int64_t shape[$NDIM] = {${SHAPE}};
-  size_t n = $NELEM;
-  float *data = malloc(n * sizeof(float));
-  for (size_t i = 0; i < n; i++)
-    data[i] = ((int)(i % 255) - 127) * 0.0078431f;
-  OMTensor *in = omTensorCreate(data, shape, $NDIM, ONNX_TYPE_FLOAT);
-  OMTensor *ins[1] = {in};
-  OMTensorList *inl = omTensorListCreate(ins, 1);
+$INPUT_DECLS
+  OMTensor *ins[$NIN] = {$INPUT_ARRAY};
+  OMTensorList *inl = omTensorListCreate(ins, $NIN);
   OMTensorList *outl = run_main_graph(inl); /* warmup + correctness */
   if (!outl) { fprintf(stderr, "run_main_graph NULL\n"); return 1; }
-  OMTensor *out = omTensorListGetOmtArray(outl)[0];
-  float *logits = (float *)omTensorGetDataPtr(out);
-  int64_t nout = omTensorGetNumElems(out);
-  if (logits_path) {
-    FILE *f = fopen(logits_path, "w");
-    for (int64_t i = 0; i < nout; i++) fprintf(f, "%.9e\n", logits[i]);
-    fclose(f);
+  int64_t nlists = omTensorListGetSize(outl);
+  /* dump EVERY output tensor (concatenated) for the rel-error check; top1 is
+     argmax over the first output as a determinism checksum. */
+  FILE *f = logits_path ? fopen(logits_path, "w") : NULL;
+  int64_t best = 0; float bestv = 0; int64_t total = 0;
+  for (int64_t t = 0; t < nlists; t++) {
+    OMTensor *out = omTensorListGetOmtArray(outl)[t];
+    float *vals = (float *)omTensorGetDataPtr(out);
+    int64_t no = omTensorGetNumElems(out);
+    for (int64_t i = 0; i < no; i++) {
+      if (f) fprintf(f, "%.9e\n", vals[i]);
+      if (t == 0 && (i == 0 || vals[i] > bestv)) { bestv = vals[i]; best = i; }
+    }
+    total += no;
   }
-  int64_t best = 0;
-  for (int64_t i = 1; i < nout; i++) if (logits[i] > logits[best]) best = i;
-  fprintf(stderr, "top1=%lld nout=%lld\n", (long long)best, (long long)nout);
+  if (f) fclose(f);
+  fprintf(stderr, "top1=%lld nout=%lld nlists=%lld\n",
+          (long long)best, (long long)total, (long long)nlists);
   omTensorListDestroy(outl);
   for (int r = 0; r < iters; r++) {
     struct timespec t0, t1;
@@ -130,7 +165,6 @@ int main(int argc, char **argv) {
     printf("%.6f\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
   }
   omTensorListDestroy(inl);
-  free(data);
   return 0;
 }
 EOF
