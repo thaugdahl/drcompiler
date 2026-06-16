@@ -92,6 +92,15 @@ struct MachineModel {
   // real native-512 part.  See claude-docs/COSTMODEL_PORTABILITY_FINDINGS.md (WP-G1).
   double avx512FreqThrottle = 1.0;
 
+  // FP FMA issue pipes -- the COMPUTE arm of the roofline (NEW: WP-T2).  The BW
+  // arm (streamCycles) has always existed; without a compute arm the model
+  // cannot tell a compute-bound deep-K GEMM from a BW-bound tiny-K one (the
+  // QK^T decision).  0 (default) keeps the compute arm INERT so the model is
+  // byte-identical to today.  Zen4/Zen5 = 2 (two 256-bit FMA pipes), Intel Xeon
+  // SKX/CLX/ICX = 2, ARM Neoverse (SVE) = 2, Apple M = 4.  These are FMA-issue
+  // pipes, not lane counts.  Set from arch.fma_units.
+  unsigned fmaUnits = 0;
+
   // True once a cost-model JSON explicitly set any vector-execution field.  The
   // register-block pass derives `vl` from preferredVectorElems() ONLY then, so
   // the default machine keeps the static vl option default (8 == the Zen4
@@ -177,6 +186,50 @@ struct MachineModel {
             : bw / static_cast<double>(thread.activeThreads ? thread.activeThreads
                                                             : 1u);
     return static_cast<double>(bytes) / effBW;
+  }
+
+  // --- Compute roofline arm (NEW: WP-T2) ------------------------------------
+  /// Peak FP throughput in flops/cycle at the native datapath width.  The 2 is
+  /// FMA's two flops; uses vectorBitsNative (the throughput-effective width, per
+  /// the preferredVectorElems convention) -- NOT vectorBitsArch, since a wider
+  /// arch vector is cracked/double-pumped at the same FLOP rate.  `elemBytes` in
+  /// BYTES (must be > 0).  Returns 0 when fmaUnits is unset (compute arm inert).
+  double peakFlopsPerCycle(int64_t elemBytes) const {
+    if (fmaUnits == 0)
+      return 0.0;
+    int64_t bits = 8 * (elemBytes > 0 ? elemBytes : 4);
+    double lanes = static_cast<double>(vectorBitsNative) / static_cast<double>(bits);
+    return 2.0 * lanes * static_cast<double>(fmaUnits);
+  }
+
+  /// Compute-bound cycles for `flops` FP operations -- the compute arm paired
+  /// with streamCycles (the BW arm); real time = max(compute, stream, latency).
+  /// 0 when the compute arm is inert (caller falls back to the BW/latency arm).
+  double computeCycles(int64_t flops, int64_t elemBytes) const {
+    double peak = peakFlopsPerCycle(elemBytes);
+    if (peak <= 0.0)
+      return 0.0;
+    return static_cast<double>(flops) / peak;
+  }
+
+  /// Ridge-point arithmetic intensity (flops/byte) = peak compute / bandwidth,
+  /// bound to the SAME bandwidth streamCycles uses (DRAM vs LLC by `fromDRAM`,
+  /// derated by activeThreads in interspersed mode, full in exclusive mode).  A
+  /// GEMM whose arithmetic intensity < this is BW-bound; >= is compute-bound.
+  /// Classifying and costing against one source by construction -- using a
+  /// different bandwidth for each would invert the decision.  Returns 0 when
+  /// either arm is unmodelled (no classification possible -> caller defaults).
+  double ridgeIntensity(int64_t elemBytes, bool fromDRAM) const {
+    double peak = peakFlopsPerCycle(elemBytes);
+    double bw = fromDRAM ? thread.dramBytesPerCycle : thread.llcBytesPerCycle;
+    if (peak <= 0.0 || bw <= 0.0)
+      return 0.0;
+    double effBW =
+        thread.exclusive
+            ? bw
+            : bw / static_cast<double>(thread.activeThreads ? thread.activeThreads
+                                                            : 1u);
+    return peak / effBW;
   }
 
   /// Effective last-level cache after dividing by co-tenant sharers.  A reuse

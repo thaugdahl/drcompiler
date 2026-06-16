@@ -60,6 +60,12 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     mm.avx512FreqThrottle = *a.avx512FreqThrottle;
     mm.hasExplicitVectorModel = true;
   }
+  // Compute-roofline arm (WP-T2).  fmaUnits is a GEMM-model signal: it enables
+  // the kernel-kind dispatch (gemmBlocking), so it sets hasExplicitGemmModel.
+  if (a.fmaUnits) {
+    mm.fmaUnits = *a.fmaUnits;
+    mm.hasExplicitGemmModel = true;
+  }
   // Cross-field sanity: the native datapath cannot be wider than the encodable
   // vector (a partial JSON that sets only vector_bits_native above the default
   // vector_bits_arch, or an outright typo).  Correct + warn so preferredVector-

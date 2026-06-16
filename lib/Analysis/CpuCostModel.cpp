@@ -192,6 +192,7 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
     readUnsigned("vector_bits_arch", m.arch.vectorBitsArch);
     readUnsigned("vec_reg_budget", m.arch.vecRegBudget);
     readNumber("avx512_freq_throttle", m.arch.avx512FreqThrottle);
+    readUnsigned("fma_units", m.arch.fmaUnits);
 
     if (auto *weights = archObj->getObject("weights")) {
       auto readWeight = [&](llvm::StringRef key,

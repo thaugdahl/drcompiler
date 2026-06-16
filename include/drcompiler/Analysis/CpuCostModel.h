@@ -45,6 +45,9 @@ struct CpuArchJsonParams {
   std::optional<unsigned> vectorBitsArch;   // widest ISA-encodable vector
   std::optional<unsigned> vecRegBudget;     // vector regs usable for accumulators
   std::optional<double> avx512FreqThrottle; // Intel AVX-512 license downclock
+  // Compute-roofline arm (WP-T2: transformer GEMM kernel-kind dispatch).  FP FMA
+  // issue pipes; absence keeps the compute arm inert (BW-only, as today).
+  std::optional<unsigned> fmaUnits;
 };
 
 /// Optional thread / parallel-execution parameters parsed from a cost-model
