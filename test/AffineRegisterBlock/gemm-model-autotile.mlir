@@ -5,10 +5,10 @@
 // When a cost-model JSON describes a GEMM model (here arch.fma_units => the
 // roofline arm => hasExplicitGemmModel), the cache-tiling decision is made
 // per-band by MachineModel::gemmBlocking -- so a deep-K GEMM whose working set
-// exceeds the effective LLC auto-cache-tiles WITHOUT the global `cache-tile`
-// flag.  The fixture's l3_size=16384 makes this 96 KiB 64x64xf64 band exceed the
-// effective LLC, so it tiles; with NO JSON the GEMM model is absent and the band
-// is register-blocked untiled (byte-identical to pre-T3) -- the FLAT prefix.
+// exceeds the effective L2 auto-cache-tiles (B-panel to L2) WITHOUT the global
+// `cache-tile` flag.  The fixture's l2_size=16384 makes this 96 KiB 64x64xf64
+// band exceed the effective L2, so it tiles; with NO JSON the GEMM model is
+// absent and the band is register-blocked untiled (byte-identical) -- FLAT.
 
 module {
   func.func @gemm(%A: memref<64x64xf64>, %B: memref<64x64xf64>, %C: memref<64x64xf64>) {

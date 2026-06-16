@@ -398,14 +398,17 @@ struct MachineModel {
     t.nr = 16;
     t.vl = static_cast<unsigned>(preferredVectorElems(elemBytes, t.mr, t.nr));
     t.kind = GemmKernel::Broadcast; // WP-T4 adds tiny-K OuterProduct via the ridge
-    // Deep-K cache-tiling decision (WP-T3): tile when the band's working set
-    // (A + B + C) exceeds the effective LLC, so the register-blocked micro-kernel
-    // runs cache-resident instead of re-streaming B from DRAM -- the openai-gpt
-    // FFN lever (the band fires today but stays DRAM-bound, cache-tile off).
-    // Sizes via macroTile from a 256^3 macro start (the pass's mc/nc/kc default).
+    // Deep-K cache-tiling decision (WP-T3/T5): tile so the active B-panel becomes
+    // L2-resident.  The budget is the effective L2, NOT the LLC: on a big-LLC
+    // host (the 7950X3D's 128 MiB V-cache) the openai-gpt FFN working set (~11
+    // MiB) already fits L3, so an LLC-budgeted tile never fires -- yet the
+    // register-block kernel still streams the ~9 MiB B from L3 every i-pass.
+    // Tiling the macro-kernel to L2 (the classic BLIS level) brings the B-panel
+    // resident and is the actual lever for the 36x openai-gpt gap (WP-T0).  Sizes
+    // via macroTile from a 256^3 macro start (the pass's mc/nc/kc default).
     MacroTile mt =
         macroTile(M, N, K, 256, 256, 256, t.mr, t.nr, t.vl, elemBytes,
-                  effectiveLLC());
+                  effectiveCache(L2));
     if (!mt.skip) {
       t.cacheTile = true;
       t.mc = mt.mc;

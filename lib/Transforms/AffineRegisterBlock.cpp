@@ -1023,33 +1023,36 @@ public:
           if (et.isIntOrFloat())
             eb = std::max<int64_t>(1, (int64_t)et.getIntOrFloatBitWidth() / 8);
         }
-        // WP-T3: under a GEMM model the configurator owns the per-band decision
-        // -- tile only the bands it flags (deep-K, working set beyond the
-        // effective LLC), leaving cache-resident bands register-blocked untiled.
-        // The legacy global `cache-tile` option (no GEMM model) tiles every band
-        // as before; the short-circuit keeps the default path byte-identical.
-        if (mm.hasExplicitGemmModel &&
-            !mm.gemmBlocking(ie, je, ke, eb).cacheTile)
-          continue;
-        // The cache we can COUNT ON under contention: a co-tenant can evict the
-        // shared L3, so only l3Size/llcSharers is guaranteed (private caches are
-        // not derated).  Tile ONLY when the band's working set (A + B + C) does
-        // not fit it -- otherwise the register-blocked micro-kernel already runs
-        // cache-resident and tiling just adds min/max point-bound overhead that
-        // scalarizes the kernel (observed: small-N collapse to ~0.1x).  Higher
-        // llcSharers => tile sooner and smaller (can't rely on the shared L3).
-        // The mc/nc/kc shrink is the ONE definition in MachineModel::macroTile
-        // (WP-T1 extraction; byte-identical), shared with the GEMM configurator.
-        unsigned sharers = llcSharers ? llcSharers : 1u;
-        int64_t effLLC = drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
-        auto mt = drcompiler::MachineModel::macroTile(ie, je, ke, mc, nc, kc, mr,
-                                                      nr, vl, eb, effLLC);
-        // skip = band already fits the effective cache, or the tile would span
-        // the full extent (no blocking benefit, scalarizing point bounds).
-        if (mt.skip)
-          continue;
-        SmallVector<unsigned, 3> sizes{(unsigned)mt.mc, (unsigned)mt.nc,
-                                       (unsigned)mt.kc};
+        // The per-band macro-tile.  Two paths:
+        //  * GEMM model (WP-T3/T5): gemmBlocking owns the decision AND the sizes,
+        //    budgeted to the effective L2 so the B-panel becomes L2-resident (the
+        //    openai-gpt FFN lever; an LLC-budgeted tile never fires on a big-LLC
+        //    host where the working set already fits L3).
+        //  * Legacy global `cache-tile` option (no GEMM model): size against the
+        //    effective LLC exactly as before -- byte-identical, the short-circuit
+        //    keeps the default path untouched.
+        // Both routes share the ONE shrink definition in MachineModel::macroTile.
+        SmallVector<unsigned, 3> sizes;
+        if (mm.hasExplicitGemmModel) {
+          drcompiler::MachineModel::GemmTiling gt = mm.gemmBlocking(ie, je, ke, eb);
+          if (!gt.cacheTile)
+            continue; // band fits L2 / not worth tiling
+          sizes = {(unsigned)gt.mc, (unsigned)gt.nc, (unsigned)gt.kc};
+        } else {
+          // The cache we can COUNT ON under contention: a co-tenant can evict the
+          // shared L3, so only l3Size/llcSharers is guaranteed.  Tile ONLY when
+          // the band's working set (A + B + C) does not fit it -- otherwise the
+          // register-blocked micro-kernel already runs cache-resident and tiling
+          // just adds point-bound overhead that scalarizes the kernel.
+          unsigned sharers = llcSharers ? llcSharers : 1u;
+          int64_t effLLC =
+              drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
+          auto mt = drcompiler::MachineModel::macroTile(ie, je, ke, mc, nc, kc,
+                                                        mr, nr, vl, eb, effLLC);
+          if (mt.skip)
+            continue;
+          sizes = {(unsigned)mt.mc, (unsigned)mt.nc, (unsigned)mt.kc};
+        }
         (void)affine::tilePerfectlyNested(in, sizes);
       }
     }
