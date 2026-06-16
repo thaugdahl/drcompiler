@@ -1020,35 +1020,18 @@ public:
         // cache-resident and tiling just adds min/max point-bound overhead that
         // scalarizes the kernel (observed: small-N collapse to ~0.1x).  Higher
         // llcSharers => tile sooner and smaller (can't rely on the shared L3).
+        // The mc/nc/kc shrink is the ONE definition in MachineModel::macroTile
+        // (WP-T1 extraction; byte-identical), shared with the GEMM configurator.
         unsigned sharers = llcSharers ? llcSharers : 1u;
         int64_t effLLC = drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
-        int64_t ws = (ie * ke + ke * je + ie * je) * eb;
-        if (effLLC <= 0 || ws <= effLLC)
+        auto mt = drcompiler::MachineModel::macroTile(ie, je, ke, mc, nc, kc, mr,
+                                                      nr, vl, eb, effLLC);
+        // skip = band already fits the effective cache, or the tile would span
+        // the full extent (no blocking benefit, scalarizing point bounds).
+        if (mt.skip)
           continue;
-        // Clamp each tile to its extent, then halve the largest until the
-        // per-tile working set (mc*kc + kc*nc + mc*nc)*eb fits the effective
-        // cache.  Halving 256 keeps mr/nr/vl-friendly multiples.
-        int64_t tmc = std::min<int64_t>(mc, ie), tnc = std::min<int64_t>(nc, je),
-                tkc = std::min<int64_t>(kc, ke);
-        auto tileWS = [&]() {
-          return (tmc * tkc + tkc * tnc + tmc * tnc) * eb;
-        };
-        while (tileWS() > effLLC) {
-          if (tmc >= tnc && tmc >= tkc && tmc > (int64_t)mr)
-            tmc = std::max<int64_t>(mr, tmc / 2);
-          else if (tnc >= tkc && tnc > (int64_t)nr)
-            tnc = std::max<int64_t>(nr, tnc / 2);
-          else if (tkc > (int64_t)vl)
-            tkc = std::max<int64_t>(vl, tkc / 2);
-          else
-            break; // can't shrink further; tile anyway (better than DRAM-bound)
-        }
-        // Degenerate: a tile spanning the full extent gives no blocking benefit
-        // and yields scalarizing point bounds -- leave it register-blocked untiled.
-        if (tmc >= ie && tnc >= je && tkc >= ke)
-          continue;
-        SmallVector<unsigned, 3> sizes{(unsigned)tmc, (unsigned)tnc,
-                                       (unsigned)tkc};
+        SmallVector<unsigned, 3> sizes{(unsigned)mt.mc, (unsigned)mt.nc,
+                                       (unsigned)mt.kc};
         (void)affine::tilePerfectlyNested(in, sizes);
       }
     }

@@ -21,6 +21,7 @@
 #define DRCOMPILER_ANALYSIS_MACHINEMODEL_H
 
 #include "llvm/ADT/StringRef.h"
+#include <algorithm>
 #include <cstdint>
 
 namespace drcompiler {
@@ -225,6 +226,127 @@ struct MachineModel {
     while (vl < archE && accs(vl) > vecRegBudget)
       vl *= 2;
     return vl;
+  }
+
+  // --- GEMM blocking model (NEW: TRANSFORMER_KRNL_SPEC WP-T1) ---------------
+  // Register-file budgets bridged from the cost-model JSON `registers` block
+  // (CpuRegisterJsonParams: gp/fp/vec/predBudget).  CpuCostModel already parses
+  // them but they never reached MachineModel, so the graph-coloring budget and
+  // the vector-tile budget (`vecRegBudget`) were two disconnected numbers.
+  // Reconciliation (CROSSCUTTING): vecRegBudget (24) = the *accumulator* slice
+  // of the full vector file (`registers.vec`, 32 on AVX-512) minus regs reserved
+  // for the streaming B-panel + broadcast temporaries.  Register-tile sizing
+  // uses vecRegBudget; RegisterPressureAnalysis uses the full registers.vec.
+  // Defaults are the x86-64 / AVX-512 architectural counts.
+  struct RegisterBudget {
+    unsigned gp = 16;   // general-purpose (addresses, loop ivs)
+    unsigned fp = 32;   // scalar FP / vector regs
+    unsigned vec = 32;  // full vector register file (32 zmm)
+    unsigned pred = 8;  // predicate / mask regs (8 AVX-512 k-regs)
+  };
+  RegisterBudget registers; // bridged in fromJson from the `registers` block
+
+  // True once a cost-model JSON provides a GEMM-model signal (the `registers`
+  // block today; arch.fmaUnits in WP-T2; a dedicated `gemm` block later).  The
+  // register-block pass consults gemmBlocking() ONLY then, so the default
+  // machine keeps the static mr/nr/vl + cache-tile-off path -> byte-identical.
+  bool hasExplicitGemmModel = false;
+
+  /// Register-block kernel family selected by gemmBlocking().
+  enum class GemmKernel {
+    Broadcast,    // deep-K: the mr x nr broadcast micro-kernel (today's path)
+    OuterProduct, // tiny-K: jam M & N, fully unroll K in registers (WP-T4)
+    Gemv          // M=1 (WP-T7, deferred)
+  };
+
+  /// One GEMM's resolved blocking decision (TRANSFORMER_KRNL_SPEC §4.3).
+  /// kc/mc/nc == 0 means "untiled / full extent".
+  struct GemmTiling {
+    unsigned mr = 8, nr = 16, vl = 8;
+    int64_t kc = 0, mc = 0, nc = 0;
+    GemmKernel kind = GemmKernel::Broadcast;
+    bool cacheTile = false;
+  };
+
+  /// Does the mr x ceil(nr/vl) accumulator tile fit the accumulator register
+  /// budget (vecRegBudget)?  Extracted from preferredVectorElems' fit loop so
+  /// the GEMM configurator and the VL deriver share ONE definition.
+  bool canFitAccumulators(unsigned mr, unsigned nr, unsigned vl) const {
+    if (vl == 0)
+      return false;
+    int64_t per = (static_cast<int64_t>(nr) + vl - 1) / vl;
+    return static_cast<int64_t>(mr) * per <= vecRegBudget;
+  }
+
+  /// Largest k-panel such that the A(mr x kc) + B(kc x nr) + C(mr x nr) panels
+  /// fit the per-thread effective L1.  `elemBytes` in BYTES.  Returned UNROUNDED;
+  /// the caller rounds kc down to a multiple of vl when it needs stride-1
+  /// vectorized B-panel loads.  No L1-panel concept existed before WP-T1.
+  int64_t maxL1Kc(unsigned mr, unsigned nr, int64_t elemBytes) const {
+    int64_t eb = elemBytes > 0 ? elemBytes : 4;
+    int64_t budget = effectiveCache(L1) / eb - static_cast<int64_t>(mr) * nr;
+    int64_t denom = static_cast<int64_t>(mr) + nr;
+    if (denom <= 0)
+      return 1;
+    int64_t kc = budget / denom;
+    return kc < 1 ? 1 : kc;
+  }
+
+  /// A macro-tile (mc,nc,kc) and whether the caller should skip tiling.
+  struct MacroTile {
+    int64_t mc, nc, kc;
+    bool skip; // band already fits the budget, or the tile spans the full extent
+  };
+
+  /// Shrink the register-block macro-tile (mc,nc,kc), each clamped to its extent
+  /// (M,N,K), by halving the largest dim until the per-tile working set
+  /// (mc*kc + kc*nc + mc*nc)*elemBytes fits `budgetBytes` (typically the
+  /// effective LLC).  `skip` is set when the whole band already fits the budget
+  /// (no tiling needed) or the resulting tile spans the full extent (degenerate
+  /// -- tiling would only add scalarizing point bounds).  Static + pure: a
+  /// byte-identical extraction of the inline cache-tile loop that was in
+  /// AffineRegisterBlock.cpp, now the ONE definition shared by the pass and the
+  /// GEMM configurator.
+  static MacroTile macroTile(int64_t M, int64_t N, int64_t K, int64_t mc,
+                             int64_t nc, int64_t kc, int64_t mr, int64_t nr,
+                             int64_t vl, int64_t elemBytes, int64_t budgetBytes) {
+    int64_t eb = elemBytes > 0 ? elemBytes : 8;
+    int64_t ws = (M * K + K * N + M * N) * eb;
+    if (budgetBytes <= 0 || ws <= budgetBytes)
+      return {0, 0, 0, true};
+    int64_t tmc = std::min<int64_t>(mc, M), tnc = std::min<int64_t>(nc, N),
+            tkc = std::min<int64_t>(kc, K);
+    auto tileWS = [&]() { return (tmc * tkc + tkc * tnc + tmc * tnc) * eb; };
+    while (tileWS() > budgetBytes) {
+      if (tmc >= tnc && tmc >= tkc && tmc > mr)
+        tmc = std::max<int64_t>(mr, tmc / 2);
+      else if (tnc >= tkc && tnc > nr)
+        tnc = std::max<int64_t>(nr, tnc / 2);
+      else if (tkc > vl)
+        tkc = std::max<int64_t>(vl, tkc / 2);
+      else
+        break; // can't shrink further; tile anyway (better than DRAM-bound)
+    }
+    if (tmc >= M && tnc >= N && tkc >= K)
+      return {tmc, tnc, tkc, true};
+    return {tmc, tnc, tkc, false};
+  }
+
+  /// THE GEMM configurator (TRANSFORMER_KRNL_SPEC §4.3): one query owns the GEMM
+  /// tiling decision for a static (M,N,K) contraction.  WP-T1 skeleton -- always
+  /// the Broadcast family with today's tiling (mr=8, nr=16, vl from the vector
+  /// model, untiled).  WP-T2 adds the roofline kernel-kind dispatch; WP-T3 wires
+  /// the pass to call this (only when hasExplicitGemmModel); WP-T5 turns on
+  /// cache-tiling for deep-K.  Pure function of the machine + (M,N,K).
+  GemmTiling gemmBlocking(int64_t /*M*/, int64_t /*N*/, int64_t /*K*/,
+                          int64_t elemBytes) const {
+    GemmTiling t;
+    t.mr = 8;
+    t.nr = 16;
+    t.vl = static_cast<unsigned>(preferredVectorElems(elemBytes, t.mr, t.nr));
+    t.kind = GemmKernel::Broadcast;
+    t.cacheTile = false; // WP-T5 flips this for deep-K
+    return t;            // mc=nc=kc=0 => untiled
   }
 
   /// Built-in defaults (no JSON).

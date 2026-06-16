@@ -110,5 +110,29 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     markThread();
   }
 
+  // Register-file budgets (TRANSFORMER_KRNL_SPEC WP-T1).  CpuCostModel already
+  // parses the `registers` block; bridge it into MachineModel so the GEMM
+  // configurator and RegisterPressureAnalysis share one budget.  Presence of any
+  // register budget is a GEMM-model signal (gates gemmBlocking via
+  // hasExplicitGemmModel); WP-T2 adds arch.fmaUnits as a second trigger.
+  const CpuRegisterJsonParams &r = cm.registerParams();
+  auto markGemm = [&] { mm.hasExplicitGemmModel = true; };
+  if (r.gpBudget) {
+    mm.registers.gp = *r.gpBudget;
+    markGemm();
+  }
+  if (r.fpBudget) {
+    mm.registers.fp = *r.fpBudget;
+    markGemm();
+  }
+  if (r.vecBudget) {
+    mm.registers.vec = *r.vecBudget;
+    markGemm();
+  }
+  if (r.predBudget) {
+    mm.registers.pred = *r.predBudget;
+    markGemm();
+  }
+
   return mm;
 }
