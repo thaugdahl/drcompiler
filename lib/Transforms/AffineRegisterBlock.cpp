@@ -502,6 +502,145 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
 /// emitting branch A (all epilogues) before branch B (all scatters) preserves
 /// every M dependence.  temp2 reads only inputs (B,A), so fissioning it from the
 /// scatter is trivially legal.
+/// WP-T5c: canonicalize onnx-mlir's scalar-alloca-accumulator GEMM into perfect
+/// register-blockable bands.  onnx-mlir lowers each Gemm to
+///   for i { for j { %a=alloca; store 0,%a; for k {%a+=A[i,k]*B[k,j]}; <epi>;
+///                   store r, C[i,j] } }
+/// whose imperfect j-body (alloca init + bias epilogue) and rank-0 (scalar)
+/// accumulator defeat BOTH register-block vectorization (enclosingSpatial fails
+/// on a non-spatial acc) and cache-tiling -- so the FFN GEMMs run as a scalar,
+/// memory-round-trip-per-k dependent chain (~1.5 GFLOP/s; the openai-gpt 0.98x
+/// no-op).  Promote the scalar alloca to the spatial output C[i,j] and fission
+/// the init / k-reduction / epilogue into separate PERFECT nests -- the exact
+/// form Stage 1b/2 already vectorize (proven: 16 broadcasts) + cache-tile.
+/// Legal because, post-promotion, each segment touches only C[i,j] (A/B/bias are
+/// read-only) and i,j are independent, so init-all then accumulate-all then
+/// epilogue-all preserves every C dependence (the distributeLoop legality, here
+/// extended to the side-effecting init/epilogue STORES that distributeLoop
+/// refuses).  Gated on a GEMM model so the default machine is byte-identical.
+static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
+  SmallVector<AffineForOp> iLoops;
+  func.walk([&](AffineForOp iLoop) {
+    if (!iLoop->getParentOfType<AffineForOp>())
+      iLoops.push_back(iLoop); // outermost spatial loops; mutate after the walk
+  });
+  for (AffineForOp iLoop : iLoops) {
+    AffineForOp jLoop = onlyChildFor(iLoop);
+    if (!jLoop || !iLoop.hasConstantUpperBound() ||
+        !jLoop.hasConstantUpperBound())
+      continue;
+    // A single innermost reduction in j's body, NOT already a perfect i-j-k band
+    // (those are handled by the existing stages).
+    AffineForOp kLoop;
+    int nred = 0;
+    jLoop.walk([&](AffineForOp r) {
+      if (isInnermost(r) && !collectAccumulators(r).empty()) {
+        kLoop = r;
+        ++nred;
+      }
+    });
+    if (nred != 1 || !kLoop || onlyChildFor(jLoop) == kLoop)
+      continue;
+    // The accumulator must be a single rank-0 (scalar) alloca local to j.
+    SmallVector<Acc> kaccs = collectAccumulators(kLoop);
+    if (kaccs.size() != 1)
+      continue;
+    Value acc = kaccs[0].memref;
+    auto accTy = dyn_cast<MemRefType>(acc.getType());
+    if (!accTy || accTy.getRank() != 0)
+      continue;
+    auto allocaOp = acc.getDefiningOp<memref::AllocaOp>();
+    if (!allocaOp || allocaOp->getParentOp() != jLoop.getOperation())
+      continue;
+    // The spatial output store: the last direct store in j's body to a >=1D
+    // memref (not the scalar acc), indexed by exactly the i and j IVs.
+    AffineStoreOp cStore;
+    for (Operation &op : jLoop.getBody()->without_terminator())
+      if (auto st = dyn_cast<AffineStoreOp>(&op))
+        if (st.getMemRef() != acc)
+          if (auto mt = dyn_cast<MemRefType>(st.getMemRef().getType()))
+            if (mt.getRank() >= 1)
+              cStore = st;
+    if (!cStore)
+      continue;
+    SmallVector<Value> cOps(cStore.getMapOperands().begin(),
+                            cStore.getMapOperands().end());
+    if (cOps.empty() || !llvm::all_of(cOps, [&](Value v) {
+          return v == iLoop.getInductionVar() || v == jLoop.getInductionVar();
+        }))
+      continue; // exotic index -> leave it (conservative)
+    Value cMemref = cStore.getMemRef();
+    AffineMap cMap = cStore.getAffineMap();
+    // No-bias copy epilogue: the final store stores exactly the loaded acc.
+    bool copyEpi = false;
+    if (Operation *d = cStore.getValueToStore().getDefiningOp())
+      if (auto ld = dyn_cast<AffineLoadOp>(d))
+        copyEpi = (ld.getMemRef() == acc);
+
+    // Promote every scalar-alloca access to C[cOps] (clone IVs are remapped when
+    // the loop is cloned below; here we use the original i/j IVs).
+    SmallVector<AffineLoadOp> lds;
+    SmallVector<AffineStoreOp> sts;
+    jLoop.walk([&](Operation *op) {
+      if (auto l = dyn_cast<AffineLoadOp>(op)) {
+        if (l.getMemRef() == acc)
+          lds.push_back(l);
+      } else if (auto s = dyn_cast<AffineStoreOp>(op)) {
+        if (s.getMemRef() == acc)
+          sts.push_back(s);
+      }
+    });
+    for (AffineLoadOp l : lds) {
+      rewriter.setInsertionPoint(l);
+      auto nl = rewriter.create<AffineLoadOp>(l.getLoc(), cMemref, cMap, cOps);
+      rewriter.replaceOp(l, nl.getResult());
+    }
+    for (AffineStoreOp s : sts) {
+      rewriter.setInsertionPoint(s);
+      rewriter.create<AffineStoreOp>(s.getLoc(), s.getValueToStore(), cMemref,
+                                     cMap, cOps);
+      rewriter.eraseOp(s);
+    }
+    rewriter.eraseOp(allocaOp);
+
+    // Fission: clone iLoop, prune the cloned j-body to one segment.  INIT = ops
+    // before the k-loop (the zero init), GEMM = the k-loop (now a perfect i-j-k
+    // band accumulating into C), EPI = ops after the k-loop (the bias add).
+    enum Seg { INIT, GEMM, EPI };
+    auto emit = [&](Seg seg) {
+      rewriter.setInsertionPoint(iLoop);
+      IRMapping map;
+      auto ni = cast<AffineForOp>(rewriter.clone(*iLoop, map));
+      auto nj = dyn_cast<AffineForOp>(&ni.getBody()->front());
+      if (!nj)
+        return;
+      AffineForOp ck;
+      for (Operation &op : *nj.getBody())
+        if (auto f = dyn_cast<AffineForOp>(&op))
+          ck = f;
+      SmallVector<Operation *> dead;
+      bool afterK = false;
+      for (Operation &op : nj.getBody()->without_terminator()) {
+        bool isK = (&op == ck.getOperation());
+        bool keep = (seg == INIT) ? (!isK && !afterK)
+                    : (seg == GEMM) ? isK
+                                    : afterK;
+        if (isK)
+          afterK = true;
+        if (!keep)
+          dead.push_back(&op);
+      }
+      for (Operation *op : llvm::reverse(dead))
+        rewriter.eraseOp(op);
+    };
+    emit(INIT);
+    emit(GEMM);
+    if (!copyEpi)
+      emit(EPI);
+    rewriter.eraseOp(iLoop);
+  }
+}
+
 static bool raiseSymmScatter(func::FuncOp func, IRRewriter &rewriter) {
   // Match candidates without mutating during the walk.
   SmallVector<AffineForOp> iCands;
@@ -819,6 +958,13 @@ public:
     // untouched) so nothing reverts it; the result is inert to the BLAS-3
     // register-block stages below.
     interchangeBlas2RowMajor(func);
+
+    // Stage 1.6 (WP-T5c): canonicalize onnx-mlir's scalar-alloca-accumulator
+    // GEMM (FFN / projections) into perfect register-blockable bands so the
+    // Stage 1b/2 vectorizer + cache-tiler can crush them.  Model-gated so the
+    // default machine (PolyBench / cgeist input) is byte-identical.
+    if (mm.hasExplicitGemmModel)
+      canonicalizeAllocaGemm(func, rewriter);
 
     // Stage 1a: family selection.  The transform is identical for both BLAS-3
     // families, but the operand layout dictates which LLVM vectorization
