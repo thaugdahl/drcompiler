@@ -552,17 +552,33 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
     auto allocaOp = acc.getDefiningOp<memref::AllocaOp>();
     if (!allocaOp || allocaOp->getParentOp() != jLoop.getOperation())
       continue;
-    // The spatial output store: the last direct store in j's body to a >=1D
-    // memref (not the scalar acc), indexed by exactly the i and j IVs.
-    AffineStoreOp cStore;
-    for (Operation &op : jLoop.getBody()->without_terminator())
-      if (auto st = dyn_cast<AffineStoreOp>(&op))
-        if (st.getMemRef() != acc)
-          if (auto mt = dyn_cast<MemRefType>(st.getMemRef().getType()))
-            if (mt.getRank() >= 1)
-              cStore = st;
-    if (!cStore)
+    // ADDITIVE reduction only (the GEMM/FFN case): a non-additive reduction
+    // (min/max/mul) would need its own init identity and the downstream FP
+    // reassociation is add-only.  (WP-T5c legality.)
+    Operation *redOp = kaccs[0].storedVal.getDefiningOp();
+    if (!redOp || !isa<arith::AddFOp, arith::AddIOp>(redOp))
       continue;
+    // The accumulator must be LOCAL: every use is inside jLoop (no escape, else
+    // the promotion would leave a dangling reference).
+    if (!llvm::all_of(acc.getUsers(),
+                      [&](Operation *u) { return jLoop->isAncestor(u); }))
+      continue;
+    // EXACTLY ONE >=1D output store in j's body (the C store) -- multiple outputs
+    // would make the "which memref is the accumulator's home" choice ambiguous.
+    AffineStoreOp cStore;
+    {
+      unsigned n = 0;
+      for (Operation &op : jLoop.getBody()->without_terminator())
+        if (auto st = dyn_cast<AffineStoreOp>(&op))
+          if (st.getMemRef() != acc)
+            if (auto mt = dyn_cast<MemRefType>(st.getMemRef().getType()))
+              if (mt.getRank() >= 1) {
+                cStore = st;
+                ++n;
+              }
+      if (n != 1)
+        continue;
+    }
     SmallVector<Value> cOps(cStore.getMapOperands().begin(),
                             cStore.getMapOperands().end());
     if (cOps.empty() || !llvm::all_of(cOps, [&](Value v) {
@@ -571,6 +587,71 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
       continue; // exotic index -> leave it (conservative)
     Value cMemref = cStore.getMemRef();
     AffineMap cMap = cStore.getAffineMap();
+    // The output C must be WRITE-ONLY in this nest.  A legit GEMM never reads its
+    // own output; ANY load of cMemref in jLoop means C aliases an input (in-place
+    // C==A / C==B), a beta/residual accumulate (C = acc + C), or a fused C-reuse
+    // -- all of which the init/k-reduction/epilogue fission would miscompile
+    // (the INIT nest zeros C before the GEMM/epilogue nest reads it).  One guard,
+    // four bug classes (WP-T5c legality review).
+    {
+      bool readsOutput = false;
+      jLoop.walk([&](AffineLoadOp ld) {
+        if (ld.getMemRef() == cMemref)
+          readsOutput = true;
+      });
+      if (readsOutput)
+        continue;
+    }
+    // The final store's value must DERIVE from the accumulator, so promoting the
+    // acc to C is the GEMM's output (not an unrelated store that merely happens to
+    // be the last >=1D store).
+    {
+      bool fromAcc = false;
+      SmallVector<Value> wl{cStore.getValueToStore()};
+      llvm::SmallPtrSet<Value, 16> seen;
+      while (!wl.empty() && !fromAcc) {
+        Value v = wl.pop_back_val();
+        if (!seen.insert(v).second)
+          continue;
+        Operation *d = v.getDefiningOp();
+        if (!d)
+          continue;
+        if (auto ld = dyn_cast<AffineLoadOp>(d)) {
+          if (ld.getMemRef() == acc)
+            fromAcc = true;
+        }
+        for (Value o : d->getOperands())
+          wl.push_back(o);
+      }
+      if (!fromAcc)
+        continue;
+    }
+    // The pre-k segment must be exactly {alloca, init-store-to-acc} with a
+    // loop-invariant init value, so it cleanly clones into a standalone INIT nest
+    // (anything else before k -- e.g. another reduction or a non-hoistable
+    // computation -- would be wrongly replicated/ordered by the fission).
+    {
+      AffineStoreOp initStore;
+      bool clean = true;
+      for (Operation &op : jLoop.getBody()->without_terminator()) {
+        if (&op == kLoop.getOperation())
+          break;
+        if (&op == allocaOp)
+          continue;
+        if (auto st = dyn_cast<AffineStoreOp>(&op))
+          if (st.getMemRef() == acc && !initStore) {
+            initStore = st;
+            continue;
+          }
+        clean = false;
+        break;
+      }
+      if (!clean || !initStore)
+        continue;
+      if (Operation *d = initStore.getValueToStore().getDefiningOp())
+        if (iLoop->isAncestor(d))
+          continue; // init computed inside the nest -> not hoistable to INIT loop
+    }
     // No-bias copy epilogue: the final store stores exactly the loaded acc.
     bool copyEpi = false;
     if (Operation *d = cStore.getValueToStore().getDefiningOp())
