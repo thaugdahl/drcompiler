@@ -765,9 +765,11 @@ public:
 
     // Cache hierarchy from the single source of truth (MachineModel,
     // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
+    // `mm` is function-scoped so the GEMM configurator (gemmBlocking) is reachable
+    // from the cache-tiling stage below (WP-T3).
+    drcompiler::MachineModel mm =
+        drcompiler::MachineModel::fromJson(cpuCostModelFile);
     {
-      drcompiler::MachineModel mm =
-          drcompiler::MachineModel::fromJson(cpuCostModelFile);
       if (!l3Size.hasValue())
         l3Size = static_cast<unsigned>(mm.l3Size);
       if (!llcSharers.hasValue())
@@ -949,12 +951,20 @@ public:
     }
 
 
-    // Stage 1b: optional cache blocking.  Register blocking alone is DRAM-bound
-    // once the matrices exceed the last-level cache (the full B is re-streamed
-    // per i-block).  Tile each perfectly-nested GEMM band by mc x nc x kc so
-    // the working set stays resident; the register-block micro-kernel then runs
-    // on the cache-resident point loops.
-    if (cacheTile) {
+    // Stage 1b: cache blocking.  Register blocking alone is DRAM-bound once the
+    // matrices exceed the last-level cache (the full B is re-streamed per
+    // i-block).  Tile each perfectly-nested GEMM band by mc x nc x kc so the
+    // working set stays resident; the register-block micro-kernel then runs on
+    // the cache-resident point loops.
+    //
+    // WP-T3: run when the legacy global `cache-tile` option is set (tiles every
+    // band, unchanged) OR when a cost-model JSON describes a GEMM model
+    // (hasExplicitGemmModel) -- then the per-band decision comes from
+    // gemmBlocking, so deep-K GEMMs auto-cache-tile WITHOUT the global flag (the
+    // openai-gpt FFN lever) while cache-resident bands are left register-blocked.
+    // Default (no JSON) keeps hasExplicitGemmModel=false => the gate is the
+    // original `if (cacheTile)` => byte-identical.
+    if (cacheTile || mm.hasExplicitGemmModel) {
       // Distribute any imperfect matmul outer loop (e.g. PolyBench's i-loop
       // carrying a beta-scaling sibling) so the matmul becomes a perfect band.
       bool changed = true;
@@ -1013,6 +1023,14 @@ public:
           if (et.isIntOrFloat())
             eb = std::max<int64_t>(1, (int64_t)et.getIntOrFloatBitWidth() / 8);
         }
+        // WP-T3: under a GEMM model the configurator owns the per-band decision
+        // -- tile only the bands it flags (deep-K, working set beyond the
+        // effective LLC), leaving cache-resident bands register-blocked untiled.
+        // The legacy global `cache-tile` option (no GEMM model) tiles every band
+        // as before; the short-circuit keeps the default path byte-identical.
+        if (mm.hasExplicitGemmModel &&
+            !mm.gemmBlocking(ie, je, ke, eb).cacheTile)
+          continue;
         // The cache we can COUNT ON under contention: a co-tenant can evict the
         // shared L3, so only l3Size/llcSharers is guaranteed (private caches are
         // not derated).  Tile ONLY when the band's working set (A + B + C) does

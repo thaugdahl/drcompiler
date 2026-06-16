@@ -391,15 +391,28 @@ struct MachineModel {
   /// model, untiled).  WP-T2 adds the roofline kernel-kind dispatch; WP-T3 wires
   /// the pass to call this (only when hasExplicitGemmModel); WP-T5 turns on
   /// cache-tiling for deep-K.  Pure function of the machine + (M,N,K).
-  GemmTiling gemmBlocking(int64_t /*M*/, int64_t /*N*/, int64_t /*K*/,
+  GemmTiling gemmBlocking(int64_t M, int64_t N, int64_t K,
                           int64_t elemBytes) const {
     GemmTiling t;
     t.mr = 8;
     t.nr = 16;
     t.vl = static_cast<unsigned>(preferredVectorElems(elemBytes, t.mr, t.nr));
-    t.kind = GemmKernel::Broadcast;
-    t.cacheTile = false; // WP-T5 flips this for deep-K
-    return t;            // mc=nc=kc=0 => untiled
+    t.kind = GemmKernel::Broadcast; // WP-T4 adds tiny-K OuterProduct via the ridge
+    // Deep-K cache-tiling decision (WP-T3): tile when the band's working set
+    // (A + B + C) exceeds the effective LLC, so the register-blocked micro-kernel
+    // runs cache-resident instead of re-streaming B from DRAM -- the openai-gpt
+    // FFN lever (the band fires today but stays DRAM-bound, cache-tile off).
+    // Sizes via macroTile from a 256^3 macro start (the pass's mc/nc/kc default).
+    MacroTile mt =
+        macroTile(M, N, K, 256, 256, 256, t.mr, t.nr, t.vl, elemBytes,
+                  effectiveLLC());
+    if (!mt.skip) {
+      t.cacheTile = true;
+      t.mc = mt.mc;
+      t.nc = mt.nc;
+      t.kc = mt.kc;
+    }
+    return t; // cacheTile=false / mc=nc=kc=0 => untiled (band fits cache)
   }
 
   /// Built-in defaults (no JSON).
