@@ -215,6 +215,21 @@ build_o3() {
   link_bin "$WORKDIR/o3.o" "$WORKDIR/o3.bin"
 }
 
+# Backend-confound control (publishability H1): onnx-mlir --O3's KRNL optimization,
+# but lowered through the SAME host backend as `none`/`codegen` (host
+# lower-affine -> convert-krnl-to-llvm -> clang -O2 -march=native), with dr-opt
+# SKIPPED.  Isolates the comparison:
+#   codegen vs o3host  = our transforms vs onnx-mlir --O3's krnl opts, SAME backend
+#                        (the fair "do we beat --O3" number, no backend confound).
+#   o3host  vs o3      = the backend delta alone (host clang vs onnx-mlir EmitObj).
+build_o3host() {
+  echo "[o3host] onnx-mlir --O3 --EmitMLIR (same host backend, no dr-opt)" >&2
+  dock onnx-mlir --O3 --EmitMLIR -o "$WORKDIR/o3h" "$MODEL_ABS"
+  dock onnx-mlir-opt --convert-krnl-to-affine "$WORKDIR/o3h.onnx.mlir" \
+    -o "$WORKDIR/o3h.affine.mlir"
+  back_half "$WORKDIR/o3h.affine.mlir" o3host
+}
+
 IFS=, read -ra CFGS <<<"$CONFIGS"
 for c in "${CFGS[@]}"; do "build_$c"; done
 
