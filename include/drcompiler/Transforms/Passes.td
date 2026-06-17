@@ -735,10 +735,19 @@ def DrMathStrengthReducePass
   let options = [
     Option<"maxExponent", "max-exponent", "unsigned", /*default=*/"8",
            "Only rewrite integer exponents in [1, max-exponent]">,
+    Option<"polyApprox", "poly-approx", "bool", /*default=*/"false",
+           "Also lower math.exp/tanh/... to vectorizable polynomial "
+           "approximations (upstream populateMathPolynomialApproximationPatterns). "
+           "Removes the libm call barrier so the surrounding pointwise loop "
+           "auto-vectorizes -- closes the openai-gpt transcendental backend gap "
+           "(onnx-mlir --O3 EmitObj does this natively; libmvec cannot vectorize "
+           "tanh, so a backend flag is insufficient). Off by default: the "
+           "approximations trade ~1e-6 accuracy, gated by the bench norm-rel-err.">,
   ];
 
   let dependentDialects = [
-    "mlir::arith::ArithDialect", "mlir::math::MathDialect"
+    "mlir::arith::ArithDialect", "mlir::math::MathDialect",
+    "mlir::vector::VectorDialect"
   ];
   let constructor = "mlir::createDrMathStrengthReducePass()";
 }

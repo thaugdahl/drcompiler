@@ -20,8 +20,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Math/Transforms/Passes.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -82,6 +86,19 @@ struct DrMathStrengthReducePass
                             static_cast<uint64_t>(e));
       op.replaceAllUsesWith(repl);
       op.erase();
+    }
+
+    // Optional: lower the remaining transcendentals (exp/tanh/log/erf/...) to
+    // vectorizable polynomial approximations.  This removes the libm call
+    // barrier so the surrounding pointwise loop auto-vectorizes -- the
+    // openai-gpt GELU/softmax tail is otherwise scalar libm (~1.66x backend gap
+    // vs onnx-mlir --O3 EmitObj, which does exactly this natively).
+    if (polyApprox) {
+      RewritePatternSet patterns(&getContext());
+      populateMathPolynomialApproximationPatterns(
+          patterns, MathPolynomialApproximationOptions{});
+      if (failed(applyPatternsGreedily(fn, std::move(patterns))))
+        signalPassFailure();
     }
   }
 };
