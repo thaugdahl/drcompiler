@@ -713,4 +713,34 @@ def AffineRegisterBlockPass
   let constructor = "mlir::createAffineRegisterBlockPass()";
 }
 
+def DrMathStrengthReducePass
+    : Pass<"dr-math-strength-reduce", "mlir::func::FuncOp">
+{
+  let summary = "Strength-reduce math.powf(x, integer) to multiplications";
+
+  let description = [{
+    Rewrites `math.powf %x, %c` to repeated `arith.mulf` (exponentiation by
+    squaring) when the exponent is a small non-negative integer constant.
+    Exact for integer exponents (x^3 = x*x*x), so unconditionally safe
+    regardless of fastmath.
+
+    GPT-2's tanh-approximation GELU computes its cubic term as `powf(x, 3.0)`
+    -- a full libm transcendental call per element that neither clang -O2 nor
+    onnx-mlir --O3 strength-reduces (the `math.powf` carries no fastmath flag,
+    so the backend leaves it a `call powf@plt`).  Two multiplies replace it,
+    removing ~4.7M libm calls per openai-gpt inference and unblocking
+    vectorization of the surrounding pointwise loop.
+  }];
+
+  let options = [
+    Option<"maxExponent", "max-exponent", "unsigned", /*default=*/"8",
+           "Only rewrite integer exponents in [1, max-exponent]">,
+  ];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect", "mlir::math::MathDialect"
+  ];
+  let constructor = "mlir::createDrMathStrengthReducePass()";
+}
+
 #endif
