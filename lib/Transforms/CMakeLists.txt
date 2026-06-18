@@ -5,6 +5,7 @@ add_mlir_library(DRCompTransforms
   RegisterBlock/Peel.cpp
   RegisterBlock/Vectorize.cpp
   AffineStencilTimeTile.cpp
+  ConvertParToSCF.cpp
   DataRecomputation.cpp
   DataRecomputation/BufferElim.cpp
   DataRecomputation/CacheCostModel.cpp
@@ -35,9 +36,11 @@ add_mlir_library(DRCompTransforms
 
   DEPENDS
     DRCompPassesIncGen
+    MLIRParOpsIncGen
 
   LINK_LIBS PUBLIC
     DRCompAnalysis
+    DRCompParDialect
     MLIRAnalysis
     MLIRFunctionInterfaces
     MLIRLoopLikeInterface

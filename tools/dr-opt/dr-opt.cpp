@@ -5,6 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "drcompiler/Dialect/Par/IR/ParOps.h"
 #include "drcompiler/Transforms/Passes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
@@ -22,6 +23,7 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
+  registry.insert<mlir::par::ParDialect>();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "DRComp optimizer driver\n", registry));

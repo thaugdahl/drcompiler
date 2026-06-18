@@ -782,14 +782,44 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
            "Emit a per-maximal-region remark after widening to a fixed point "
            "(perfect-nest climb + conformant sibling fuse): par-region / "
            "par-frontier.  [M1]">,
+    Option<"parMaterialize", "par-materialize", "bool", "false",
+           "Materialize maximal single-band climb regions into the `par` "
+           "dialect (par.region / par.forall; sequential suffix as scf.for; "
+           "affine accesses expanded to memref).  First IR-mutating mode.  "
+           "[M2]">,
   ];
 
   let dependentDialects = [
     "affine::AffineDialect", "scf::SCFDialect",
-    "memref::MemRefDialect", "func::FuncDialect"
+    "memref::MemRefDialect", "func::FuncDialect",
+    "arith::ArithDialect", "par::ParDialect"
   ];
 
   let constructor = "mlir::createDrParBubblesPass()";
+}
+
+def ConvertParToSCFPass : Pass<"convert-par-to-scf", "mlir::func::FuncOp">
+{
+  let summary = "Lower the `par` dialect to scf (sequential-equivalent sink)";
+
+  let description = [{
+    Lowering target for the `par` dialect (PARALLEL_PAR_DIALECT_SPEC.md §4.3):
+    the M2 correctness/test sink.
+
+      par.forall  -> scf.parallel (constant bounds materialized as arith index)
+      par.region  -> inlined into the enclosing block
+      par.yield   -> erased
+
+    scf.parallel preserves the parallel semantics but executes correctly under
+    any schedule, so a materialized region's results can be diffed against the
+    original affine program.  par->omp and par->libdrpar are later phases.
+  }];
+
+  let dependentDialects = [
+    "scf::SCFDialect", "arith::ArithDialect", "memref::MemRefDialect"
+  ];
+
+  let constructor = "mlir::createConvertParToSCFPass()";
 }
 
 #endif

@@ -15,6 +15,7 @@ set(LIBS
   MLIRRegisterAllPasses
   MLIRRegisterAllExtensions
   DRCompTransforms
+  DRCompParDialect
 )
 
 add_llvm_executable(dr-opt
