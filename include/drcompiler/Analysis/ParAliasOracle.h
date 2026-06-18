@@ -53,6 +53,15 @@ public:
   /// Trace a memref SSA value back through view-like ops (subview/cast/view/…)
   /// to its allocation root.  Two distinct alloc/alloca roots never alias.
   static mlir::Value allocationRoot(mlir::Value memref);
+
+  /// True when `op` is a call to a provably *pure* function — its callee is
+  /// defined (non-external) and transitively touches no memory (operates only
+  /// on SSA arguments).  Such a call is race-free to run per parallel
+  /// iteration.  Conservative: external / unresolved / recursive callees and
+  /// any memory effect ⇒ false.  (M4 interprocedural call consumption: the
+  /// sound subset; per-iteration-disjoint impure calls via forwarding analysis
+  /// are a later step.)
+  static bool isPureCall(mlir::Operation *op);
 };
 
 } // namespace par

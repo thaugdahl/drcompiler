@@ -278,7 +278,8 @@ static bool bandMaterializable(ArrayRef<affine::AffineForOp> band) {
   for (Operation &op : inner.getBody()->without_terminator()) {
     if (isa<affine::AffineLoadOp, affine::AffineStoreOp>(op))
       continue;
-    if (op.getNumRegions() == 0 && isMemoryEffectFree(&op))
+    if (op.getNumRegions() == 0 &&
+        (isMemoryEffectFree(&op) || ParAliasOracle::isPureCall(&op)))
       continue;
     return false;
   }

@@ -5,9 +5,12 @@
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -30,6 +33,46 @@ Value ParAliasOracle::allocationRoot(Value memref) {
 static bool isAllocLike(Value v) {
   Operation *def = v.getDefiningOp();
   return def && isa<memref::AllocOp, memref::AllocaOp>(def);
+}
+
+/// Resolve a func.call's callee and check it transitively touches no memory.
+/// `visiting` guards against recursion (a cycle is treated as impure).
+static bool isPureFuncImpl(func::FuncOp fn,
+                           llvm::DenseSet<Operation *> &visiting) {
+  if (fn.isExternal())
+    return false;
+  if (!visiting.insert(fn.getOperation()).second)
+    return false; // recursion: conservative
+  bool pure = true;
+  fn.walk([&](Operation *op) {
+    if (op == fn.getOperation())
+      return; // walk is root-inclusive; the func.func op itself is not an effect
+    if (auto call = dyn_cast<func::CallOp>(op)) {
+      auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      if (!callee || !isPureFuncImpl(callee, visiting))
+        pure = false;
+      return;
+    }
+    if (op->hasTrait<OpTrait::IsTerminator>())
+      return;
+    if (!isMemoryEffectFree(op))
+      pure = false;
+  });
+  visiting.erase(fn.getOperation());
+  return pure;
+}
+
+bool ParAliasOracle::isPureCall(Operation *op) {
+  auto call = dyn_cast<func::CallOp>(op);
+  if (!call)
+    return false;
+  auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+      call, call.getCalleeAttr());
+  if (!callee)
+    return false;
+  llvm::DenseSet<Operation *> visiting;
+  return isPureFuncImpl(callee, visiting);
 }
 
 ConflictKind ParAliasOracle::classify(Operation *a, Operation *b,
@@ -83,7 +126,9 @@ ConflictKind ParAliasOracle::axisConflict(Operation *loopOp) const {
     if (isa<affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp>(
             op))
       return;
-    if (!isMemoryEffectFree(op))
+    // A call to a provably-pure function touches no memory — benign under
+    // parallel execution (M4 interprocedural consumption, sound subset).
+    if (!isMemoryEffectFree(op) && !isPureCall(op))
       sawOpaque = true;
   });
 

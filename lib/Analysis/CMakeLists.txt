@@ -22,6 +22,7 @@ add_mlir_library(DRCompAnalysis
     MLIRAffineDialect
     MLIRAffineUtils
     MLIRAnalysis
+    MLIRFuncDialect
     MLIRMemRefDialect
     MLIRSideEffectInterfaces
     MLIRViewLikeInterface
