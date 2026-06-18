@@ -777,7 +777,11 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
   let options = [
     Option<"parTestDiagnostics", "par-test-diagnostics", "bool", "false",
            "Emit a per-loop axis classification remark "
-           "(PARALLEL / SEQUENTIAL ...)">,
+           "(PARALLEL / SEQUENTIAL ...)  [M0]">,
+    Option<"parTestRegions", "par-test-regions", "bool", "false",
+           "Emit a per-maximal-region remark after widening to a fixed point "
+           "(perfect-nest climb + conformant sibling fuse): par-region / "
+           "par-frontier.  [M1]">,
   ];
 
   let dependentDialects = [
