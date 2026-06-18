@@ -30,10 +30,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "dr-par-bubbles"
 
@@ -439,6 +441,55 @@ static CrossKind classifyCross(affine::AffineForOp a, affine::AffineForOp b) {
   return CrossKind::Fusable;
 }
 
+/// A reshuffle boundary: two bands share a buffer, but the producer wrote it
+/// under a different worker→data mapping than the consumer reads it — not a
+/// plain constant offset.  Materializes to par.redistribute (vs par.barrier).
+struct RedistDesc {
+  Value buf;
+  std::string from, to;
+};
+
+static std::string mapStr(AffineMap m) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  m.print(os);
+  return s;
+}
+
+/// Find a same-buffer cross pair between bands of `A` and `B` whose 1-D access
+/// maps differ by more than a constant offset (different IV coefficient — a
+/// reverse/scale/permute). Returns the buffer + the two maps, else nullopt.
+static std::optional<RedistDesc> findReshuffle(ArrayRef<affine::AffineForOp> A,
+                                               ArrayRef<affine::AffineForOp> B) {
+  for (affine::AffineForOp ba : A) {
+    SmallVector<Operation *, 8> aa;
+    collectAccesses(ba, aa);
+    for (affine::AffineForOp bb : B) {
+      SmallVector<Operation *, 8> bbacc;
+      collectAccesses(bb, bbacc);
+      for (Operation *x : aa) {
+        for (Operation *y : bbacc) {
+          bool writes = isa<affine::AffineWriteOpInterface>(x) ||
+                        isa<affine::AffineWriteOpInterface>(y);
+          if (!writes || memrefOf(x) != memrefOf(y))
+            continue;
+          AffineMap mx = accMap(x), my = accMap(y);
+          if (mx.getNumDims() != 1 || mx.getNumResults() != 1 ||
+              mx.getNumSymbols() != 0 || my.getNumDims() != 1 ||
+              my.getNumResults() != 1 || my.getNumSymbols() != 0)
+            continue; // not a clean 1-D access pair: leave as a barrier
+          AffineExpr diff = simplifyAffineExpr(
+              mx.getResult(0) - my.getResult(0), /*numDims=*/1, /*numSymbols=*/0);
+          if (isa<AffineConstantExpr>(diff))
+            continue; // constant offset: a plain shift, barrier suffices
+          return RedistDesc{memrefOf(x), mapStr(mx), mapStr(my)};
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 /// A depth-1 affine.for whose single axis is parallel and whose body is
 /// materializable.  These are the bands M3 fuses across; everything else falls
 /// back to the M2 single-band path.
@@ -485,6 +536,7 @@ static void materializeRun(ArrayRef<affine::AffineForOp> run) {
 
   unsigned idx = 0;
   bool firstSub = true;
+  SmallVector<affine::AffineForOp, 4> prevSub;
   while (idx < run.size()) {
     SmallVector<affine::AffineForOp, 4> sub;
     sub.push_back(run[idx]);
@@ -503,9 +555,16 @@ static void materializeRun(ArrayRef<affine::AffineForOp> run) {
       ++k;
     }
 
+    // Boundary between the previous subgroup and this one: a worker↔data
+    // remap of a shared buffer becomes par.redistribute; otherwise a barrier.
     b.setInsertionPointToEnd(rblk);
-    if (!firstSub)
-      b.create<par::BarrierOp>(loc);
+    if (!firstSub) {
+      if (auto rd = findReshuffle(prevSub, sub))
+        b.create<par::RedistributeOp>(loc, rd->buf, b.getStringAttr(rd->from),
+                                      b.getStringAttr(rd->to));
+      else
+        b.create<par::BarrierOp>(loc);
+    }
     firstSub = false;
 
     b.setInsertionPointToEnd(rblk);
@@ -527,6 +586,7 @@ static void materializeRun(ArrayRef<affine::AffineForOp> run) {
         cloneBodyOp(b, &op, map);
     }
     b.create<par::YieldOp>(loc, ValueRange{});
+    prevSub = sub;
     idx = k;
   }
 

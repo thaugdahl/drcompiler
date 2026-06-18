@@ -73,3 +73,28 @@ func.func @offset() {
   }
   return
 }
+
+// Same buffer, a worker<->data REMAP (reverse read, IV coefficient changes from
+// +1 to -1) -> par.redistribute between the two par.forall (not a plain shift).
+// CHECK-LABEL: func.func @reshuffle
+// CHECK:         par.region {
+// CHECK:           par.forall([0], [128], [1]) {
+// CHECK:             memref.store
+// CHECK:             par.yield
+// CHECK:           }
+// CHECK:           par.redistribute %{{.*}} : memref<128xf32> from "(d0) -> (d0)" to "(d0) -> (-d0 + 127)"
+// CHECK:           par.forall([0], [128], [1]) {
+// CHECK:             memref.load
+// CHECK:             memref.store
+// CHECK:             par.yield
+func.func @reshuffle() {
+  %z = arith.constant 0.0 : f32
+  %M = memref.alloc() : memref<128xf32>
+  %O = memref.alloc() : memref<128xf32>
+  affine.for %i = 0 to 128 { affine.store %z, %M[%i] : memref<128xf32> }
+  affine.for %i = 0 to 128 {
+    %v = affine.load %M[127 - %i] : memref<128xf32>
+    affine.store %v, %O[%i] : memref<128xf32>
+  }
+  return
+}
