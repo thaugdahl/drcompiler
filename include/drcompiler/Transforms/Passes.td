@@ -787,6 +787,11 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
            "dialect (par.region / par.forall; sequential suffix as scf.for; "
            "affine accesses expanded to memref).  First IR-mutating mode.  "
            "[M2]">,
+    Option<"parTestSpmd", "par-test-spmd", "bool", "false",
+           "Diagnostic-only: pick a whole-function shard axis (S0) and classify "
+           "each inter-band edge for barrier elision (S1) -- ELIDE / HALO / "
+           "REDISTRIBUTE / BARRIER. Emits par-shard / par-edge / par-spmd "
+           "remarks.  See PARALLEL_SPMD_SPEC.md.">,
   ];
 
   let dependentDialects = [

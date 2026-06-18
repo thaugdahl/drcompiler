@@ -34,6 +34,9 @@
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Twine.h"
+#include <map>
+#include <set>
+#include <string>
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -629,6 +632,111 @@ static void materializeBlock(ArrayRef<affine::AffineForOp> roots,
 }
 
 //===----------------------------------------------------------------------===//
+// S0/S1 — whole-function shard-axis selection + barrier-elision analysis
+// (diagnostic-only spike; see PARALLEL_SPMD_SPEC.md §3-§4)
+//===----------------------------------------------------------------------===//
+
+enum class EdgeKind { Elide = 0, Halo = 1, Redistribute = 2, Barrier = 3 };
+
+static EdgeKind worstEdge(EdgeKind a, EdgeKind b) {
+  return static_cast<int>(a) >= static_cast<int>(b) ? a : b;
+}
+static StringRef edgeName(EdgeKind k) {
+  switch (k) {
+  case EdgeKind::Elide:        return "ELIDE";
+  case EdgeKind::Halo:         return "HALO";
+  case EdgeKind::Redistribute: return "REDISTRIBUTE";
+  case EdgeKind::Barrier:      return "BARRIER";
+  }
+  return "BARRIER";
+}
+
+/// Identity of a band's shard axis (its outermost loop) if that loop is
+/// parallel: the printed lb/ub maps, OPERAND-AGNOSTIC so the same axis matches
+/// across layers (e.g. every conv's `0 to #map(%dim)` batch loop, where the
+/// %dim SSA value differs per layer).  Multi-dim bands welcome (we shard the
+/// outer loop; inner loops stay sequential within the shard).
+static std::optional<std::string> shardAxisId(affine::AffineForOp band,
+                                               const ParAliasOracle &oracle) {
+  if (classifyLoop(band.getOperation(), oracle) != AxisKind::Parallel)
+    return std::nullopt;
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "lb=";
+  band.getLowerBoundMap().print(os);
+  os << " ub=";
+  band.getUpperBoundMap().print(os);
+  return s;
+}
+
+/// A short human label for a shard axis (constant extent, else "dyn").
+static std::string shardLabel(affine::AffineForOp band) {
+  if (band.hasConstantLowerBound() && band.hasConstantUpperBound())
+    return "extent=" +
+           std::to_string(band.getConstantUpperBound() -
+                          band.getConstantLowerBound());
+  return "dyn";
+}
+
+/// Owner-aligned on the shard axis: same access map, and the shard IV occupies
+/// the same operand slots in both (the inner-loop operands are free — they
+/// range within the shard).  Sound projection onto the shard axis
+/// (PARALLEL_SPMD_SPEC.md §4): shard t reads exactly what shard t wrote.
+static bool alignedOnShard(Operation *x, Operation *y, Value sX, Value sY) {
+  if (accMap(x) != accMap(y))
+    return false;
+  SmallVector<Value> ox = accOperands(x), oy = accOperands(y);
+  if (ox.size() != oy.size())
+    return false;
+  for (size_t k = 0, e = ox.size(); k < e; ++k)
+    if ((ox[k] == sX) != (oy[k] == sY))
+      return false; // shard IV must sit in the same slot(s)
+  return true;
+}
+
+/// Classify the barrier-elision verdict for the inter-band edge A -> B, sharded
+/// on their outermost (parallel) loops.  Sound: any non-provably-owner-aligned
+/// dependence keeps its sync.
+static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
+  Value sA = A.getInductionVar(), sB = B.getInductionVar();
+  SmallVector<Operation *, 8> aa, bb;
+  collectAccesses(A, aa);
+  collectAccesses(B, bb);
+  EdgeKind worst = EdgeKind::Elide;
+  for (Operation *x : aa) {
+    for (Operation *y : bb) {
+      bool writes = isa<affine::AffineWriteOpInterface>(x) ||
+                    isa<affine::AffineWriteOpInterface>(y);
+      if (!writes)
+        continue;
+      Value mx = memrefOf(x), my = memrefOf(y);
+      if (mx != my) {
+        if (ParAliasOracle::allocationRoot(mx) !=
+            ParAliasOracle::allocationRoot(my))
+          continue; // distinct buffers -> no cross-shard interaction
+        worst = worstEdge(worst, EdgeKind::Barrier); // same root, views
+        continue;
+      }
+      if (alignedOnShard(x, y, sA, sB))
+        continue; // owner-aligned on the shard axis
+      AffineMap mxm = accMap(x), mym = accMap(y);
+      if (mxm.getNumDims() == 1 && mxm.getNumResults() == 1 &&
+          mxm.getNumSymbols() == 0 && mym.getNumDims() == 1 &&
+          mym.getNumResults() == 1 && mym.getNumSymbols() == 0) {
+        AffineExpr diff = simplifyAffineExpr(
+            mxm.getResult(0) - mym.getResult(0), 1, 0);
+        worst = worstEdge(worst, isa<AffineConstantExpr>(diff)
+                                     ? EdgeKind::Halo        // 1-D shift -> halo
+                                     : EdgeKind::Redistribute); // 1-D remap
+      } else {
+        worst = worstEdge(worst, EdgeKind::Barrier); // multi-dim non-aligned
+      }
+    }
+  }
+  return worst;
+}
+
+//===----------------------------------------------------------------------===//
 
 struct DrParBubblesPass
     : public impl::DrParBubblesPassBase<DrParBubblesPass> {
@@ -693,6 +801,83 @@ struct DrParBubblesPass
         });
         for (Block *blk : order)
           materializeBlock(byBlock[blk], oracle);
+      });
+    }
+
+    // S0/S1 — whole-function shard-axis + barrier-elision spike (diagnostic).
+    if (parTestSpmd) {
+      module.walk([&](func::FuncOp fn) {
+        if (fn.isExternal())
+          return;
+        SmallVector<affine::AffineForOp, 16> bands;
+        fn.walk([&](affine::AffineForOp loop) {
+          if (isBandRoot(loop))
+            bands.push_back(loop);
+        });
+        // S0: pick the shard axis (by operand-agnostic bound identity)
+        // covering the most top-level parallel bands.
+        std::map<std::string, unsigned> idCount;
+        std::set<std::string> degenerate; // extent==1 axes: no real parallelism
+        unsigned total = 0;
+        for (affine::AffineForOp band : bands)
+          if (auto id = shardAxisId(band, oracle)) {
+            idCount[*id]++;
+            ++total;
+            if (shardLabel(band) == "extent=1")
+              degenerate.insert(*id);
+          }
+        if (idCount.empty())
+          return;
+        // Prefer the max-coverage axis with real parallelism (extent != 1);
+        // fall back to any if all candidates are degenerate.
+        std::string shardId;
+        unsigned best = 0;
+        for (auto &kv : idCount)
+          if (!degenerate.count(kv.first) && kv.second > best) {
+            best = kv.second;
+            shardId = kv.first;
+          }
+        if (best == 0)
+          for (auto &kv : idCount)
+            if (kv.second > best) {
+              best = kv.second;
+              shardId = kv.first;
+            }
+        std::string label;
+        for (affine::AffineForOp band : bands)
+          if (auto id = shardAxisId(band, oracle))
+            if (*id == shardId) {
+              label = shardLabel(band);
+              break;
+            }
+        fn.emitRemark("par-shard: ") << label << " bands=" << best << "/"
+                                     << total;
+
+        // S1: classify each edge between consecutive shard-axis bands.
+        unsigned elide = 0, halo = 0, redist = 0, barrier = 0;
+        affine::AffineForOp prev = nullptr;
+        for (affine::AffineForOp band : bands) {
+          auto id = shardAxisId(band, oracle);
+          if (!id || *id != shardId) {
+            prev = nullptr; // off-axis band breaks the SPMD chain
+            continue;
+          }
+          if (prev) {
+            EdgeKind k = classifyEdge(prev, band);
+            band->emitRemark("par-edge: ") << edgeName(k);
+            switch (k) {
+            case EdgeKind::Elide: ++elide; break;
+            case EdgeKind::Halo: ++halo; break;
+            case EdgeKind::Redistribute: ++redist; break;
+            case EdgeKind::Barrier: ++barrier; break;
+            }
+          }
+          prev = band;
+        }
+        unsigned edges = elide + halo + redist + barrier;
+        fn.emitRemark("par-spmd: elide=")
+            << elide << " halo=" << halo << " redistribute=" << redist
+            << " barrier=" << barrier << " (of " << edges << " shard edges)";
       });
     }
   }
