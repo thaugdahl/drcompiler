@@ -92,11 +92,6 @@ static AxisKind classifyLoop(Operation *loopOp, const ParAliasOracle &oracle) {
 // M1 — region formation (climb + conformant fuse)
 //===----------------------------------------------------------------------===//
 
-static bool isAllocLike(Value v) {
-  Operation *def = v.getDefiningOp();
-  return def && isa<memref::AllocOp, memref::AllocaOp>(def);
-}
-
 static Value memrefOf(Operation *op) {
   if (auto w = dyn_cast<affine::AffineWriteOpInterface>(op))
     return w.getMemRef();
@@ -158,11 +153,9 @@ static bool crossClean(affine::AffineForOp a, affine::AffineForOp b) {
         return false;
       Value rx = ParAliasOracle::allocationRoot(mx);
       Value ry = ParAliasOracle::allocationRoot(my);
-      if (rx == ry)
-        return false;
-      if (isAllocLike(rx) && isAllocLike(ry))
-        continue; // distinct buffers: no interaction
-      return false; // unprovable (args / globals): conservative
+      if (rx != ry)
+        continue;     // distinct allocation roots: distinct memory (affine model)
+      return false;   // same underlying buffer (views) + write: conservative
     }
   }
   return true;
@@ -434,9 +427,9 @@ static CrossKind classifyCross(affine::AffineForOp a, affine::AffineForOp b) {
       if (mx != my) {
         Value rx = ParAliasOracle::allocationRoot(mx);
         Value ry = ParAliasOracle::allocationRoot(my);
-        if (isAllocLike(rx) && isAllocLike(ry) && rx != ry)
-          continue; // disjoint buffers
-        return CrossKind::Barrier;
+        if (rx != ry)
+          continue; // distinct allocation roots: distinct memory (affine model)
+        return CrossKind::Barrier; // same buffer via views: conservative
       }
       if (alignedAccess(x, y, ivA, ivB))
         continue;

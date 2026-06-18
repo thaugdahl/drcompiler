@@ -6,7 +6,6 @@
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
@@ -27,12 +26,6 @@ Value ParAliasOracle::allocationRoot(Value memref) {
     memref = view.getViewSource();
   }
   return memref;
-}
-
-/// True when `v` is the result of an allocation op (a fresh, named buffer).
-static bool isAllocLike(Value v) {
-  Operation *def = v.getDefiningOp();
-  return def && isa<memref::AllocOp, memref::AllocaOp>(def);
 }
 
 /// Resolve a func.call's callee and check it transitively touches no memory.
@@ -94,15 +87,18 @@ ConflictKind ParAliasOracle::classify(Operation *a, Operation *b,
                                          : ConflictKind::None;
   }
 
-  // Tier 0 — distinct allocation roots never alias.
+  // Distinct memref SSA values.  Adopt the affine dialect's aliasing model --
+  // the same assumption checkMemrefAccessDependence / affine::isLoopParallel /
+  // affine-loop-fusion already rely on: memrefs with DISTINCT allocation roots
+  // (distinct allocs, or distinct function arguments) do not alias.  Two views
+  // of the SAME root (e.g. subviews of one buffer) may overlap at an offset, so
+  // stay conservative -- stricter than raw affine, which would wrongly treat
+  // them as independent.
   Value ra = allocationRoot(sa.memref);
   Value rb = allocationRoot(da.memref);
-  if (ra != rb && isAllocLike(ra) && isAllocLike(rb))
-    return ConflictKind::None;
-
-  // Tier 2 — different/unprovable memrefs (function args, globals, non-affine):
-  // sound-conservative.  Refined by cross-procedure forwarding in M4.
-  return ConflictKind::Unknown;
+  if (ra == rb)
+    return ConflictKind::Unknown; // same underlying buffer via views
+  return ConflictKind::None;      // distinct roots = distinct memory
 }
 
 ConflictKind ParAliasOracle::axisConflict(Operation *loopOp) const {

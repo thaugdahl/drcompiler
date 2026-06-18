@@ -65,13 +65,29 @@ func.func @opaque() {
   return
 }
 
-// ---- function-arg memrefs: unprovable aliasing => conservative (M0 limit) ---
-// (M4 cross-procedure forwarding / a restrict attr would separate these.)
+// ---- distinct function-arg memrefs: non-aliasing (affine model) => PARALLEL --
+// Distinct allocation roots (here, distinct func args) are assumed disjoint,
+// consistent with affine::isLoopParallel / checkMemrefAccessDependence.
 func.func @args(%A: memref<128xf32>, %B: memref<128xf32>) {
-  // expected-remark @below {{par-bubble axis: SEQUENTIAL (conservative)}}
+  // expected-remark @below {{par-bubble axis: PARALLEL}}
   affine.for %i = 0 to 128 {
     %a = affine.load %A[%i] : memref<128xf32>
     affine.store %a, %B[%i] : memref<128xf32>
+  }
+  return
+}
+
+// ---- two views of the SAME buffer may overlap => conservative (safer than
+// raw affine, which would treat distinct SSA memrefs as independent).
+func.func @same_root_views(%Buf: memref<256xf32>) {
+  %lo = memref.subview %Buf[0]  [128] [1]
+      : memref<256xf32> to memref<128xf32, strided<[1]>>
+  %hi = memref.subview %Buf[64] [128] [1]
+      : memref<256xf32> to memref<128xf32, strided<[1], offset: 64>>
+  // expected-remark @below {{par-bubble axis: SEQUENTIAL (conservative)}}
+  affine.for %i = 0 to 128 {
+    %v = affine.load %lo[%i] : memref<128xf32, strided<[1]>>
+    affine.store %v, %hi[%i] : memref<128xf32, strided<[1], offset: 64>>
   }
   return
 }
