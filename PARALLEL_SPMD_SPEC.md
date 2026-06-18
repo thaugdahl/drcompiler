@@ -207,6 +207,51 @@ shard loop into it (inner non-shard loops stay sequential / `scf.for`).
   `omp.barrier` only where kept.
 - S4: execution diff (redundant-halo vs barrier vs sequential).
 
+## 11.5 Spike results (S0/S1) — measured 2026-06-18 (commit 59c1dcc)
+
+S0/S1 landed diagnostic-only (`dr-par-bubbles{par-test-spmd}`). Measured:
+
+- **Synthetic clean-affine eltwise chain** (3 loops, one axis): **2/2 edges
+  ELIDE**. (Note: M3 already *fuses* this case into one `par.forall` — strictly
+  stronger than elision. The unique S2+ value is the multi-dim non-fusable case.)
+- **resnet50 affine dump** (real; needs `-allow-unregistered-dialect` for the
+  `krnl.*` ops): over the **batch (`dyn`) axis**, 117/370 parallel bands chain
+  with **33/33 edges ELIDE, 0 halo / redistribute / barrier** → whole-kernel
+  SPMD over batch is **completely barrier-free**. 676/844 loops classify
+  PARALLEL (93 reduction, 72 conservative, 3 carried).
+
+**Verdict: GO on the mechanism** — barrier elision is sound, works on a real
+conv net, and confirms batch≥cores is embarrassingly parallel, end-to-end
+barrier-free.
+
+### Blockers for S2–S6 (why the build-out needs supervision / more infra)
+
+1. **krnl dialect**: onnx-mlir affine dumps still carry `krnl.global` etc.;
+   `dr-opt` can't parse them without `-allow-unregistered-dialect`, and as
+   opaque ops they would block real materialization. Need to run at a pipeline
+   stage without krnl, or register/handle it.
+2. **Body complexity**: 72/844 loops are conservative — per-layer `memref.alloc`
+   scratch + non-affine `memref.load` + `arith.select` make the affine-only
+   oracle bail. Real materialization must handle (or pre-clean) these.
+3. **Shard-axis at batch-1**: the by-coverage heuristic picks the batch axis; at
+   batch=1 (latency) that is degenerate (1 shard). Within-sample axes
+   (channel/spatial) don't chain across layers (64→128→256), so batch-1 latency
+   has no single whole-kernel shard axis — it needs per-segment re-sharding +
+   redistributes (the hard case).
+4. **Validation**: S2 elision soundness *cannot* be validated by `par→scf`
+   (which joins between `scf.parallel`s anyway); it needs `par→omp(nowait)` or
+   libdrpar **plus execution**. S4 (halo recompute) and S6 (reduce reassoc) are
+   numeric; S5 (libdrpar) needs a pthread-pool C runtime that does not exist.
+   None are execution-validatable unsupervised → **not built** (soundness bar).
+
+### Recommended supervised next step
+S2 on a **clean, batch>1** affine kernel (no krnl; scratch allocs cleaned):
+hoist the batch loop to wrap the function as one `par.region`/`par.forall`,
+place `par.barrier` only at non-elided edges, lower via a faithful `par→omp`
+(one team + `nowait`), and validate by **execution** (numeric diff vs
+sequential). Then libdrpar for pinning. The payoff (33/33 barrier-free on
+resnet50 batch) justifies it.
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer
