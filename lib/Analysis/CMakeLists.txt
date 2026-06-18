@@ -2,6 +2,7 @@ add_mlir_library(DRCompAnalysis
   ArchHandlerRegistry.cpp
   CpuCostModel.cpp
   MachineModel.cpp
+  ParAliasOracle.cpp
   ArchHandlers/Generic.cpp
   ArchHandlers/X86_64_AVX2.cpp
   ArchHandlers/X86_64_AVX512.cpp
@@ -21,6 +22,9 @@ add_mlir_library(DRCompAnalysis
     MLIRAffineDialect
     MLIRAffineUtils
     MLIRAnalysis
+    MLIRMemRefDialect
+    MLIRSideEffectInterfaces
+    MLIRViewLikeInterface
     MLIRIR
     MLIRSupport
 )

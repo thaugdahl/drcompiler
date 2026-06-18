@@ -752,4 +752,40 @@ def DrMathStrengthReducePass
   let constructor = "mlir::createDrMathStrengthReducePass()";
 }
 
+def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
+{
+  let summary = "Seed per-loop parallel bubbles and classify loop axes (M0)";
+
+  let description = [{
+    Front-end of the bubble-widening parallel-codegen track
+    (PARALLEL_BUBBLE_SPEC.md).  M0: seed one bubble per loop (affine.for /
+    scf.for) and classify each loop's axis via the intra-module
+    `ParAliasOracle`:
+
+      PARALLEL     - no loop-carried dependence on this axis (distributable)
+      SEQUENTIAL   - carried dependence | reduction (iter_args) | conservative
+                     (non-affine / SCF / unprovable aliasing)
+
+    The oracle is tiered: Tier 0 allocation-root provenance disjointness,
+    Tier 1 polyhedral affine dependence (checkMemrefAccessDependence), Tier 2
+    conservative.  M0 is diagnostic-only (no IR mutation); widening to a fixed
+    point, the `par` dialect, peeling/redistribution, and interprocedural call
+    consumption land in M1-M4.  Cross-procedure forwarding and SCF dependence
+    are deferred (PARALLEL_BUBBLE_SPEC.md §2, §12).
+  }];
+
+  let options = [
+    Option<"parTestDiagnostics", "par-test-diagnostics", "bool", "false",
+           "Emit a per-loop axis classification remark "
+           "(PARALLEL / SEQUENTIAL ...)">,
+  ];
+
+  let dependentDialects = [
+    "affine::AffineDialect", "scf::SCFDialect",
+    "memref::MemRefDialect", "func::FuncDialect"
+  ];
+
+  let constructor = "mlir::createDrParBubblesPass()";
+}
+
 #endif

@@ -19,6 +19,7 @@ add_mlir_library(DRCompTransforms
   DrPinLiveOut.cpp
   MathStrengthReduce.cpp
   MemoryFission.cpp
+  ParBubbles.cpp
   PrintArchHandler.cpp
   PrintRegisterPressure.cpp
   RaiseMallocToMemRef.cpp
