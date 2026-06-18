@@ -55,21 +55,36 @@ static void lowerForall(par::ForallOp forall) {
   forall.erase();
 }
 
-/// par.region -> inline its body ops into the enclosing block.
-static void inlineRegion(par::RegionOp region) {
-  Block *body = region.getBody();
+/// Splice a single-block op's body (minus terminator) into the enclosing block
+/// and erase the op.  Used for par.region and par.critical (sequential sink:
+/// one worker in order == the original program order).
+static void inlineSingleBlock(Operation *op, Block *body) {
   Operation *term = body->getTerminator();
-  Block *parent = region->getBlock();
-  parent->getOperations().splice(Block::iterator(region),
-                                 body->getOperations(), body->begin(),
-                                 Block::iterator(term));
-  region.erase();
+  Block *parent = op->getBlock();
+  parent->getOperations().splice(Block::iterator(op), body->getOperations(),
+                                 body->begin(), Block::iterator(term));
+  op->erase();
 }
 
 struct ConvertParToSCFPass
     : public impl::ConvertParToSCFPassBase<ConvertParToSCFPass> {
   void runOnOperation() override {
     func::FuncOp fn = getOperation();
+
+    // Inline single-worker critical slabs (sequential sink == in-order).
+    SmallVector<par::CriticalOp> crits;
+    fn.walk([&](par::CriticalOp c) { crits.push_back(c); });
+    for (par::CriticalOp c : crits)
+      inlineSingleBlock(c, c.getBody());
+
+    // Barriers and redistributes are no-ops under sequential execution.
+    SmallVector<Operation *> syncs;
+    fn.walk([&](Operation *op) {
+      if (isa<par::BarrierOp, par::RedistributeOp>(op))
+        syncs.push_back(op);
+    });
+    for (Operation *op : syncs)
+      op->erase();
 
     SmallVector<par::ForallOp> foralls;
     fn.walk([&](par::ForallOp f) { foralls.push_back(f); });
@@ -79,7 +94,7 @@ struct ConvertParToSCFPass
     SmallVector<par::RegionOp> regions;
     fn.walk([&](par::RegionOp r) { regions.push_back(r); });
     for (par::RegionOp r : regions)
-      inlineRegion(r);
+      inlineSingleBlock(r, r.getBody());
   }
 };
 

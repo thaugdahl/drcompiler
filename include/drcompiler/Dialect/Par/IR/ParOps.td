@@ -67,9 +67,43 @@ def Par_ForallOp : Par_Op<"forall",
   }];
 }
 
+def Par_BarrierOp : Par_Op<"barrier", [HasParent<"RegionOp">]> {
+  let summary = "Team barrier: all workers synchronize here";
+  let description = [{
+    Separates two `par.forall`s in one region when the second consumes data the
+    first produces across iterations (an offset producer->consumer dependence):
+    keep both parallel, synchronize between them.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+def Par_CriticalOp : Par_Op<"critical",
+    [SingleBlock, NoRegionArguments, RecursiveMemoryEffects,
+     ParentOneOf<["RegionOp", "ForallOp"]>]> {
+  let summary = "A sub-region executed by a single worker, in order";
+  let description = [{
+    Target for peeled boundary slabs (the conflicting sub-iteration-space of an
+    affine-overlap peel).  Executed by exactly one worker while the team waits.
+  }];
+  let regions = (region SizedRegion<1>:$region);
+  let assemblyFormat = "$region attr-dict";
+}
+
+def Par_RedistributeOp : Par_Op<"redistribute", [HasParent<"RegionOp">]> {
+  let summary = "Re-block a memref's worker<->data mapping between sub-regions";
+  let description = [{
+    Transitory region between two `par.forall`s whose worker->data mappings
+    disagree (e.g. a row-parallel producer feeding a column-parallel consumer).
+    `from`/`to` name the source and target distributions.
+  }];
+  let arguments = (ins AnyMemRef:$value, StrAttr:$from, StrAttr:$to);
+  let assemblyFormat = "$value `:` type($value) `from` $from `to` $to attr-dict";
+}
+
 def Par_YieldOp : Par_Op<"yield",
-    [Pure, ReturnLike, Terminator, ParentOneOf<["RegionOp", "ForallOp"]>]> {
-  let summary = "Terminator for par.region / par.forall bodies";
+    [Pure, ReturnLike, Terminator,
+     ParentOneOf<["RegionOp", "ForallOp", "CriticalOp"]>]> {
+  let summary = "Terminator for par.region / par.forall / par.critical bodies";
   let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
 }

@@ -380,6 +380,201 @@ static bool materializeBand(ArrayRef<affine::AffineForOp> band,
 }
 
 //===----------------------------------------------------------------------===//
+// M3 — multi-band fuse / barrier materialization (depth-1 parallel bands)
+//===----------------------------------------------------------------------===//
+
+static AffineMap accMap(Operation *op) {
+  if (auto l = dyn_cast<affine::AffineLoadOp>(op))
+    return l.getAffineMap();
+  return cast<affine::AffineStoreOp>(op).getAffineMap();
+}
+static SmallVector<Value> accOperands(Operation *op) {
+  if (auto l = dyn_cast<affine::AffineLoadOp>(op))
+    return llvm::to_vector(l.getMapOperands());
+  return llvm::to_vector(cast<affine::AffineStoreOp>(op).getMapOperands());
+}
+
+/// Two same-buffer accesses are element-aligned when their access maps are
+/// structurally equal and every operand matches, with each loop's own IV in the
+/// same slot (so element i of one only meets element i of the other).
+static bool alignedAccess(Operation *a, Operation *b, Value ivA, Value ivB) {
+  if (accMap(a) != accMap(b))
+    return false;
+  SmallVector<Value> oa = accOperands(a), ob = accOperands(b);
+  if (oa.size() != ob.size())
+    return false;
+  for (size_t k = 0, e = oa.size(); k < e; ++k) {
+    if (oa[k] == ivA && ob[k] == ivB)
+      continue;
+    if (oa[k] == ob[k])
+      continue;
+    return false;
+  }
+  return true;
+}
+
+enum class CrossKind { Fusable, Barrier };
+
+/// Relationship between two conformant depth-1 sibling bands: Fusable (every
+/// cross write-pair is on disjoint allocations or element-aligned) or Barrier
+/// (an offset / unprovable dependence — keep both parallel, sync between).
+static CrossKind classifyCross(affine::AffineForOp a, affine::AffineForOp b) {
+  Value ivA = a.getInductionVar(), ivB = b.getInductionVar();
+  SmallVector<Operation *, 8> aa, bb;
+  collectAccesses(a, aa);
+  collectAccesses(b, bb);
+  for (Operation *x : aa) {
+    for (Operation *y : bb) {
+      bool writes = isa<affine::AffineWriteOpInterface>(x) ||
+                    isa<affine::AffineWriteOpInterface>(y);
+      if (!writes)
+        continue;
+      Value mx = memrefOf(x), my = memrefOf(y);
+      if (mx != my) {
+        Value rx = ParAliasOracle::allocationRoot(mx);
+        Value ry = ParAliasOracle::allocationRoot(my);
+        if (isAllocLike(rx) && isAllocLike(ry) && rx != ry)
+          continue; // disjoint buffers
+        return CrossKind::Barrier;
+      }
+      if (alignedAccess(x, y, ivA, ivB))
+        continue;
+      return CrossKind::Barrier;
+    }
+  }
+  return CrossKind::Fusable;
+}
+
+/// A depth-1 affine.for whose single axis is parallel and whose body is
+/// materializable.  These are the bands M3 fuses across; everything else falls
+/// back to the M2 single-band path.
+static bool isSimpleParallel(affine::AffineForOp loop,
+                             const ParAliasOracle &oracle) {
+  SmallVector<affine::AffineForOp, 4> band;
+  affine::getPerfectlyNestedLoops(band, loop);
+  if (band.size() != 1)
+    return false;
+  if (classifyLoop(loop.getOperation(), oracle) != AxisKind::Parallel)
+    return false;
+  return bandMaterializable(band);
+}
+
+/// True when every value `band`'s body reads from outside the band is defined
+/// before `anchor` (so it still dominates a region inserted there).  Guards
+/// against fusing a band that uses a value defined between the run's bands.
+static bool bodyOperandsDominate(affine::AffineForOp band, Operation *anchor) {
+  affine::AffineForOp b = band;
+  for (Operation &op : b.getBody()->without_terminator()) {
+    for (Value v : op.getOperands()) {
+      if (isa<BlockArgument>(v))
+        continue; // IV (remapped) / enclosing-scope arg (dominates)
+      Operation *def = v.getDefiningOp();
+      if (!def || b->isAncestor(def))
+        continue; // defined inside the band body
+      if (def->getBlock() == anchor->getBlock() &&
+          !def->isBeforeInBlock(anchor))
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Materialize a run of conformant depth-1 simple-parallel sibling bands into a
+/// single par.region: maximal fusable subgroups share one par.forall (bodies
+/// sequenced); an offset boundary between subgroups becomes a par.barrier.
+static void materializeRun(ArrayRef<affine::AffineForOp> run) {
+  affine::AffineForOp first = run.front();
+  OpBuilder b(first);
+  Location loc = first.getLoc();
+  auto regionOp = b.create<par::RegionOp>(loc);
+  Block *rblk = b.createBlock(&regionOp.getRegion());
+
+  unsigned idx = 0;
+  bool firstSub = true;
+  while (idx < run.size()) {
+    SmallVector<affine::AffineForOp, 4> sub;
+    sub.push_back(run[idx]);
+    unsigned k = idx + 1;
+    while (k < run.size()) {
+      affine::AffineForOp cand = run[k];
+      bool fusable = true;
+      for (affine::AffineForOp s : sub)
+        if (classifyCross(s, cand) == CrossKind::Barrier) {
+          fusable = false;
+          break;
+        }
+      if (!fusable)
+        break;
+      sub.push_back(cand);
+      ++k;
+    }
+
+    b.setInsertionPointToEnd(rblk);
+    if (!firstSub)
+      b.create<par::BarrierOp>(loc);
+    firstSub = false;
+
+    b.setInsertionPointToEnd(rblk);
+    affine::AffineForOp f0 = sub.front();
+    SmallVector<int64_t> lb{f0.getConstantLowerBound()};
+    SmallVector<int64_t> ub{f0.getConstantUpperBound()};
+    SmallVector<int64_t> st{f0.getStepAsInt()};
+    auto forall = b.create<par::ForallOp>(
+        loc, b.getDenseI64ArrayAttr(lb), b.getDenseI64ArrayAttr(ub),
+        b.getDenseI64ArrayAttr(st));
+    Block *fblk = b.createBlock(&forall.getRegion());
+    fblk->addArgument(b.getIndexType(), loc);
+    Value iv = fblk->getArgument(0);
+    b.setInsertionPointToStart(fblk);
+    for (affine::AffineForOp band : sub) {
+      IRMapping map;
+      map.map(band.getInductionVar(), iv);
+      for (Operation &op : band.getBody()->without_terminator())
+        cloneBodyOp(b, &op, map);
+    }
+    b.create<par::YieldOp>(loc, ValueRange{});
+    idx = k;
+  }
+
+  b.setInsertionPointToEnd(rblk);
+  b.create<par::YieldOp>(loc, ValueRange{});
+
+  for (affine::AffineForOp band : run)
+    band.erase();
+}
+
+/// Materialize all band roots of one block: maximal runs of conformant
+/// dominating simple-parallel bands go through materializeRun (fuse/barrier);
+/// every other band falls back to the M2 single-band path.
+static void materializeBlock(ArrayRef<affine::AffineForOp> roots,
+                             const ParAliasOracle &oracle) {
+  unsigned n = roots.size(), i = 0;
+  while (i < n) {
+    affine::AffineForOp head = roots[i];
+    if (isSimpleParallel(head, oracle)) {
+      SmallVector<affine::AffineForOp, 4> run;
+      run.push_back(head);
+      unsigned j = i + 1;
+      while (j < n && isSimpleParallel(roots[j], oracle) &&
+             conformant(head, roots[j]) &&
+             bodyOperandsDominate(roots[j], head.getOperation())) {
+        run.push_back(roots[j]);
+        ++j;
+      }
+      materializeRun(run);
+      i = j;
+    } else {
+      SmallVector<affine::AffineForOp, 4> band;
+      affine::getPerfectlyNestedLoops(band, roots[i]);
+      SmallVector<AxisKind, 4> levels;
+      classifyBand(band, oracle, levels);
+      materializeBand(band, levels); // no-op if not materializable
+      ++i;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
 
 struct DrParBubblesPass
     : public impl::DrParBubblesPassBase<DrParBubblesPass> {
@@ -424,30 +619,26 @@ struct DrParBubblesPass
       });
     }
 
-    // M2 — materialize single climb regions into the `par` dialect.
+    // M2/M3 — materialize maximal regions into the `par` dialect.  Single
+    // climb bands -> par.region/par.forall (+ scf.for suffix); runs of
+    // conformant depth-1 parallel siblings -> fused foralls / barrier groups.
     if (parMaterialize) {
       module.walk([&](func::FuncOp fn) {
         if (fn.isExternal())
           return;
-        // Re-walk to a fixed point: materializeBand erases the affine nest and
-        // emits par/scf, so a fresh walk never re-sees a materialized region.
-        bool changed = true;
-        while (changed) {
-          changed = false;
-          fn.walk([&](affine::AffineForOp loop) -> WalkResult {
-            if (!isBandRoot(loop))
-              return WalkResult::advance();
-            SmallVector<affine::AffineForOp, 4> band;
-            affine::getPerfectlyNestedLoops(band, loop);
-            SmallVector<AxisKind, 4> levels;
-            classifyBand(band, oracle, levels);
-            if (materializeBand(band, levels)) {
-              changed = true;
-              return WalkResult::interrupt();
-            }
-            return WalkResult::advance();
-          });
-        }
+        // Band roots per block, in program order (preserved by the walk).
+        llvm::DenseMap<Block *, SmallVector<affine::AffineForOp, 4>> byBlock;
+        SmallVector<Block *, 8> order;
+        fn.walk([&](affine::AffineForOp loop) {
+          if (!isBandRoot(loop))
+            return;
+          auto &v = byBlock[loop->getBlock()];
+          if (v.empty())
+            order.push_back(loop->getBlock());
+          v.push_back(loop);
+        });
+        for (Block *blk : order)
+          materializeBlock(byBlock[blk], oracle);
       });
     }
   }
