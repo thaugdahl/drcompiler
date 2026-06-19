@@ -21,6 +21,9 @@ M = int(sys.argv[2]) if len(sys.argv) > 2 else 4096   # elements per batch
 K = int(sys.argv[3]) if len(sys.argv) > 3 else 4      # layers
 P = int(sys.argv[4]) if len(sys.argv) > 4 else 192    # compute steps / element
 R = int(sys.argv[5]) if len(sys.argv) > 5 else 3      # timed repeats
+# arg 6: interleave=1 emits each layer's scratch alloc BETWEEN bands (real-ONNX
+# shape; exercises S2 inter-band glue hoisting).  default 0 = allocs at top.
+INTERLEAVE = (len(sys.argv) > 6 and sys.argv[6] == "1")
 
 T = f"memref<{N}x{M}xf32>"
 o = []
@@ -37,11 +40,14 @@ def src(l): return "%A" if l == 0 else f"%S{l-1}"
 def dst(l): return "%OUT" if l == K-1 else f"%S{l}"
 
 w(f"func.func @kernel(%A: {T}, %OUT: {T}) {{")
-for l in range(K-1):
-    w(f"  %S{l} = memref.alloc() : {T}")
+if not INTERLEAVE:
+    for l in range(K-1):
+        w(f"  %S{l} = memref.alloc() : {T}")
 w("  %c1 = arith.constant 0.999 : f32")
 w("  %c2 = arith.constant 0.013 : f32")
 for l in range(K):
+    if INTERLEAVE and l < K-1:
+        w(f"  %S{l} = memref.alloc() : {T}")  # scratch declared between bands
     w(f"  affine.for %n = 0 to {N} {{")
     w(f"    affine.for %i = 0 to {M} {{")
     w(f"      %x = affine.load {src(l)}[%n, %i] : {T}")

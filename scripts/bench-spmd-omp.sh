@@ -9,7 +9,7 @@
 # Usage: [N M K P R] as env or args; LLVM_INSTALL_DIR / OMP_LIB overridable.
 set -euo pipefail
 export LC_ALL=C   # rtclock prints '0.19' (dot); keep printf/awk dot-decimal
-N=${1:-64}; M=${2:-4096}; K=${3:-4}; P=${4:-192}; R=${5:-3}
+N=${1:-64}; M=${2:-4096}; K=${3:-4}; P=${4:-192}; R=${5:-3}; IL=${6:-0}
 LL=${LLVM_INSTALL_DIR:-/home/tor/Dev/marco/install/llvm-project}
 OMP_LIB=${OMP_LIB:-/usr/lib/libomp.so}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,8 +28,8 @@ LOWER_OMP=(--convert-scf-to-cf --convert-openmp-to-llvm --convert-cf-to-llvm
            --convert-arith-to-llvm --finalize-memref-to-llvm
            --convert-func-to-llvm --reconcile-unrealized-casts)
 
-python3 "$HERE/scripts/gen_spmd_perf_kernel.py" "$N" "$M" "$K" "$P" "$R" > "$D/k.mlir"
-echo "kernel: N=$N M=$M layers=$K steps/elem=$P repeats=$R"
+python3 "$HERE/scripts/gen_spmd_perf_kernel.py" "$N" "$M" "$K" "$P" "$R" "$IL" > "$D/k.mlir"
+echo "kernel: N=$N M=$M layers=$K steps/elem=$P repeats=$R interleave-allocs=$IL"
 
 # barrier count in the SPMD form (informational)
 nb=$($DROPT "$D/k.mlir" --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd})' 2>/dev/null | grep -c 'par.barrier' || true)

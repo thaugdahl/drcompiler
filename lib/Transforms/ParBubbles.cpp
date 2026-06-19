@@ -33,6 +33,7 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Twine.h"
 #include <map>
 #include <set>
@@ -786,6 +787,37 @@ static bool nestOperandsDominate(affine::AffineForOp root, Operation *anchor) {
   return ok;
 }
 
+/// Make a run of shard bands contiguous by hoisting the inter-band "glue" --
+/// scratch allocs, constants, pure index/view ops (the per-layer setup real
+/// ONNX kernels interleave between layers) -- above the first band.  Sound: a
+/// hoisted op is either side-effect-free (reads no memory, so no RAW with a
+/// band store) or a fresh allocation (no ordering constraint with other
+/// buffers), and bands have no SSA results, so nothing hoisted depends on a
+/// band; moving it earlier preserves semantics.  Returns false (no mutation) if
+/// any inter-band op is NOT hoistable (a load/store/call/dealloc/region op) --
+/// then materialization bails.
+static bool hoistInterBandGlue(ArrayRef<affine::AffineForOp> roots) {
+  llvm::SmallPtrSet<Operation *, 16> bandSet;
+  for (affine::AffineForOp r : roots)
+    bandSet.insert(r.getOperation());
+  affine::AffineForOp frontBand = roots.front(), backBand = roots.back();
+  Operation *first = frontBand.getOperation();
+  Operation *last = backBand.getOperation();
+  SmallVector<Operation *> glue;
+  for (Operation *op = first->getNextNode(); op && op != last;
+       op = op->getNextNode()) {
+    if (bandSet.count(op))
+      continue; // an intervening band root
+    bool alloc = isa<memref::AllocOp, memref::AllocaOp>(op);
+    if (op->getNumRegions() != 0 || !(isMemoryEffectFree(op) || alloc))
+      return false; // reads/writes memory or carries a region: not hoistable
+    glue.push_back(op);
+  }
+  for (Operation *g : glue)
+    g->moveBefore(first); // forward order -> relative order preserved
+  return true;
+}
+
 /// Materialize a contiguous run of shard-axis bands (`roots`, perfect nests
 /// `nests`) into ONE par.region over the shard space [lb,ub,step).  Maximal
 /// ELIDE-connected sub-runs share a par.forall (bodies sequenced); a non-elided
@@ -1076,11 +1108,14 @@ struct DrParBubblesPass
           }
           nests.push_back(std::move(nest));
         }
-        for (size_t i = 0; i + 1 < roots.size(); ++i)
-          if (roots[i]->getNextNode() != roots[i + 1].getOperation()) {
-            fn.emitRemark("par-spmd: not materialized (op between shard bands)");
-            return;
-          }
+        // Hoist movable inter-band glue (scratch allocs / pure index+view ops)
+        // so the bands become contiguous; bail on a non-hoistable op.
+        if (!hoistInterBandGlue(roots)) {
+          fn.emitRemark(
+              "par-spmd: not materialized (non-hoistable op between shard "
+              "bands)");
+          return;
+        }
         for (affine::AffineForOp r : roots)
           if (!nestOperandsDominate(r, roots.front().getOperation())) {
             fn.emitRemark(

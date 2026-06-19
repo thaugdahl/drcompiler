@@ -95,3 +95,37 @@ func.func @spmd_multidim() {
   }
   return
 }
+
+// -----
+
+// Real-ONNX shape: each layer's scratch buffer (and a per-layer constant) is
+// allocated BETWEEN the bands.  The glue is hoisted above the first band so the
+// run is contiguous, then the owner-aligned layers fuse into ONE forall.  All
+// three bands ELIDE -> zero barriers.
+// CHECK-LABEL: func.func @interleaved_glue
+// CHECK:         memref.alloc
+// CHECK:         memref.alloc
+// CHECK:         par.region {
+// CHECK:           par.forall([0], [8], [1]) {
+// CHECK-NOT:       par.barrier
+// CHECK-NOT:       par.forall
+// CHECK:         }
+func.func @interleaved_glue(%A: memref<8x8xf32>, %D: memref<8x8xf32>) {
+  %B = memref.alloc() : memref<8x8xf32>
+  affine.for %n = 0 to 8 { affine.for %j = 0 to 8 {
+    %a = affine.load %A[%n, %j] : memref<8x8xf32>
+    affine.store %a, %B[%n, %j] : memref<8x8xf32>
+  }}
+  %C = memref.alloc() : memref<8x8xf32>
+  %k = arith.constant 2.0 : f32
+  affine.for %n = 0 to 8 { affine.for %j = 0 to 8 {
+    %b = affine.load %B[%n, %j] : memref<8x8xf32>
+    %m = arith.mulf %b, %k : f32
+    affine.store %m, %C[%n, %j] : memref<8x8xf32>
+  }}
+  affine.for %n = 0 to 8 { affine.for %j = 0 to 8 {
+    %c = affine.load %C[%n, %j] : memref<8x8xf32>
+    affine.store %c, %D[%n, %j] : memref<8x8xf32>
+  }}
+  return
+}

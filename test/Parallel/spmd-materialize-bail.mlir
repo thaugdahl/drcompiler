@@ -39,19 +39,24 @@ func.func @bail_offaxis() {
 
 // -----
 
-// A non-band op (an alloc feeding a later band) sits between two shard bands:
-// moving the second band ahead of it would reorder, so bail.
-// expected-remark @below {{par-spmd: not materialized (op between shard bands)}}
-func.func @bail_interleaved() {
+// A non-hoistable op (a memref.load reading the first band's output) sits
+// between two shard bands: it cannot be hoisted above band 1 (it reads what
+// band 1 writes), and moving band 2 past it would reorder -> bail.  (Scratch
+// allocs / pure index ops between bands DO hoist -- see spmd-materialize.mlir.)
+// expected-remark @below {{par-spmd: not materialized (non-hoistable op between shard bands)}}
+func.func @bail_nonhoistable() {
+  %c0 = arith.constant 0 : index
   %z = arith.constant 0.0 : f32
   %A = memref.alloc() : memref<64xf32>
+  %B = memref.alloc() : memref<64xf32>
   affine.for %i = 0 to 64 {
     affine.store %z, %A[%i] : memref<64xf32>
   }
-  %B = memref.alloc() : memref<64xf32>
+  %peek = memref.load %A[%c0] : memref<64xf32>
   affine.for %i = 0 to 64 {
     %a = affine.load %A[%i] : memref<64xf32>
-    affine.store %a, %B[%i] : memref<64xf32>
+    %s = arith.addf %a, %peek : f32
+    affine.store %s, %B[%i] : memref<64xf32>
   }
   return
 }
