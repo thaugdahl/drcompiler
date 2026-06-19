@@ -363,8 +363,8 @@ static bool materializeBand(ArrayRef<affine::AffineForOp> band,
     steps.push_back(bd.getStepAsInt());
   }
   auto forall = b.create<par::ForallOp>(
-      loc, b.getDenseI64ArrayAttr(lbs), b.getDenseI64ArrayAttr(ubs),
-      b.getDenseI64ArrayAttr(steps), ValueRange{});
+      loc, TypeRange{}, b.getDenseI64ArrayAttr(lbs), b.getDenseI64ArrayAttr(ubs),
+      b.getDenseI64ArrayAttr(steps), ValueRange{}, ValueRange{});
   Block *fblk = b.createBlock(&forall.getRegion());
   fblk->addArguments(SmallVector<Type>(p, b.getIndexType()),
                      SmallVector<Location>(p, loc));
@@ -583,8 +583,8 @@ static void materializeRun(ArrayRef<affine::AffineForOp> run) {
     SmallVector<int64_t> ub{f0.getConstantUpperBound()};
     SmallVector<int64_t> st{f0.getStepAsInt()};
     auto forall = b.create<par::ForallOp>(
-        loc, b.getDenseI64ArrayAttr(lb), b.getDenseI64ArrayAttr(ub),
-        b.getDenseI64ArrayAttr(st), ValueRange{});
+        loc, TypeRange{}, b.getDenseI64ArrayAttr(lb), b.getDenseI64ArrayAttr(ub),
+        b.getDenseI64ArrayAttr(st), ValueRange{}, ValueRange{});
     Block *fblk = b.createBlock(&forall.getRegion());
     fblk->addArgument(b.getIndexType(), loc);
     Value iv = fblk->getArgument(0);
@@ -899,8 +899,9 @@ materializeSpmd(ArrayRef<affine::AffineForOp> roots,
     if (dynUb)
       dynOps.push_back(dynUb);
     auto forall = b.create<par::ForallOp>(
-        loc, b.getDenseI64ArrayAttr({lb}), b.getDenseI64ArrayAttr({ubEntry}),
-        b.getDenseI64ArrayAttr({step}), dynOps);
+        loc, TypeRange{}, b.getDenseI64ArrayAttr({lb}),
+        b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({step}), dynOps,
+        ValueRange{});
     Block *fblk = b.createBlock(&forall.getRegion());
     fblk->addArgument(b.getIndexType(), loc);
     Value iv = fblk->getArgument(0);

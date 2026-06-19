@@ -41,6 +41,14 @@ namespace {
 /// Constant bounds are materialized as arith index constants in the enclosing
 /// (omp.parallel) block; only the induction variables are remapped.
 static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait) {
+  // Reducing foralls need an omp reduction clause (S6, not yet wired); until
+  // then convert-par-to-scf is the reduce reference.  Fail loudly rather than
+  // silently dropping the par.reduce.
+  if (!forall.getResults().empty()) {
+    forall.emitError("convert-par-to-omp: reducing par.forall not yet supported "
+                     "(lower via convert-par-to-scf; omp reduction is S6)");
+    return;
+  }
   Location loc = forall.getLoc();
   ArrayRef<int64_t> lo = forall.getLowerBounds();
   ArrayRef<int64_t> hi = forall.getUpperBounds();

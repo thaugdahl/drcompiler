@@ -43,24 +43,33 @@ def Par_RegionOp : Par_Op<"region",
 }
 
 def Par_ForallOp : Par_Op<"forall",
-    [SingleBlock, RecursiveMemoryEffects]> {
+    [SingleBlock, RecursiveMemoryEffects, AttrSizedOperandSegments]> {
   let summary = "Distribute a constant rectangular iteration space across workers";
   let description = [{
     `lowerBounds`, `upperBounds` and `steps` are equal-length constant arrays,
     one entry per distributed dimension; the body block carries one `index`
     induction variable per dimension.  Iterations are partitioned across the
-    team (block by default); no order is guaranteed across workers.  (Dynamic /
-    affine bounds are a follow-up; M2 is constant-bound.)
+    team (block by default); no order is guaranteed across workers.  A dim whose
+    `upperBounds` entry is the kDynamic sentinel takes its bound from the
+    matching `dynamicUpperBounds` operand (runtime extent).
+
+    When `initVals` (and matching `results`) are present the body's terminator
+    is a `par.reduce` contributing one value per result through an associative
+    combinator (cross-worker reduction over the distributed space, scf.parallel
+    style); otherwise the terminator is `par.yield`.
   }];
   let arguments = (ins DenseI64ArrayAttr:$lowerBounds,
                        DenseI64ArrayAttr:$upperBounds,
                        DenseI64ArrayAttr:$steps,
-                       Variadic<Index>:$dynamicUpperBounds);
+                       Variadic<Index>:$dynamicUpperBounds,
+                       Variadic<AnyType>:$initVals);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$region);
   let assemblyFormat =
       "`(` $lowerBounds `,` $upperBounds `,` $steps `)` "
       "(`dyn` `(` $dynamicUpperBounds^ `:` type($dynamicUpperBounds) `)`)? "
-      "$region attr-dict";
+      "(`init` `(` $initVals^ `:` type($initVals) `)`)? "
+      "$region (`->` type($results)^)? attr-dict";
   let hasVerifier = 1;
   let extraClassDeclaration = [{
     unsigned getNumDims() { return getLowerBounds().size(); }
@@ -89,6 +98,24 @@ def Par_BarrierOp : Par_Op<"barrier", [HasParent<"RegionOp">]> {
     keep both parallel, synchronize between them.
   }];
   let assemblyFormat = "attr-dict";
+}
+
+def Par_ReduceOp : Par_Op<"reduce",
+    [Terminator, HasParent<"ForallOp">]> {
+  let summary = "Associative cross-worker reduction contribution (kind-based)";
+  let description = [{
+    Terminator of a reducing `par.forall`: each iteration contributes one value
+    per enclosing-forall result through an associative+commutative combinator
+    named by `kinds` (one per contribution): 0=addf 1=mulf 2=maxnumf 3=minnumf
+    4=addi 5=muli 6=maxsi 7=minsi.  Workers reduce their slice into a private
+    partial; a final tree-combine produces the forall result (under
+    `fastmath<reassoc>` for FP).  Kind-based (not a combinator region) to match
+    the back-end `__drpar_reduce_*(perThread, n, out, kind)` ABI.
+  }];
+  let arguments = (ins Variadic<AnyType>:$contributions, DenseI64ArrayAttr:$kinds);
+  let assemblyFormat =
+      "`(` $contributions `:` type($contributions) `)` `kinds` $kinds attr-dict";
+  let hasVerifier = 1;
 }
 
 def Par_CriticalOp : Par_Op<"critical",

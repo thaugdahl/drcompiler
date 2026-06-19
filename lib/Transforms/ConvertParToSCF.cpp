@@ -27,9 +27,64 @@ using namespace mlir;
 
 namespace {
 
+/// Associative combinator for a par.reduce kind (see ParOps.td).
+static Value combine(OpBuilder &b, Location loc, int64_t kind, Value l,
+                     Value r) {
+  switch (kind) {
+  case 0: return b.create<arith::AddFOp>(loc, l, r);
+  case 1: return b.create<arith::MulFOp>(loc, l, r);
+  case 2: return b.create<arith::MaxNumFOp>(loc, l, r);
+  case 3: return b.create<arith::MinNumFOp>(loc, l, r);
+  case 4: return b.create<arith::AddIOp>(loc, l, r);
+  case 5: return b.create<arith::MulIOp>(loc, l, r);
+  case 6: return b.create<arith::MaxSIOp>(loc, l, r);
+  default: return b.create<arith::MinSIOp>(loc, l, r);
+  }
+}
+
+/// A reducing par.forall (1-D, carries results) -> a SEQUENTIAL scf.for with
+/// iter_args: the spec's sequential reference (par->scf runs sequentially), so
+/// the accumulators are threaded and combined per kind.  Exact, no FP reassoc.
+static void lowerReduceForall(par::ForallOp forall) {
+  OpBuilder b(forall);
+  Location loc = forall.getLoc();
+  Value lb = b.create<arith::ConstantIndexOp>(loc, forall.getLowerBounds()[0]);
+  Value ub = forall.isDynamicUpperBound(0)
+                 ? forall.getDynamicUpperBound(0)
+                 : b.create<arith::ConstantIndexOp>(loc,
+                                                    forall.getUpperBounds()[0])
+                       .getResult();
+  Value st = b.create<arith::ConstantIndexOp>(loc, forall.getSteps()[0]);
+  auto red = cast<par::ReduceOp>(forall.getBody()->getTerminator());
+  SmallVector<Value> inits(forall.getInitVals());
+  SmallVector<int64_t> kinds(red.getKinds());
+
+  // scf.for with iter_args via the bodyBuilder idiom (it creates the body +
+  // terminator; we clone the forall body and combine into the accumulators).
+  auto forOp = b.create<scf::ForOp>(
+      loc, lb, ub, st, inits,
+      [&](OpBuilder &nb, Location nloc, Value iv, ValueRange iterArgs) {
+        IRMapping map;
+        map.map(forall.getInductionVars()[0], iv);
+        for (Operation &op : forall.getBody()->without_terminator())
+          nb.clone(op, map);
+        SmallVector<Value> yields;
+        for (unsigned i = 0, e = red.getContributions().size(); i < e; ++i)
+          yields.push_back(combine(nb, nloc, kinds[i], iterArgs[i],
+                                   map.lookupOrDefault(red.getContributions()[i])));
+        nb.create<scf::YieldOp>(nloc, yields);
+      });
+  forall.replaceAllUsesWith(forOp.getResults());
+  forall.erase();
+}
+
 /// par.forall -> scf.parallel; the body is cloned in (only the induction
 /// variables are remapped — every other operand dominates the new op).
 static void lowerForall(par::ForallOp forall) {
+  if (!forall.getResults().empty()) {
+    lowerReduceForall(forall);
+    return;
+  }
   OpBuilder b(forall);
   Location loc = forall.getLoc();
   ArrayRef<int64_t> lo = forall.getLowerBounds();
