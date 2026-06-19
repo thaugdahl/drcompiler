@@ -64,14 +64,24 @@ echo "== front: static affine (0:$INSHAPE) =="
 dockt onnx-mlir --O2 --EmitMLIR --shapeInformation=0:$INSHAPE -o "$W/m" "$MA" >/dev/null 2>&1
 dockt onnx-mlir-opt --convert-krnl-to-affine "$W/m.onnx.mlir" -o "$W/m.affine.mlir"
 
-build_cfg(){ # $1=name  $2=extra dr-opt pipeline (or empty)
+build_cfg(){ # $1=name  $2=dr-opt pass pipeline
   local nm=$1 pipe=$2
-  if [[ -n "$pipe" ]]; then
-    $DROPT "$W/m.affine.mlir" -allow-unregistered-dialect --pass-pipeline="$pipe" -o "$W/$nm.mlir" 2>&1 | grep -iE 'perband' | head -1
-  else cp "$W/m.affine.mlir" "$W/$nm.mlir"; fi
-  "$LL/mlir-opt" -allow-unregistered-dialect $LOWER "$W/$nm.mlir" -o "$W/$nm.llvm.mlir"
-  "$LL/mlir-translate" --mlir-to-llvmir "$W/$nm.llvm.mlir" -o "$W/$nm.ll"
-  "$LL/clang" -O2 -march=native -fopenmp "$W/h.c" "$W/$nm.ll" -lm -o "$W/$nm.bin"
+  # Efficient single-pass compile: dr-opt + mlir-opt exchange MLIR BYTECODE
+  # (weights stay binary, not text), and dr-opt|mlir-opt|mlir-translate|llc are
+  # PIPED -- the multi-GB textual .ll never hits disk (was 3GB for gpt).  No
+  # intermediate files.  $DROPT's perband remark goes to stderr.
+  # dr-opt|mlir-opt exchange MLIR bytecode (binary weights); translate emits the
+  # textual .ll into llvm-as (LLParser, no clang source-loc limit) -> bitcode ->
+  # clang compiles the bitcode with full -O2 middle-end (vectorizer) + native
+  # codegen (llc alone skips the middle-end -> ~3x slower).  Fully piped: no
+  # multi-GB intermediate ever hits disk.
+  $DROPT "$W/m.affine.mlir" -allow-unregistered-dialect --pass-pipeline="$pipe" --emit-bytecode -o - 2>"$W/$nm.r" \
+    | "$LL/mlir-opt" -allow-unregistered-dialect $LOWER --emit-bytecode -o - \
+    | "$LL/mlir-translate" --mlir-to-llvmir -o - \
+    | "$LL/llvm-as" -o - \
+    | "$LL/clang" -O2 -march=native -fopenmp -c -x ir - -o "$W/$nm.o" 2>/dev/null
+  grep -iE 'perband' "$W/$nm.r" | head -1
+  "$LL/clang" -O2 -no-pie -fopenmp "$W/h.c" "$W/$nm.o" -lm -o "$W/$nm.bin"
 }
 echo "== seq reference (krnl-free, no SPMD) =="
 build_cfg seq "builtin.module(lower-krnl-global)"

@@ -440,6 +440,35 @@ memory-bound resnet50 inference (an inherent property of memory-bound CNNs, well
 known in the literature).  The lever for a real CNN win is arithmetic intensity
 (register-block/vectorize the convs first, then SPMD), not more parallelism.
 
+## 11.12 Efficient compilation — no huge intermediates (2026-06-20)
+
+The naive back-end wrote a textual file per stage: dr-opt `.mlir` (≈930 MB),
+mlir-opt `.mlir` (≈930 MB), mlir-translate `.ll` (**≈3 GB** for gpt — weights as
+decimal text, ~6× their binary size).  That overflowed `/tmp` (a 31 GB tmpfs)
+and hit clang's source-location limit on the 3 GB `.ll`.
+
+`scripts/validate-spmd-parallel.sh` now compiles in **one fully-piped pass with
+binary IR**, zero intermediate files:
+
+```
+dr-opt … --emit-bytecode -o - \         # MLIR bytecode: weights stay BINARY
+ | mlir-opt … --emit-bytecode -o - \     # (not re-serialized to text)
+ | mlir-translate --mlir-to-llvmir -o - \ # textual .ll streams through the pipe
+ | llvm-as -o - \                         # LLParser->bitcode (no clang text limit)
+ | clang -O2 -march=native -c -x ir - -o k.o   # full middle-end + native codegen
+```
+
+- MLIR bytecode between dr-opt↔mlir-opt: binary weights, no 2× 930 MB text.
+- The multi-GB `.ll` only ever streams through a pipe — never a file.
+- `llvm-as` parses the textual `.ll` (LLParser has no source-location limit) →
+  bitcode; clang compiles the **bitcode** (binary, no text limit) with the full
+  `-O2` middle-end (vectorizer) + `-march=native` — `llc` alone skips the
+  middle-end and is ~3× slower.
+- Verified byte-equivalent + perf-equivalent to the old file-based clang path:
+  resnet50 batch-1 1t=3.31 s, 16t=2.45 s (1.35×), `norm_rel_err 1.05e-6`; mnist
+  `0.000e+00`, zero `.ll`/`.mlir` files left.  This also removes the disk /
+  clang-frontend blockers that gpt's 3 GB `.ll` hit.
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer
