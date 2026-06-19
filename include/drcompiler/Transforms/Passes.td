@@ -792,6 +792,14 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
            "each inter-band edge for barrier elision (S1) -- ELIDE / HALO / "
            "REDISTRIBUTE / BARRIER. Emits par-shard / par-edge / par-spmd "
            "remarks.  See PARALLEL_SPMD_SPEC.md.">,
+    Option<"parSpmdPerband", "par-spmd-perband", "bool", "false",
+           "Materialize batch-1 within-sample SPMD (S7): ONE par.region; each "
+           "top-level band shards its OWN outermost parallel loop into a "
+           "par.forall (extents may differ per layer; inner loops incl. the "
+           "reduction stay scf.for, within-shard), with a par.barrier between "
+           "consecutive bands (the consumer reads the full producer output). "
+           "Bails (with a count) if any band's outer loop is not a "
+           "materializable parallel axis. See PARALLEL_SPMD_SPEC.md.">,
     Option<"parSpmd", "par-spmd", "bool", "false",
            "Materialize whole-function SPMD (S2): widen every top-level "
            "shard-axis band into ONE par.region, hoist one par.forall over the "
