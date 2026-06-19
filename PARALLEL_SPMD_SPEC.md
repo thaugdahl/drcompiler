@@ -271,11 +271,35 @@ sequenced, inner loops sunk as `scf.for`); a non-elided edge → `par.redistribu
   / non-materializable band, non-contiguous bands, inter-band value dependence —
   exactly the §11.5 real-kernel blockers (resnet50-style dumps correctly bail).
 
-**Still STRUCTURAL tier only** — the §11.5 validation blocker stands: `par→scf`
-joins between `scf.parallel`s, so elision soundness is NOT execution-validated.
-S3 (`par→omp` nowait) + an execution diff remain the gate before this is a
-measured speedup, and S4/S5/S6 are unchanged. The mechanism is proven to build
-the right IR on clean kernels; it is not yet proven correct at runtime.
+**Tier when landed: structural.** S3 (below) lifted it to execution-validated
+for clean kernels.
+
+## 11.7 S3 landed — execution-validated (2026-06-19, commit ce60d2f)
+
+The faithful `par→omp` lowering (`convert-par-to-omp`) + the execution gate that
+was §11.5 blocker #4.
+
+- `par.region → omp.parallel` (one team); `par.forall → omp.wsloop {
+  omp.loop_nest }`; an elided edge → `nowait` on the wsloop (the explicit
+  boundary `omp.barrier` provides the sync — no double barrier); `par.barrier`
+  / `par.redistribute → omp.barrier`. One `omp.parallel` + barriers only where
+  S1 kept them — strictly fewer fork/joins than the per-loop
+  `par→scf.parallel→convert-scf-to-openmp` compose. Test `par-to-omp.mlir`.
+- **EXECUTION-VALIDATED** (`scripts/validate-spmd-omp.sh`): a clean multi-dim
+  shard kernel (two owner-aligned ELIDE bands fused into one `omp.wsloop nowait`
+  + a transpose band behind the one kept `omp.barrier`) compiled three ways —
+  golden (untransformed, sequential), seq (`par→scf`), omp (`par→omp →
+  convert-openmp-to-llvm`, real OpenMP team via `mlir-runner`). All three
+  **byte-identical**; 30 omp runs across {1,2,3,4,8,16} threads, **zero
+  mismatches**. → the barrier elision + `nowait` placement is execution-correct,
+  not just structurally plausible. **§11.5 blocker #4 cleared for clean
+  kernels.**
+
+**What this does NOT yet show:** a measured *speedup*. The 8×8 validation
+kernel is far too small to amortize fork/barrier cost — correctness, not perf.
+A speedup study needs a kernel large enough (the resnet50 batch axis is the
+target) and the real-kernel blockers (krnl, per-layer allocs) handled. S4 (halo
+recompute), S5 (libdrpar pinning), S6 (reduce-over-shard) are unchanged.
 
 ## 11. Open questions / honest limits
 
