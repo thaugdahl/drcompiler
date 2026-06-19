@@ -295,11 +295,34 @@ was §11.5 blocker #4.
   not just structurally plausible. **§11.5 blocker #4 cleared for clean
   kernels.**
 
-**What this does NOT yet show:** a measured *speedup*. The 8×8 validation
-kernel is far too small to amortize fork/barrier cost — correctness, not perf.
-A speedup study needs a kernel large enough (the resnet50 batch axis is the
-target) and the real-kernel blockers (krnl, per-layer allocs) handled. S4 (halo
-recompute), S5 (libdrpar pinning), S6 (reduce-over-shard) are unchanged.
+## 11.8 Measured speedup — S3 fully met (2026-06-19, commit 8320452)
+
+The perf gate (`scripts/gen_spmd_perf_kernel.py` + `scripts/bench-spmd-omp.sh`):
+a large clean batch-shardable kernel — K owner-aligned elementwise layers over
+batch N, each element a P-step compute recurrence (compute-bound). All K layers
+fuse into ONE `par.forall` over N with **ZERO barriers** (the barrier-free batch
+SPMD case). golden-sequential vs `par→omp` across threads, checksum-checked:
+
+| config | per-call | speedup | checksum |
+|---|---|---|---|
+| golden seq | 0.854 s | 1.00× | ref |
+| par→omp 1t | 0.891 s | 0.96× | OK (lowering overhead ~4%) |
+| par→omp 4t | 0.225 s | 3.80× | OK |
+| par→omp 8t | 0.114 s | 7.50× | OK |
+| par→omp 16t | 0.058 s | **14.69×** (92% eff) | OK |
+| par→omp 32t | 0.032 s | ~25× (~78% eff) | OK |
+
+(dev host, 32 cores; N=64 M=8192 K=4 P=384.) Output byte-identical to the
+sequential golden every run. → whole-kernel barrier-free batch SPMD is **correct
+AND scales near-linearly**. **S3 fully met** (faithful `par→omp`,
+execution-correct, measured speedup).
+
+**Honest limits:** compute-bound kernel — a bandwidth-bound kernel saturates
+earlier (a hardware ceiling, not an SPMD flaw); 32t falls to ~78% (full-socket
+shared-LLC/turbo/SMT). Clean synthetic kernel (no krnl, scratch hoisted); real
+ONNX kernels still need the §11.5 blockers (krnl, per-layer allocs, batch-1
+axis) before this runs on resnet50. S4 (halo recompute), S5 (libdrpar pinning),
+S6 (reduce-over-shard) are unchanged.
 
 ## 11. Open questions / honest limits
 
