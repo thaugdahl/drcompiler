@@ -266,9 +266,15 @@ static unsigned leadingParallel(ArrayRef<AxisKind> levels) {
 /// iter_args, and the innermost body holds only affine load/store ops and
 /// region-free, side-effect-free ops (arith/math).  Anything else (calls,
 /// non-affine memref ops, nested regions) bails — left as affine.for.
-static bool bandMaterializable(ArrayRef<affine::AffineForOp> band) {
-  for (affine::AffineForOp l : band) {
-    if (!l.hasConstantLowerBound() || !l.hasConstantUpperBound())
+static bool bandMaterializable(ArrayRef<affine::AffineForOp> band,
+                               bool dynOuterUb = false) {
+  for (unsigned d = 0, e = band.size(); d < e; ++d) {
+    affine::AffineForOp l = band[d];
+    if (!l.hasConstantLowerBound())
+      return false;
+    // The outer (shard) loop may carry a dynamic upper bound under S2; every
+    // inner loop must be constant-bound (it becomes an scf.for with constants).
+    if (!l.hasConstantUpperBound() && !(dynOuterUb && d == 0))
       return false;
     if (l.getNumResults() != 0)
       return false;
@@ -358,7 +364,7 @@ static bool materializeBand(ArrayRef<affine::AffineForOp> band,
   }
   auto forall = b.create<par::ForallOp>(
       loc, b.getDenseI64ArrayAttr(lbs), b.getDenseI64ArrayAttr(ubs),
-      b.getDenseI64ArrayAttr(steps));
+      b.getDenseI64ArrayAttr(steps), ValueRange{});
   Block *fblk = b.createBlock(&forall.getRegion());
   fblk->addArguments(SmallVector<Type>(p, b.getIndexType()),
                      SmallVector<Location>(p, loc));
@@ -578,7 +584,7 @@ static void materializeRun(ArrayRef<affine::AffineForOp> run) {
     SmallVector<int64_t> st{f0.getStepAsInt()};
     auto forall = b.create<par::ForallOp>(
         loc, b.getDenseI64ArrayAttr(lb), b.getDenseI64ArrayAttr(ub),
-        b.getDenseI64ArrayAttr(st));
+        b.getDenseI64ArrayAttr(st), ValueRange{});
     Block *fblk = b.createBlock(&forall.getRegion());
     fblk->addArgument(b.getIndexType(), loc);
     Value iv = fblk->getArgument(0);
@@ -746,23 +752,51 @@ static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
 // par.barrier.  IR-mutating; default off; constant shard extent only.
 //===----------------------------------------------------------------------===//
 
+/// If `loop`'s upper bound is `lb to %v` for a single SSA Value %v (the ub map
+/// is a bare dim/symbol identity over one operand, e.g. the runtime batch size
+/// `0 to %N`), return %v; else null.  Lets S2 shard a dynamic-extent axis.
+static Value simpleDynUb(affine::AffineForOp loop) {
+  if (loop.hasConstantUpperBound())
+    return nullptr;
+  AffineMap m = loop.getUpperBoundMap();
+  if (m.getNumResults() != 1)
+    return nullptr;
+  AffineExpr e = m.getResult(0);
+  auto ops = loop.getUpperBoundOperands();
+  unsigned pos;
+  if (auto d = dyn_cast<AffineDimExpr>(e))
+    pos = d.getPosition();
+  else if (auto s = dyn_cast<AffineSymbolExpr>(e))
+    pos = m.getNumDims() + s.getPosition();
+  else
+    return nullptr; // not a bare identity (has coeff/offset): too complex
+  if (pos >= ops.size())
+    return nullptr;
+  return ops[pos];
+}
+
 /// The perfect nest of `root` if it is an S2 shard band: outermost loop is the
-/// (parallel) shard axis with the given constant bounds, body materializable.
-/// Empty otherwise.
+/// (parallel) shard axis with constant lb/step and either the given constant
+/// upper bound `ubConst` (dynUb null) or exactly the dynamic upper-bound Value
+/// `dynUb` (so every band shards the SAME runtime extent); body materializable.
 static SmallVector<affine::AffineForOp, 4>
 spmdBand(affine::AffineForOp root, const ParAliasOracle &oracle, int64_t lb,
-         int64_t ub, int64_t step) {
+         int64_t step, int64_t ubConst, Value dynUb) {
   SmallVector<affine::AffineForOp, 4> band;
   affine::getPerfectlyNestedLoops(band, root);
   affine::AffineForOp s = band.front();
   if (classifyLoop(s.getOperation(), oracle) != AxisKind::Parallel)
     return {};
-  if (!s.hasConstantLowerBound() || !s.hasConstantUpperBound())
-    return {};
-  if (s.getConstantLowerBound() != lb || s.getConstantUpperBound() != ub ||
+  if (!s.hasConstantLowerBound() || s.getConstantLowerBound() != lb ||
       s.getStepAsInt() != step)
     return {};
-  if (!bandMaterializable(band))
+  if (dynUb) {
+    if (simpleDynUb(s) != dynUb)
+      return {};
+  } else if (!s.hasConstantUpperBound() || s.getConstantUpperBound() != ubConst) {
+    return {};
+  }
+  if (!bandMaterializable(band, /*dynOuterUb=*/dynUb != nullptr))
     return {};
   return band;
 }
@@ -825,8 +859,8 @@ static bool hoistInterBandGlue(ArrayRef<affine::AffineForOp> roots) {
 static void
 materializeSpmd(ArrayRef<affine::AffineForOp> roots,
                 ArrayRef<SmallVector<affine::AffineForOp, 4>> nests, int64_t lb,
-                int64_t ub, int64_t step, unsigned &nForall, unsigned &nBarrier,
-                unsigned &nRedist) {
+                int64_t step, int64_t ubConst, Value dynUb, unsigned &nForall,
+                unsigned &nBarrier, unsigned &nRedist) {
   affine::AffineForOp first = roots.front();
   OpBuilder b(first);
   Location loc = first.getLoc();
@@ -860,9 +894,13 @@ materializeSpmd(ArrayRef<affine::AffineForOp> roots,
 
     // One forall over the shard axis for this sub-run.
     b.setInsertionPointToEnd(rblk);
+    int64_t ubEntry = dynUb ? ShapedType::kDynamic : ubConst;
+    SmallVector<Value> dynOps;
+    if (dynUb)
+      dynOps.push_back(dynUb);
     auto forall = b.create<par::ForallOp>(
-        loc, b.getDenseI64ArrayAttr({lb}), b.getDenseI64ArrayAttr({ub}),
-        b.getDenseI64ArrayAttr({step}));
+        loc, b.getDenseI64ArrayAttr({lb}), b.getDenseI64ArrayAttr({ubEntry}),
+        b.getDenseI64ArrayAttr({step}), dynOps);
     Block *fblk = b.createBlock(&forall.getRegion());
     fblk->addArgument(b.getIndexType(), loc);
     Value iv = fblk->getArgument(0);
@@ -1063,23 +1101,31 @@ struct DrParBubblesPass
           return;
         std::string shardId = *sel;
 
-        // The chosen axis must have a constant extent (par.forall is
-        // constant-bound).  A representative on-axis band gives the bounds;
-        // operand-agnostic shardAxisId => all on-axis bands share them.
-        int64_t lb = 0, ub = 0, step = 1;
-        bool constExtent = false;
+        // Shard-axis bounds from a representative on-axis band.  lb/step must be
+        // constant; the upper bound is either a constant or a single runtime
+        // Value (`0 to %N`, e.g. a dynamic batch size) -- spmdBand then requires
+        // every on-axis band to share that SAME Value (owner-computes needs one
+        // shard space).  A complex affine ub bails.
+        int64_t lb = 0, ubConst = 0, step = 1;
+        Value dynUb = nullptr;
+        bool got = false;
         for (affine::AffineForOp band : bands)
           if (auto id = shardAxisId(band, oracle); id && *id == shardId) {
-            if (band.hasConstantLowerBound() && band.hasConstantUpperBound()) {
-              lb = band.getConstantLowerBound();
-              ub = band.getConstantUpperBound();
-              step = band.getStepAsInt();
-              constExtent = true;
-            }
+            if (!band.hasConstantLowerBound())
+              break;
+            lb = band.getConstantLowerBound();
+            step = band.getStepAsInt();
+            if (band.hasConstantUpperBound())
+              ubConst = band.getConstantUpperBound();
+            else if (!(dynUb = simpleDynUb(band)))
+              break; // non-constant, non-simple bound: too complex
+            got = true;
             break;
           }
-        if (!constExtent) {
-          fn.emitRemark("par-spmd: not materialized (dynamic shard extent)");
+        if (!got) {
+          fn.emitRemark(
+              "par-spmd: not materialized (non-constant lb / complex shard "
+              "bound)");
           return;
         }
 
@@ -1099,7 +1145,7 @@ struct DrParBubblesPass
 
         SmallVector<SmallVector<affine::AffineForOp, 4>, 8> nests;
         for (affine::AffineForOp r : roots) {
-          auto nest = spmdBand(r, oracle, lb, ub, step);
+          auto nest = spmdBand(r, oracle, lb, step, ubConst, dynUb);
           if (nest.empty()) {
             fn.emitRemark(
                 "par-spmd: not materialized (off-axis or non-materializable "
@@ -1124,12 +1170,13 @@ struct DrParBubblesPass
           }
 
         unsigned nForall = 0, nBarrier = 0, nRedist = 0;
-        materializeSpmd(roots, nests, lb, ub, step, nForall, nBarrier,
-                        nRedist);
+        materializeSpmd(roots, nests, lb, step, ubConst, dynUb, nForall,
+                        nBarrier, nRedist);
         fn.emitRemark("par-spmd: materialized foralls=")
             << nForall << " barriers=" << nBarrier
-            << " redistributes=" << nRedist << " (" << roots.size()
-            << " bands)";
+            << " redistributes=" << nRedist << " ("
+            << (dynUb ? "dyn" : std::to_string(ubConst - lb)) << " extent, "
+            << roots.size() << " bands)";
       });
     }
   }

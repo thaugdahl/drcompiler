@@ -54,15 +54,29 @@ def Par_ForallOp : Par_Op<"forall",
   }];
   let arguments = (ins DenseI64ArrayAttr:$lowerBounds,
                        DenseI64ArrayAttr:$upperBounds,
-                       DenseI64ArrayAttr:$steps);
+                       DenseI64ArrayAttr:$steps,
+                       Variadic<Index>:$dynamicUpperBounds);
   let regions = (region SizedRegion<1>:$region);
   let assemblyFormat =
-      "`(` $lowerBounds `,` $upperBounds `,` $steps `)` $region attr-dict";
+      "`(` $lowerBounds `,` $upperBounds `,` $steps `)` "
+      "(`dyn` `(` $dynamicUpperBounds^ `:` type($dynamicUpperBounds) `)`)? "
+      "$region attr-dict";
   let hasVerifier = 1;
   let extraClassDeclaration = [{
     unsigned getNumDims() { return getLowerBounds().size(); }
     ::mlir::Block::BlockArgListType getInductionVars() {
       return getBody()->getArguments();
+    }
+    /// A dim's upper bound is dynamic when its static entry is the kDynamic
+    /// sentinel; its value is then the matching $dynamicUpperBounds operand.
+    bool isDynamicUpperBound(unsigned d) {
+      return ::mlir::ShapedType::isDynamic(getUpperBounds()[d]);
+    }
+    ::mlir::Value getDynamicUpperBound(unsigned d) {
+      unsigned k = 0;
+      for (unsigned i = 0; i < d; ++i)
+        if (::mlir::ShapedType::isDynamic(getUpperBounds()[i])) ++k;
+      return getDynamicUpperBounds()[k];
     }
   }];
 }

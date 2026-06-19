@@ -129,3 +129,28 @@ func.func @interleaved_glue(%A: memref<8x8xf32>, %D: memref<8x8xf32>) {
   }}
   return
 }
+
+// -----
+
+// Dynamic (runtime) batch extent `0 to %N`, shared across both owner-aligned
+// bands -> ONE par.forall over the kDynamic shard axis carrying %N as the
+// dynamic upper bound.  This is the real-ONNX batch-throughput shape.
+// CHECK-LABEL: func.func @dyn_batch
+// CHECK:         par.region {
+// CHECK:           par.forall([0], [-9223372036854775808], [1]) dyn(%arg2 : index) {
+// CHECK-NOT:       par.barrier
+// CHECK-NOT:       par.forall
+// CHECK:         }
+func.func @dyn_batch(%A: memref<?x16xf32>, %D: memref<?x16xf32>, %N: index) {
+  %B = memref.alloc(%N) : memref<?x16xf32>
+  affine.for %n = 0 to %N { affine.for %j = 0 to 16 {
+    %a = affine.load %A[%n, %j] : memref<?x16xf32>
+    %e = arith.mulf %a, %a : f32
+    affine.store %e, %B[%n, %j] : memref<?x16xf32>
+  }}
+  affine.for %n = 0 to %N { affine.for %j = 0 to 16 {
+    %b = affine.load %B[%n, %j] : memref<?x16xf32>
+    affine.store %b, %D[%n, %j] : memref<?x16xf32>
+  }}
+  return
+}

@@ -39,7 +39,9 @@ static void lowerForall(par::ForallOp forall) {
   SmallVector<Value> lbs, ubs, steps;
   for (size_t d = 0, e = lo.size(); d < e; ++d) {
     lbs.push_back(b.create<arith::ConstantIndexOp>(loc, lo[d]));
-    ubs.push_back(b.create<arith::ConstantIndexOp>(loc, hi[d]));
+    ubs.push_back(forall.isDynamicUpperBound(d)
+                      ? forall.getDynamicUpperBound(d)
+                      : b.create<arith::ConstantIndexOp>(loc, hi[d]).getResult());
     steps.push_back(b.create<arith::ConstantIndexOp>(loc, st[d]));
   }
 

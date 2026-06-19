@@ -32,5 +32,14 @@ LogicalResult ForallOp::verify() {
   for (BlockArgument arg : getBody()->getArguments())
     if (!arg.getType().isIndex())
       return emitOpError("induction variables must be of 'index' type");
+  size_t nDyn = 0;
+  for (int64_t ub : getUpperBounds())
+    if (ShapedType::isDynamic(ub))
+      ++nDyn;
+  if (getDynamicUpperBounds().size() != nDyn)
+    return emitOpError("expected ")
+           << nDyn << " dynamic upper-bound operand(s) (one per kDynamic entry "
+              "in upperBounds), got "
+           << getDynamicUpperBounds().size();
   return success();
 }

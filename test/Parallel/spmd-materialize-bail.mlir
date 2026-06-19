@@ -4,14 +4,35 @@
 // materializer refuses to mutate unless every precondition holds, emitting a
 // remark (on the function) that names the reason.  No par.region is produced.
 
-// A dynamic shard extent cannot be a constant par.forall.
-// expected-remark @below {{par-spmd: not materialized (dynamic shard extent)}}
-func.func @bail_dyn(%n : index) {
+// A complex (non-bare) affine upper bound is not a simple runtime extent: bail.
+// (A bare `0 to %n` DOES materialize -- see spmd-materialize.mlir @dyn_batch.)
+// expected-remark @below {{par-spmd: not materialized (non-constant lb / complex shard bound)}}
+func.func @bail_complexbound(%n : index) {
   %A = memref.alloc(%n) : memref<?xf32>
   %B = memref.alloc(%n) : memref<?xf32>
-  affine.for %i = 0 to %n {
+  affine.for %i = 0 to affine_map<()[s0] -> (s0 + 1)>()[%n] {
     %a = affine.load %A[%i] : memref<?xf32>
     affine.store %a, %B[%i] : memref<?xf32>
+  }
+  return
+}
+
+// -----
+
+// Two bands share the shard-axis MAP (`0 to %dyn`) but use DIFFERENT runtime
+// extents (%n vs %m): owner-computes needs ONE shard space, so the second band
+// is off-axis -> bail.  (This is the cross-layer dim-equality limit: real ONNX
+// per-layer batch dims are distinct SSA values not proven equal.)
+// expected-remark @below {{par-spmd: not materialized (off-axis or non-materializable band)}}
+func.func @bail_diffdyn(%n : index, %m : index) {
+  %z = arith.constant 0.0 : f32
+  %A = memref.alloc(%n) : memref<?xf32>
+  %C = memref.alloc(%m) : memref<?xf32>
+  affine.for %i = 0 to %n {
+    affine.store %z, %A[%i] : memref<?xf32>
+  }
+  affine.for %i = 0 to %m {
+    affine.store %z, %C[%i] : memref<?xf32>
   }
   return
 }
