@@ -836,4 +836,32 @@ def ConvertParToSCFPass : Pass<"convert-par-to-scf", "mlir::func::FuncOp">
   let constructor = "mlir::createConvertParToSCFPass()";
 }
 
+def ConvertParToOMPPass : Pass<"convert-par-to-omp", "mlir::func::FuncOp">
+{
+  let summary = "Lower the `par` dialect to OpenMP (faithful whole-kernel SPMD)";
+
+  let description = [{
+    The faithful SPMD lowering (PARALLEL_SPMD_SPEC.md §7, S3):
+
+      par.region        -> omp.parallel            (ONE team for the kernel)
+      par.forall        -> omp.wsloop { omp.loop_nest }   (static worksharing)
+        elided edge       -> `nowait` on the wsloop (the explicit boundary
+                            omp.barrier provides the sync; no double barrier)
+      par.barrier        -> omp.barrier             (only at non-elided edges)
+      par.redistribute   -> omp.barrier             (conservative; reblock is
+                            Phase B)
+
+    One omp.parallel for the whole region with barriers only where S1 kept
+    them -- strictly fewer fork/joins than the per-loop
+    `par -> scf.parallel -> --convert-scf-to-openmp` compose.  Lower further
+    with --convert-openmp-to-llvm and run with the OpenMP runtime.
+  }];
+
+  let dependentDialects = [
+    "omp::OpenMPDialect", "arith::ArithDialect", "memref::MemRefDialect"
+  ];
+
+  let constructor = "mlir::createConvertParToOMPPass()";
+}
+
 #endif

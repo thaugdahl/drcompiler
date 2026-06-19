@@ -5,6 +5,7 @@
 #include "drcompiler/Transforms/AffineLoopTile.h"
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "drcompiler/Transforms/AffineStencilTimeTile.h"
+#include "drcompiler/Transforms/ConvertParToOMP.h"
 #include "drcompiler/Transforms/ConvertParToSCF.h"
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/DrAffineLoopDistribute.h"

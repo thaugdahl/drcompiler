@@ -6,6 +6,7 @@ add_mlir_library(DRCompTransforms
   RegisterBlock/Vectorize.cpp
   AffineStencilTimeTile.cpp
   ConvertParToSCF.cpp
+  ConvertParToOMP.cpp
   DataRecomputation.cpp
   DataRecomputation/BufferElim.cpp
   DataRecomputation/CacheCostModel.cpp
@@ -48,6 +49,7 @@ add_mlir_library(DRCompTransforms
     MLIRPass
     MLIRRuntimeVerifiableOpInterface
     MLIRSCFDialect
+    MLIROpenMPDialect
     MLIRFuncDialect
     MLIRAffineDialect
     MLIRAffineAnalysis
