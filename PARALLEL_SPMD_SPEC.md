@@ -252,6 +252,31 @@ place `par.barrier` only at non-elided edges, lower via a faithful `par→omp`
 sequential). Then libdrpar for pinning. The payoff (33/33 barrier-free on
 resnet50 batch) justifies it.
 
+## 11.6 S2 landed — structural tier (2026-06-19, commit e1ae9eb)
+
+S2 whole-function widening + materialization, behind `dr-par-bubbles{par-spmd}`
+(IR-mutating, default off / byte-identical). Builds the §7 form on clean affine
+kernels: ONE `par.region`; maximal ELIDE-connected shard-band runs share ONE
+hoisted `par.forall` over the (constant) shard axis (owner-computes — bodies
+sequenced, inner loops sunk as `scf.for`); a non-elided edge → `par.redistribute`
+(1-D remap) or `par.barrier`. IR sync-op count == S1's non-elided-edge count.
+
+- **Demonstrated** (tests `spmd-materialize.mlir`): eltwise chain (3 bands, all
+  ELIDE) → one forall / zero barriers; **multi-dim batch shard** — two
+  owner-aligned bands fuse into one `par.forall(n)`, a transpose-read third band
+  (genuine cross-shard) behind a `par.barrier`, inner spatial loop as `scf.for`.
+  This is the multi-dim non-fusable case M3 cannot express (M3 fuses only
+  conformant depth-1 siblings). `par→scf` gives the sequential reference.
+- **Sound bails** (no mutation + naming remark): dynamic shard extent, off-axis
+  / non-materializable band, non-contiguous bands, inter-band value dependence —
+  exactly the §11.5 real-kernel blockers (resnet50-style dumps correctly bail).
+
+**Still STRUCTURAL tier only** — the §11.5 validation blocker stands: `par→scf`
+joins between `scf.parallel`s, so elision soundness is NOT execution-validated.
+S3 (`par→omp` nowait) + an execution diff remain the gate before this is a
+measured speedup, and S4/S5/S6 are unchanged. The mechanism is proven to build
+the right IR on clean kernels; it is not yet proven correct at runtime.
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer
