@@ -19,6 +19,7 @@ add_mlir_library(DRCompTransforms
   DataRecomputation/Strategies/PartialRemat.cpp
   DrAffineLoopDistribute.cpp
   DrPinLiveOut.cpp
+  LowerKrnlGlobal.cpp
   MathStrengthReduce.cpp
   MemoryFission.cpp
   ParBubbles.cpp

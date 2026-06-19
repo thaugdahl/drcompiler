@@ -10,6 +10,7 @@
 #include "drcompiler/Transforms/DataRecomputation.h"
 #include "drcompiler/Transforms/DrAffineLoopDistribute.h"
 #include "drcompiler/Transforms/DrPinLiveOut.h"
+#include "drcompiler/Transforms/LowerKrnlGlobal.h"
 #include "drcompiler/Transforms/MathStrengthReduce.h"
 #include "drcompiler/Transforms/MemoryFission.h"
 #include "drcompiler/Transforms/ParBubbles.h"

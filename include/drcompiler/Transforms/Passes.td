@@ -844,6 +844,27 @@ def ConvertParToSCFPass : Pass<"convert-par-to-scf", "mlir::func::FuncOp">
   let constructor = "mlir::createConvertParToSCFPass()";
 }
 
+def LowerKrnlGlobalPass : Pass<"lower-krnl-global", "mlir::ModuleOp">
+{
+  let summary = "Rewrite krnl.global -> memref.global (krnl-free SPMD lowering)";
+
+  let description = [{
+    Strips the krnl ops that survive into the affine stage so a whole-kernel
+    SPMD (par->omp) module can be lowered to LLVM by HOST mlir-opt (onnx-mlir's
+    monolithic convert-krnl-to-llvm rejects omp/scf.parallel):
+
+      krnl.global {name,shape,value} : () -> memref  =>  memref.global +
+                                                          memref.get_global
+      krnl.entry_point ...                            =>  erased
+
+    krnl ops are unregistered (run dr-opt with -allow-unregistered-dialect);
+    matched by op name.  See PARALLEL_SPMD_SPEC.md (parallel back-end).
+  }];
+
+  let dependentDialects = ["memref::MemRefDialect"];
+  let constructor = "mlir::createLowerKrnlGlobalPass()";
+}
+
 def ConvertParToOMPPass : Pass<"convert-par-to-omp", "mlir::func::FuncOp">
 {
   let summary = "Lower the `par` dialect to OpenMP (faithful whole-kernel SPMD)";
