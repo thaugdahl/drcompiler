@@ -422,6 +422,24 @@ the batch-1 gap (full codegen passes for a fair baseline, barrier elision
 between same-axis layers, or batch > 1) is perf-tuning on top of a proven,
 correct mechanism.
 
+**Batch > 1 throughput on resnet50 — also bandwidth-limited.** Sharding the
+batch axis (consistent owner-computes across all layers) at batch=16 scales only
+**1.00 / 1.36 / 1.39 / 1.36× at 1/8/16/32 threads** (correct, ≤1e-6), plateauing
+at 8 threads.  16-way data parallelism yielding ~1.4× means the bottleneck is
+**memory bandwidth, not the SPMD mechanism**: resnet50 inference is
+memory-bound (large activations, low arithmetic intensity), so parallel cores
+saturate DRAM bandwidth.  The contrast is the evidence — the *compute-bound*
+synthetic kernel scaled **14.69× @ 16t** (§11.8) with the identical machinery.
+(Compounded here by the slow demoted-scalar conv path — no register-block /
+vectorize — and 22 serial layers.)
+
+**Net verdict.** The whole-kernel SPMD transform is **built, materializes a real
+conv net, is numerically exact, and executes in real OpenMP** — all proven.  Its
+*speedup* is workload-bound: near-linear on compute-bound kernels, ~1.4× on
+memory-bound resnet50 inference (an inherent property of memory-bound CNNs, well
+known in the literature).  The lever for a real CNN win is arithmetic intensity
+(register-block/vectorize the convs first, then SPMD), not more parallelism.
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer

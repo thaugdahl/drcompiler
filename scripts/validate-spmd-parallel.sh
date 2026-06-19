@@ -86,8 +86,9 @@ OMP_NUM_THREADS=1 "$W/seq.bin" "$W/seq.logits" 1 >/dev/null 2>&1
 echo "== correctness (spmd vs seq, per thread count) + median time =="
 SREF=""
 for t in $THREADS; do
-  OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores "$W/spmd.bin" "$W/spmd.logits" 7 >"$W/t.$t" 2>/dev/null
-  med=$(sort -n "$W/t.$t" | awk 'NR==4{print;exit}')
+  IT=${ITERS:-7}
+  OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores "$W/spmd.bin" "$W/spmd.logits" "$IT" >"$W/t.$t" 2>/dev/null
+  med=$(sort -n "$W/t.$t" | awk -v n="$IT" 'NR==int((n+1)/2){print;exit}')
   err=$(paste "$W/seq.logits" "$W/spmd.logits" | awk '{d=$1-$2;if(d<0)d=-d;if(d>ma)ma=d;a=($1<0?-$1:$1);if(a>mx)mx=a}END{printf "%.2e",(mx>0?ma/mx:ma)}')
   [[ -z "$SREF" ]] && SREF=$med
   spd=$(awk -v r="$SREF" -v m="$med" 'BEGIN{printf "%.2f", r/m}')
