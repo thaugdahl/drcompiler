@@ -40,7 +40,8 @@ namespace {
 /// par.forall -> omp.wsloop [nowait] { omp.loop_nest (ivs) { <body> omp.yield } }
 /// Constant bounds are materialized as arith index constants in the enclosing
 /// (omp.parallel) block; only the induction variables are remapped.
-static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait) {
+static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait,
+                        IRMapping &m) {
   // Reducing foralls need an omp reduction clause (S6, not yet wired); until
   // then convert-par-to-scf is the reduce reference.  Fail loudly rather than
   // silently dropping the par.reduce.
@@ -58,7 +59,7 @@ static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait) {
   for (size_t d = 0, e = lo.size(); d < e; ++d) {
     lbs.push_back(b.create<arith::ConstantIndexOp>(loc, lo[d]));
     ubs.push_back(forall.isDynamicUpperBound(d)
-                      ? forall.getDynamicUpperBound(d)
+                      ? m.lookupOrDefault(forall.getDynamicUpperBound(d))
                       : b.create<arith::ConstantIndexOp>(loc, hi[d]).getResult());
     steps.push_back(b.create<arith::ConstantIndexOp>(loc, st[d]));
   }
@@ -77,16 +78,20 @@ static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait) {
   SmallVector<Location> ivLocs(lo.size(), loc);
   lnBlk->addArguments(ivTypes, ivLocs);
 
-  IRMapping map;
+  // Clone the body under the region map (so it resolves replicated glue) plus
+  // this loop's IVs; IVs are loop-local so use a copy, not the shared map.
+  IRMapping bodyMap = m;
   for (size_t d = 0, e = lo.size(); d < e; ++d)
-    map.map(forall.getInductionVars()[d], lnBlk->getArgument(d));
+    bodyMap.map(forall.getInductionVars()[d], lnBlk->getArgument(d));
   b.setInsertionPointToStart(lnBlk);
   for (Operation &op : forall.getBody()->without_terminator())
-    b.clone(op, map);
+    b.clone(op, bodyMap);
   b.create<omp::YieldOp>(loc);
 }
 
-/// par.region -> omp.parallel { <forall/barrier sequence> omp.terminator }.
+/// par.region -> omp.parallel { <forall/barrier/single/replicated sequence>
+/// omp.terminator }.  One IRMapping threads the whole region so replicated glue
+/// (cloned at region level) is visible to later foralls/singles.
 static void lowerRegion(par::RegionOp region) {
   OpBuilder b(region);
   Location loc = region.getLoc();
@@ -97,6 +102,7 @@ static void lowerRegion(par::RegionOp region) {
   for (Operation &op : region.getBody()->without_terminator())
     ops.push_back(&op);
 
+  IRMapping m;
   for (size_t i = 0, n = ops.size(); i < n; ++i) {
     b.setInsertionPointToEnd(pblk);
     Operation *op = ops[i];
@@ -105,7 +111,7 @@ static void lowerRegion(par::RegionOp region) {
       // barrier/redistribute follows (an elided edge inside an S2 region).
       bool nowait = (i + 1 < n) &&
                     isa<par::BarrierOp, par::RedistributeOp>(ops[i + 1]);
-      lowerForall(b, forall, nowait);
+      lowerForall(b, forall, nowait, m);
     } else if (isa<par::BarrierOp, par::RedistributeOp>(op)) {
       b.create<omp::BarrierOp>(loc);
     } else if (auto crit = dyn_cast<par::CriticalOp>(op)) {
@@ -116,12 +122,12 @@ static void lowerRegion(par::RegionOp region) {
       Block *sblk = b.createBlock(&single.getRegion());
       OpBuilder::InsertionGuard g(b);
       b.setInsertionPointToStart(sblk);
-      IRMapping cmap;
+      IRMapping cmap = m;
       for (Operation &cop : crit.getBody()->without_terminator())
         b.clone(cop, cmap);
       b.create<omp::TerminatorOp>(loc);
     } else {
-      b.clone(*op); // pass-through (operands dominate the omp.parallel)
+      b.clone(*op, m); // replicated glue: record results in the shared map
     }
   }
 

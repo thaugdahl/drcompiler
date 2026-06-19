@@ -77,3 +77,37 @@ func.func @with_critical(%A: memref<64xf32>, %B: memref<64xf32>) {
   }
   return
 }
+
+// -----
+
+// Inter-band glue (a scalar read of band-1 output + a multiply) is REPLICATED
+// at region level between the foralls -- every worker recomputes it, so the
+// SSA value %f is visible inside the second forall (whole-function widening).
+// CHECK-LABEL: func.func @glue
+// CHECK:         par.region {
+// CHECK:           par.forall([0], [64], [1]) {
+// CHECK:             par.yield
+// CHECK:           }
+// CHECK:           memref.load
+// CHECK:           arith.mulf
+// CHECK:           par.barrier
+// CHECK:           par.forall([0], [64], [1]) {
+func.func @glue(%A: memref<64xf32>, %D: memref<64xf32>) {
+  %c0 = arith.constant 0 : index
+  %two = arith.constant 2.0 : f32
+  %one = arith.constant 1.0 : f32
+  %B = memref.alloc() : memref<64xf32>
+  affine.for %i = 0 to 64 {
+    %a = affine.load %A[%i] : memref<64xf32>
+    %b = arith.addf %a, %one : f32
+    affine.store %b, %B[%i] : memref<64xf32>
+  }
+  %s = memref.load %B[%c0] : memref<64xf32>
+  %f = arith.mulf %s, %two : f32
+  affine.for %i = 0 to 64 {
+    %b = affine.load %B[%i] : memref<64xf32>
+    %d = arith.mulf %b, %f : f32
+    affine.store %d, %D[%i] : memref<64xf32>
+  }
+  return
+}

@@ -965,64 +965,196 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
   return info;
 }
 
-/// Materialize each band into one par.region, par.barrier between bands: a
-/// shardable band (`infos[i]` set) becomes a par.forall over its own output
-/// axis; a non-shardable band (`infos[i]` empty -- imperfect nest / non-affine
-/// body / sequential outer) becomes a par.critical (one worker runs it in
-/// order, sound but serial).  So the whole function materializes, not just the
-/// parallel subset.
-static void materializePerband(ArrayRef<affine::AffineForOp> roots,
-                               ArrayRef<std::optional<PerBandInfo>> infos,
-                               unsigned &nForall, unsigned &nCritical,
-                               unsigned &nBarrier) {
-  affine::AffineForOp first = roots.front();
-  OpBuilder b(first);
-  Location loc = first.getLoc();
+/// May `op` write or free memory?  Such ops can't be replicated across workers
+/// (a concurrent write is a race) -> run single-worker.  Read-only / pure ops
+/// replicate safely (every worker computes the same value, SSA visible to all).
+static bool mayWriteOrFree(Operation *op) {
+  if (isMemoryEffectFree(op))
+    return false;
+  auto iface = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!iface)
+    return true; // unknown effects (unregistered op / call): conservative
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  iface.getEffects(effects);
+  for (auto &e : effects)
+    if (isa<MemoryEffects::Write, MemoryEffects::Free>(e.getEffect()))
+      return true;
+  return false;
+}
+
+/// A span value is used after the band span (so erasing the span would dangle).
+static bool usedAfter(Operation *op, Operation *lastBand, Block &entry) {
+  for (Value r : op->getResults())
+    for (Operation *user : r.getUsers()) {
+      Operation *top = (user->getBlock() == &entry)
+                           ? user
+                           : entry.findAncestorOpInBlock(*user);
+      if (top && lastBand->isBeforeInBlock(top))
+        return true;
+    }
+  return false;
+}
+
+/// Whole-function widening (PARALLEL_SPMD_SPEC.md §2/§7): wrap the band span of
+/// `fn`'s entry block in ONE par.region.  Each span op is dispositioned:
+///   MOVE        — allocs + pure metadata/index ops whose operands all dominate
+///                 the region: hoisted before the team (computed once, shared,
+///                 may escape post-span e.g. the output buffer/view);
+///   FORALL      — a band shardable on its own output axis;
+///   CRITICAL    — a non-shardable band, or write/free glue: one worker, in
+///                 order (effect visible after its implicit barrier);
+///   REPLICATE   — read-only/pure glue depending on in-region data: cloned into
+///                 the region (every worker recomputes it, SSA visible to all).
+/// par.barrier precedes each band.  Bails (no mutation) only if an in-region
+/// value (replicate/critical glue) escapes the span -- it can't (it lives
+/// inside omp.parallel).
+static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
+                                 unsigned &nForall, unsigned &nCritical,
+                                 unsigned &nReplicated, unsigned &nMoved,
+                                 unsigned &nBarrier, unsigned &shardable,
+                                 unsigned &nBands, StringRef &bailReason) {
+  Block &entry = fn.getBody().front();
+  Operation *firstBand = nullptr, *lastBand = nullptr;
+  for (Operation &op : entry)
+    if (isa<affine::AffineForOp>(op)) {
+      if (!firstBand)
+        firstBand = &op;
+      lastBand = &op;
+    }
+  if (!firstBand)
+    return false; // no bands
+
+  SmallVector<Operation *> span;
+  for (Operation *op = firstBand;; op = op->getNextNode()) {
+    span.push_back(op);
+    if (op == lastBand)
+      break;
+  }
+
+  enum class Disp { Move, Forall, Critical, Replicate };
+  // Plan pass: classify; `moved` tracks ops hoisted before the region so a
+  // pure op depending only on moved/pre-span values can be moved too.
+  llvm::SmallPtrSet<Operation *, 32> moved;
+  auto dominatesRegion = [&](Value v) {
+    Operation *d = v.getDefiningOp();
+    if (!d)
+      return true; // block/func argument
+    if (moved.count(d))
+      return true; // hoisted before the region
+    return d->getBlock() == &entry && d->isBeforeInBlock(firstBand);
+  };
+  SmallVector<Disp> disp;
+  disp.reserve(span.size());
+  for (Operation *op : span) {
+    Disp d;
+    if (auto band = dyn_cast<affine::AffineForOp>(op)) {
+      d = perBandShard(band, oracle) ? Disp::Forall : Disp::Critical;
+    } else {
+      bool operandsDominate = llvm::all_of(
+          op->getOperands(), [&](Value v) { return dominatesRegion(v); });
+      bool isAlloc = isa<memref::AllocOp, memref::AllocaOp>(op);
+      if ((isAlloc || isMemoryEffectFree(op)) && operandsDominate) {
+        moved.insert(op); // hoist before the team (computed once, shared)
+        d = Disp::Move;
+      } else if (isAlloc) {
+        // A shared buffer whose (dynamic) size depends on an in-region value
+        // can't be hoisted, and replicating it would make it thread-private
+        // (unsound for a shared activation).  Bail.
+        bailReason = "an alloc size depends on an in-region value";
+        return false;
+      } else if (mayWriteOrFree(op)) {
+        d = Disp::Critical;
+      } else {
+        d = Disp::Replicate;
+      }
+    }
+    // In-region ops (replicate / critical glue) produce values that live inside
+    // omp.parallel -> they must not be used after the span.  Bands have no
+    // results; moved ops may escape freely.
+    if ((d == Disp::Replicate || (d == Disp::Critical && !isa<affine::AffineForOp>(op))) &&
+        usedAfter(op, lastBand, entry)) {
+      bailReason = "an in-region glue value is used after the band span";
+      return false;
+    }
+    disp.push_back(d);
+  }
+
+  OpBuilder b(firstBand);
+  Location loc = firstBand->getLoc();
   auto regionOp = b.create<par::RegionOp>(loc);
   Block *rblk = b.createBlock(&regionOp.getRegion());
+  IRMapping map;
 
-  for (unsigned i = 0, n = roots.size(); i < n; ++i) {
+  auto cloneCritical = [&](Operation *op) {
     b.setInsertionPointToEnd(rblk);
-    if (i > 0) {
-      b.create<par::BarrierOp>(loc); // consumer reads the full producer output
-      ++nBarrier;
-    }
-    if (infos[i]) {
-      const PerBandInfo &info = *infos[i];
-      int64_t ubEntry = info.dynUb ? ShapedType::kDynamic : info.ubConst;
+    auto crit = b.create<par::CriticalOp>(loc);
+    b.createBlock(&crit.getRegion());
+    b.setInsertionPointToStart(crit.getBody());
+    b.clone(*op, map);
+    b.setInsertionPointToEnd(crit.getBody());
+    b.create<par::YieldOp>(loc, ValueRange{});
+    ++nCritical;
+  };
+
+  for (size_t i = 0, e = span.size(); i < e; ++i) {
+    Operation *op = span[i];
+    switch (disp[i]) {
+    case Disp::Move:
+      op->moveBefore(regionOp); // keep identity; dominates region + post-span
+      ++nMoved;
+      break;
+    case Disp::Forall: {
+      ++nBands;
+      auto info = perBandShard(cast<affine::AffineForOp>(op), oracle);
+      ++shardable;
+      b.setInsertionPointToEnd(rblk);
+      if (nForall + nCritical > 0) {
+        b.create<par::BarrierOp>(loc);
+        ++nBarrier;
+      }
+      int64_t ubEntry = info->dynUb ? ShapedType::kDynamic : info->ubConst;
       SmallVector<Value> dynOps;
-      if (info.dynUb)
-        dynOps.push_back(info.dynUb);
+      if (info->dynUb)
+        dynOps.push_back(map.lookupOrDefault(info->dynUb));
       auto forall = b.create<par::ForallOp>(
-          loc, TypeRange{}, b.getDenseI64ArrayAttr({info.lb}),
-          b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({info.step}),
-          dynOps, ValueRange{});
+          loc, TypeRange{}, b.getDenseI64ArrayAttr({info->lb}),
+          b.getDenseI64ArrayAttr({ubEntry}),
+          b.getDenseI64ArrayAttr({info->step}), dynOps, ValueRange{});
       Block *fblk = b.createBlock(&forall.getRegion());
       fblk->addArgument(b.getIndexType(), loc);
-      Value iv = fblk->getArgument(0);
+      map.map(info->nest.front().getInductionVar(), fblk->getArgument(0));
       b.setInsertionPointToStart(fblk);
-      ArrayRef<affine::AffineForOp> band = info.nest;
-      affine::AffineForOp shardLoop = band.front();
-      IRMapping map;
-      map.map(shardLoop.getInductionVar(), iv);
-      buildSeq(b, band, /*idx=*/1, map);
+      buildSeq(b, info->nest, /*idx=*/1, map);
       b.create<par::YieldOp>(loc, ValueRange{});
       ++nForall;
-    } else {
-      // Single-worker fallback: clone the whole band nest as-is (kept affine).
-      auto crit = b.create<par::CriticalOp>(loc);
-      Block *cblk = b.createBlock(&crit.getRegion());
-      b.setInsertionPointToStart(cblk);
-      affine::AffineForOp bandRoot = roots[i];
-      b.clone(*bandRoot.getOperation());
-      b.create<par::YieldOp>(loc, ValueRange{});
-      ++nCritical;
+      break;
+    }
+    case Disp::Critical:
+      if (isa<affine::AffineForOp>(op)) {
+        ++nBands;
+        b.setInsertionPointToEnd(rblk);
+        if (nForall + nCritical > 0) {
+          b.create<par::BarrierOp>(loc);
+          ++nBarrier;
+        }
+      }
+      cloneCritical(op);
+      break;
+    case Disp::Replicate:
+      b.setInsertionPointToEnd(rblk);
+      b.clone(*op, map);
+      ++nReplicated;
+      break;
     }
   }
   b.setInsertionPointToEnd(rblk);
   b.create<par::YieldOp>(loc, ValueRange{});
-  for (affine::AffineForOp r : roots)
-    r.erase();
+  // Erase the originals we cloned into the region (everything but moved ops),
+  // in reverse program order.
+  for (size_t i = span.size(); i-- > 0;)
+    if (disp[i] != Disp::Move)
+      span[i]->erase();
+  return true;
 }
 
 /// S0 shard-axis selection: the operand-agnostic bound id (shardAxisId) covering
@@ -1279,46 +1411,25 @@ struct DrParBubblesPass
       });
     }
 
-    // S7 — batch-1 within-sample per-band sharding.
+    // S7 — batch-1 within-sample per-band sharding (whole-function widening).
     if (parSpmdPerband) {
       module.walk([&](func::FuncOp fn) {
         if (fn.isExternal())
           return;
-        Block &entry = fn.getBody().front();
-        SmallVector<affine::AffineForOp, 16> roots;
-        for (Operation &op : entry)
-          if (auto f = dyn_cast<affine::AffineForOp>(&op))
-            roots.push_back(f);
-        if (roots.empty())
-          return;
-
-        // Each band shards its own outermost parallel loop where possible; a
-        // non-shardable band falls back to par.critical (single worker), so the
-        // whole function materializes into one team.
-        SmallVector<std::optional<PerBandInfo>, 16> infos;
-        unsigned shardable = 0;
-        for (affine::AffineForOp r : roots) {
-          auto info = perBandShard(r, oracle);
-          if (info)
-            ++shardable;
-          infos.push_back(std::move(info));
-        }
-        if (!hoistInterBandGlue(roots)) {
-          fn.emitRemark("par-spmd-perband: not materialized (non-hoistable op "
-                        "between bands)");
+        unsigned nForall = 0, nCritical = 0, nReplicated = 0, nMoved = 0,
+                 nBarrier = 0, shardable = 0, nBands = 0;
+        StringRef bail;
+        if (!materializeWholeFunc(fn, oracle, nForall, nCritical, nReplicated,
+                                  nMoved, nBarrier, shardable, nBands, bail)) {
+          if (!bail.empty())
+            fn.emitRemark("par-spmd-perband: not materialized (") << bail << ")";
           return;
         }
-        for (affine::AffineForOp r : roots)
-          if (!nestOperandsDominate(r, roots.front().getOperation())) {
-            fn.emitRemark("par-spmd-perband: not materialized (inter-band value "
-                          "dependence)");
-            return;
-          }
-        unsigned nForall = 0, nCritical = 0, nBarrier = 0;
-        materializePerband(roots, infos, nForall, nCritical, nBarrier);
         fn.emitRemark("par-spmd-perband: materialized foralls=")
-            << nForall << " critical=" << nCritical << " barriers=" << nBarrier
-            << " (" << roots.size() << " bands, " << shardable << " parallel)";
+            << nForall << " critical=" << nCritical
+            << " replicated=" << nReplicated << " moved=" << nMoved
+            << " barriers=" << nBarrier << " (" << nBands << " bands, "
+            << shardable << " parallel)";
       });
     }
   }
