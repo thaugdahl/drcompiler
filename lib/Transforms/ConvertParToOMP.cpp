@@ -108,6 +108,18 @@ static void lowerRegion(par::RegionOp region) {
       lowerForall(b, forall, nowait);
     } else if (isa<par::BarrierOp, par::RedistributeOp>(op)) {
       b.create<omp::BarrierOp>(loc);
+    } else if (auto crit = dyn_cast<par::CriticalOp>(op)) {
+      // Single worker runs the slab in order (implicit end barrier).
+      auto single = b.create<omp::SingleOp>(
+          loc, ValueRange{}, ValueRange{}, ValueRange{}, ArrayAttr{},
+          UnitAttr{}, ValueRange{}, ArrayAttr{}, UnitAttr{});
+      Block *sblk = b.createBlock(&single.getRegion());
+      OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(sblk);
+      IRMapping cmap;
+      for (Operation &cop : crit.getBody()->without_terminator())
+        b.clone(cop, cmap);
+      b.create<omp::TerminatorOp>(loc);
     } else {
       b.clone(*op); // pass-through (operands dominate the omp.parallel)
     }

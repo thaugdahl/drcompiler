@@ -965,10 +965,15 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
   return info;
 }
 
-/// Materialize each band's own-axis shard into one par.region, par.barrier
-/// between bands.
+/// Materialize each band into one par.region, par.barrier between bands: a
+/// shardable band (`infos[i]` set) becomes a par.forall over its own output
+/// axis; a non-shardable band (`infos[i]` empty -- imperfect nest / non-affine
+/// body / sequential outer) becomes a par.critical (one worker runs it in
+/// order, sound but serial).  So the whole function materializes, not just the
+/// parallel subset.
 static void materializePerband(ArrayRef<affine::AffineForOp> roots,
-                               ArrayRef<PerBandInfo> infos, unsigned &nForall,
+                               ArrayRef<std::optional<PerBandInfo>> infos,
+                               unsigned &nForall, unsigned &nCritical,
                                unsigned &nBarrier) {
   affine::AffineForOp first = roots.front();
   OpBuilder b(first);
@@ -982,26 +987,37 @@ static void materializePerband(ArrayRef<affine::AffineForOp> roots,
       b.create<par::BarrierOp>(loc); // consumer reads the full producer output
       ++nBarrier;
     }
-    const PerBandInfo &info = infos[i];
-    int64_t ubEntry = info.dynUb ? ShapedType::kDynamic : info.ubConst;
-    SmallVector<Value> dynOps;
-    if (info.dynUb)
-      dynOps.push_back(info.dynUb);
-    auto forall = b.create<par::ForallOp>(
-        loc, TypeRange{}, b.getDenseI64ArrayAttr({info.lb}),
-        b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({info.step}),
-        dynOps, ValueRange{});
-    Block *fblk = b.createBlock(&forall.getRegion());
-    fblk->addArgument(b.getIndexType(), loc);
-    Value iv = fblk->getArgument(0);
-    b.setInsertionPointToStart(fblk);
-    ArrayRef<affine::AffineForOp> band = info.nest;
-    affine::AffineForOp shardLoop = band.front();
-    IRMapping map;
-    map.map(shardLoop.getInductionVar(), iv);
-    buildSeq(b, band, /*idx=*/1, map);
-    b.create<par::YieldOp>(loc, ValueRange{});
-    ++nForall;
+    if (infos[i]) {
+      const PerBandInfo &info = *infos[i];
+      int64_t ubEntry = info.dynUb ? ShapedType::kDynamic : info.ubConst;
+      SmallVector<Value> dynOps;
+      if (info.dynUb)
+        dynOps.push_back(info.dynUb);
+      auto forall = b.create<par::ForallOp>(
+          loc, TypeRange{}, b.getDenseI64ArrayAttr({info.lb}),
+          b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({info.step}),
+          dynOps, ValueRange{});
+      Block *fblk = b.createBlock(&forall.getRegion());
+      fblk->addArgument(b.getIndexType(), loc);
+      Value iv = fblk->getArgument(0);
+      b.setInsertionPointToStart(fblk);
+      ArrayRef<affine::AffineForOp> band = info.nest;
+      affine::AffineForOp shardLoop = band.front();
+      IRMapping map;
+      map.map(shardLoop.getInductionVar(), iv);
+      buildSeq(b, band, /*idx=*/1, map);
+      b.create<par::YieldOp>(loc, ValueRange{});
+      ++nForall;
+    } else {
+      // Single-worker fallback: clone the whole band nest as-is (kept affine).
+      auto crit = b.create<par::CriticalOp>(loc);
+      Block *cblk = b.createBlock(&crit.getRegion());
+      b.setInsertionPointToStart(cblk);
+      affine::AffineForOp bandRoot = roots[i];
+      b.clone(*bandRoot.getOperation());
+      b.create<par::YieldOp>(loc, ValueRange{});
+      ++nCritical;
+    }
   }
   b.setInsertionPointToEnd(rblk);
   b.create<par::YieldOp>(loc, ValueRange{});
@@ -1276,22 +1292,16 @@ struct DrParBubblesPass
         if (roots.empty())
           return;
 
-        // Each band must shard its own outermost parallel loop.  All-or-nothing
-        // for now (the count reports how close a real kernel is); a
-        // non-shardable band is the documented next step (par.critical).
-        SmallVector<PerBandInfo, 16> infos;
+        // Each band shards its own outermost parallel loop where possible; a
+        // non-shardable band falls back to par.critical (single worker), so the
+        // whole function materializes into one team.
+        SmallVector<std::optional<PerBandInfo>, 16> infos;
         unsigned shardable = 0;
-        for (affine::AffineForOp r : roots)
-          if (auto info = perBandShard(r, oracle)) {
-            infos.push_back(std::move(*info));
+        for (affine::AffineForOp r : roots) {
+          auto info = perBandShard(r, oracle);
+          if (info)
             ++shardable;
-          }
-        if (shardable != roots.size()) {
-          fn.emitRemark("par-spmd-perband: not materialized (")
-              << shardable << "/" << roots.size()
-              << " top-level bands are materializable parallel-outer axes; "
-                 "need all)";
-          return;
+          infos.push_back(std::move(info));
         }
         if (!hoistInterBandGlue(roots)) {
           fn.emitRemark("par-spmd-perband: not materialized (non-hoistable op "
@@ -1304,11 +1314,11 @@ struct DrParBubblesPass
                           "dependence)");
             return;
           }
-        unsigned nForall = 0, nBarrier = 0;
-        materializePerband(roots, infos, nForall, nBarrier);
+        unsigned nForall = 0, nCritical = 0, nBarrier = 0;
+        materializePerband(roots, infos, nForall, nCritical, nBarrier);
         fn.emitRemark("par-spmd-perband: materialized foralls=")
-            << nForall << " barriers=" << nBarrier << " (" << roots.size()
-            << " bands)";
+            << nForall << " critical=" << nCritical << " barriers=" << nBarrier
+            << " (" << roots.size() << " bands, " << shardable << " parallel)";
       });
     }
   }

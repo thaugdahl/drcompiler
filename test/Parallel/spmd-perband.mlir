@@ -48,3 +48,32 @@ func.func @perlayer(%A: memref<64x64xf32>, %D: memref<32x64xf32>) {
   }
   return
 }
+
+// -----
+
+// A non-shardable band (outer loop carries a dependence: B[i] <- B[i-1]) falls
+// back to par.critical (single worker) so the function still materializes into
+// one team; the parallel band before it is a par.forall.
+// CHECK-LABEL: func.func @with_critical
+// CHECK:         par.region {
+// CHECK:           par.forall([0], [64], [1]) {
+// CHECK:           par.barrier
+// CHECK:           par.critical {
+// CHECK:             affine.for %{{.*}} = 1 to 64 {
+// CHECK:             par.yield
+// CHECK:           par.yield
+// CHECK:         }
+func.func @with_critical(%A: memref<64xf32>, %B: memref<64xf32>) {
+  %one = arith.constant 1.0 : f32
+  affine.for %i = 0 to 64 {
+    %a = affine.load %A[%i] : memref<64xf32>
+    %b = arith.addf %a, %one : f32
+    affine.store %b, %B[%i] : memref<64xf32>
+  }
+  affine.for %i = 1 to 64 {
+    %p = affine.load %B[%i - 1] : memref<64xf32>
+    %v = arith.addf %p, %one : f32
+    affine.store %v, %B[%i] : memref<64xf32>
+  }
+  return
+}
