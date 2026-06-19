@@ -75,8 +75,12 @@ build_cfg(){ # $1=name  $2=extra dr-opt pipeline (or empty)
 }
 echo "== seq reference (krnl-free, no SPMD) =="
 build_cfg seq "builtin.module(lower-krnl-global)"
-echo "== spmd (lower-krnl-global + par-spmd-perband + par->omp) =="
-build_cfg spmd "builtin.module(lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
+echo "== spmd (perfect reductions + lower-krnl-global + par-spmd-perband + par->omp) =="
+# dr-affine-loop-distribute + dr-scalar-reduction-demote PERFECT the conv/gemm
+# reduction bands (fission init out, single-level memref-accumulator) so they
+# materialize as par.forall (sharded) instead of par.critical (serial) -- the
+# heavy convs become parallel.  Both passes are exact (semantics-preserving).
+build_cfg spmd "builtin.module(func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
 
 OMP_NUM_THREADS=1 "$W/seq.bin" "$W/seq.logits" 1 >/dev/null 2>&1
 echo "== correctness (spmd vs seq, per thread count) + median time =="

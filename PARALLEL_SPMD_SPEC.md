@@ -392,6 +392,36 @@ onnx-mlir's monolithic pass, then host `--convert-openmp-to-llvm` + libomp), or
 to emit through onnx-mlir's native parallel path — a separate integration.
 The mechanism + materialization are proven; only the parallel back-end remains.
 
+## 11.11 Parallel back-end + batch-1 speedup (2026-06-19)
+
+`lower-krnl-global` (commit f751727) routes around onnx-mlir's krnl-to-llvm:
+`krnl.global → memref.global`, `krnl.entry_point` erased, then HOST mlir-opt
+lowers the whole module to LLVM with omp intact (`--convert-openmp-to-llvm`),
+`mlir-translate` emits real `__kmpc_fork`, `clang -fopenmp` links libomp, entry
+via a hand-written `_mlir_ciface_main_graph` harness.
+`scripts/validate-spmd-parallel.sh`.
+
+Per-band shard-axis fix (commit 6cbfb72): shard the outermost parallel loop with
+**real extent** (skip the degenerate batch axis at batch=1; the conv
+output-channel / spatial axes, 64–2048).
+
+**resnet50 batch-1, parallel, correct** (`norm_rel_err ≤ 1e-6` at every thread
+count): with `dr-affine-loop-distribute` + `dr-scalar-reduction-demote`
+perfecting the conv reduction bands (82→148 forall, 55→22 critical, 87%
+parallel), the OpenMP run scales **1.00 / 1.18 / 1.28 / 1.33 / 1.36×** at
+1/2/4/8/16 threads.
+
+**Honest limit.** The speedup is modest and roughly **break-even vs plain
+sequential**: spmd-1t = 3.31 s > plain-seq ≈ 2.2 s, because (a) `demote` ran
+*without* the `register-block` + `promote` that normally follow it (slow
+memref-accumulator reductions), (b) **169 per-layer barriers**, (c) the convs
+are memory-bound.  Batch-1 latency is the inherent hard case (limited
+within-sample parallelism + barrier-heavy); **batch ≥ cores THROUGHPUT is where
+SPMD wins** — the synthetic near-linear result (14.69× @ 16t, §11.8).  Closing
+the batch-1 gap (full codegen passes for a fair baseline, barrier elision
+between same-axis layers, or batch > 1) is perf-tuning on top of a proven,
+correct mechanism.
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer
