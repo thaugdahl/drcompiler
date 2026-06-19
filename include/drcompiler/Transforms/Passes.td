@@ -861,7 +861,8 @@ def LowerKrnlGlobalPass : Pass<"lower-krnl-global", "mlir::ModuleOp">
     matched by op name.  See PARALLEL_SPMD_SPEC.md (parallel back-end).
   }];
 
-  let dependentDialects = ["memref::MemRefDialect"];
+  let dependentDialects = ["memref::MemRefDialect", "scf::SCFDialect",
+                           "arith::ArithDialect"];
   let constructor = "mlir::createLowerKrnlGlobalPass()";
 }
 
