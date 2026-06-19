@@ -939,30 +939,84 @@ materializeSpmd(ArrayRef<affine::AffineForOp> roots,
 /// materializable parallel axis.
 struct PerBandInfo {
   SmallVector<affine::AffineForOp, 4> nest;
+  unsigned shardIdx; // which loop in the nest is the shard axis
   int64_t lb, step, ubConst;
   Value dynUb;
 };
+
+/// A loop runs <=1 iteration (e.g. the batch axis at batch=1): sharding it
+/// gives no parallelism, so the shard axis must look past it.
+static bool degenerateExtent(affine::AffineForOp l) {
+  return l.hasConstantLowerBound() && l.hasConstantUpperBound() &&
+         (l.getConstantUpperBound() - l.getConstantLowerBound()) <=
+             l.getStepAsInt();
+}
 
 static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
                                                const ParAliasOracle &oracle) {
   PerBandInfo info;
   affine::getPerfectlyNestedLoops(info.nest, root);
-  affine::AffineForOp outer = info.nest.front();
-  if (classifyLoop(outer.getOperation(), oracle) != AxisKind::Parallel)
+  // Shard the OUTERMOST parallel loop with real extent (>1).  Degenerate outer
+  // loops (e.g. the batch axis at batch=1) are skipped -- they nest inside the
+  // forall (a trivial interchange, sound because they run once).  A
+  // non-degenerate loop that ISN'T the shard axis above it would block the
+  // interchange, so bail then.
+  unsigned n = info.nest.size(), d = 0;
+  for (; d < n; ++d) {
+    affine::AffineForOp l = info.nest[d];
+    bool par = classifyLoop(l.getOperation(), oracle) == AxisKind::Parallel;
+    if (par && !degenerateExtent(l))
+      break; // shard here
+    if (!degenerateExtent(l))
+      return std::nullopt; // non-degenerate, non-shardable loop outside: bail
+  }
+  if (d == n)
+    return std::nullopt; // no parallel loop with real extent
+  info.shardIdx = d;
+  affine::AffineForOp shard = info.nest[d];
+  if (!shard.hasConstantLowerBound())
     return std::nullopt;
-  if (!outer.hasConstantLowerBound())
-    return std::nullopt;
-  info.lb = outer.getConstantLowerBound();
-  info.step = outer.getStepAsInt();
+  info.lb = shard.getConstantLowerBound();
+  info.step = shard.getStepAsInt();
   info.dynUb = nullptr;
   info.ubConst = 0;
-  if (outer.hasConstantUpperBound())
-    info.ubConst = outer.getConstantUpperBound();
-  else if (!(info.dynUb = simpleDynUb(outer)))
+  if (shard.hasConstantUpperBound())
+    info.ubConst = shard.getConstantUpperBound();
+  else if (d == 0 && (info.dynUb = simpleDynUb(shard)))
+    ; // dynamic extent only supported on the outermost axis
+  else
     return std::nullopt;
   if (!bandMaterializable(info.nest, /*dynOuterUb=*/info.dynUb != nullptr))
     return std::nullopt;
   return info;
+}
+
+/// Build the band's loops as scf.for, SKIPPING the shard loop (its IV is mapped
+/// to the par.forall arg), then clone the innermost body.  The skipped shard
+/// loop becomes the outer par.forall; degenerate loops above it nest inside
+/// (sound interchange).
+static void buildSeqSkip(OpBuilder &b, ArrayRef<affine::AffineForOp> band,
+                         unsigned idx, unsigned shardIdx, IRMapping &map) {
+  if (idx == band.size()) {
+    affine::AffineForOp inner = band.back();
+    for (Operation &op : inner.getBody()->without_terminator())
+      cloneBodyOp(b, &op, map);
+    return;
+  }
+  if (idx == shardIdx) {
+    buildSeqSkip(b, band, idx + 1, shardIdx, map);
+    return;
+  }
+  affine::AffineForOp l = band[idx];
+  Location loc = l.getLoc();
+  Value lb = b.create<arith::ConstantIndexOp>(loc, l.getConstantLowerBound());
+  Value ub = b.create<arith::ConstantIndexOp>(loc, l.getConstantUpperBound());
+  Value st = b.create<arith::ConstantIndexOp>(loc, l.getStepAsInt());
+  auto forOp = b.create<scf::ForOp>(loc, lb, ub, st);
+  map.map(l.getInductionVar(), forOp.getInductionVar());
+  OpBuilder::InsertionGuard g(b);
+  b.setInsertionPointToStart(forOp.getBody());
+  buildSeqSkip(b, band, idx + 1, shardIdx, map);
 }
 
 /// May `op` write or free memory?  Such ops can't be replicated across workers
@@ -1122,9 +1176,10 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
           b.getDenseI64ArrayAttr({info->step}), dynOps, ValueRange{});
       Block *fblk = b.createBlock(&forall.getRegion());
       fblk->addArgument(b.getIndexType(), loc);
-      map.map(info->nest.front().getInductionVar(), fblk->getArgument(0));
+      map.map(info->nest[info->shardIdx].getInductionVar(),
+              fblk->getArgument(0));
       b.setInsertionPointToStart(fblk);
-      buildSeq(b, info->nest, /*idx=*/1, map);
+      buildSeqSkip(b, info->nest, /*idx=*/0, info->shardIdx, map);
       b.create<par::YieldOp>(loc, ValueRange{});
       ++nForall;
       break;
