@@ -346,13 +346,38 @@ real-ONNX-shaped kernels:
   mismatches (`scripts/validate-spmd-dyn.sh`).
 
 **S2 now expresses the real-ONNX batch-throughput shape** (interleaved scratch
-allocs + runtime batch). **Residual for full resnet50** (all need supervision /
-infra, none done): (a) **off-axis (reduction) bands** inside the region — S2 is
-still whole-function all-or-nothing, real nets interleave reduction layers that
-must shard the axis sequentially-within-shard or hit §6 reduce; (b) the
-**krnl.global weights + onnx execution runtime** (200 MB dump, dr-opt needs
-`-allow-unregistered-dialect`, no run harness); (c) **proving per-layer batch
-dims equal** (distinct `memref.dim` SSA values — currently bails as off-axis).
+allocs + runtime batch).
+
+## 11.10 Batch-1 within-sample SPMD — resnet50 MATERIALIZES (2026-06-19)
+
+The batch-1 latency path (user-directed).  At batch=1 the batch axis is
+degenerate, so each layer shards a WITHIN-SAMPLE axis (its own output:
+oc/spatial/output-neuron); the inner reduction (ic/kernel/k) stays within-shard
+— no cross-shard reduce for conv/pool/FC.  `par.reduce` (commit 6ecb336) built
+for the genuine reductions (GPT softmax).
+
+- **`par-spmd-perband` + whole-function widening**: ONE `par.region` over the
+  whole function; each band → `par.forall` (own output axis, dynamic extent ok)
+  or `par.critical` (non-shardable, single worker); allocs + pure metadata
+  **hoisted** (shared); read-only glue **replicated** (every worker recomputes,
+  SSA visible); write/free glue → `par.critical`; `par.barrier` between bands.
+- **onnx-mlir-lean image built** here (the krnl→llvm back-half + `libcruntime`);
+  harness proven live (mnist codegen 6.5×, 2e-7).
+- **Static batch-1 is the unlock**: dynamic-batch (`?`) resnet50 computes buffer
+  sizes from *loaded* shape values → data-dependent allocs the widener soundly
+  refuses (bails).  Compiling with `--shapeInformation=0:1x3x224x224` (the
+  latency case) drops that glue.  `scripts/spmd-resnet50-static.sh`.
+- **RESULT** (static batch-1 resnet50, 137 top-level bands): materialized
+  **foralls=82, critical=55, moved=207, barriers=136** (82 parallel = 60%); and
+  `convert-par-to-omp` lowers it to **ONE `omp.parallel`** with `omp.wsloop=82`,
+  `omp.single=55`, `omp.barrier=136`, **par leftover=0** — the whole-kernel SPMD
+  team form on a real net, structurally valid end-to-end from affine.
+
+**Remaining: the numeric run.** The harness codegen pipeline (`dr-opt` →
+`--lower-affine` → `convert-krnl-to-llvm` → translate → clang) has no OpenMP
+lowering; an SPMD config must add `convert-par-to-omp` to the dr-opt step and
+`--convert-openmp-to-llvm` + `-lomp` to the back half, composed with onnx-mlir's
+`convert-krnl-to-llvm` (ordering TBD).  Then norm-rel-err vs `none` is the gate.
 
 ## 11. Open questions / honest limits
 
