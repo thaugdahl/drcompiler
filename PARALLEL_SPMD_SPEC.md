@@ -373,11 +373,24 @@ for the genuine reductions (GPT softmax).
   `omp.single=55`, `omp.barrier=136`, **par leftover=0** — the whole-kernel SPMD
   team form on a real net, structurally valid end-to-end from affine.
 
-**Remaining: the numeric run.** The harness codegen pipeline (`dr-opt` →
-`--lower-affine` → `convert-krnl-to-llvm` → translate → clang) has no OpenMP
-lowering; an SPMD config must add `convert-par-to-omp` to the dr-opt step and
-`--convert-openmp-to-llvm` + `-lomp` to the back half, composed with onnx-mlir's
-`convert-krnl-to-llvm` (ordering TBD).  Then norm-rel-err vs `none` is the gate.
+**NUMERIC CORRECTNESS — VALIDATED** (`scripts/validate-spmd-onnx.sh`):
+the SPMD-materialized model run end-to-end through the onnx-mlir toolchain is
+**byte-identical** to the untransformed reference —
+- **mnist**: `norm_rel_err = 0.000e+00` (n=10);
+- **resnet50-v2-7 batch-1**: `norm_rel_err = 0.000e+00` (n=1000), exercising the
+  full widened structure (82 forall + 55 critical + 207 hoisted + 136 barriers).
+The whole-function SPMD transform is numerically exact on a real conv net.
+
+**Parallel (OpenMP) execution — blocked by onnx-mlir's lowering, not the
+transform.** `onnx-mlir-opt --convert-krnl-to-llvm` rejects any external
+parallel construct (`failed to legalize omp.* / scf.parallel` — it expects
+sequential `scf.for`; onnx-mlir parallelizes via its own `--parallel`).  So the
+correctness gate lowers `par.forall` to **sequential** cf (par→scf →
+`--convert-scf-to-cf`) before krnl-to-llvm.  Actual parallel execution needs a
+**krnl-free** lowering path (lower `krnl.global` → `llvm.mlir.global` without
+onnx-mlir's monolithic pass, then host `--convert-openmp-to-llvm` + libomp), or
+to emit through onnx-mlir's native parallel path — a separate integration.
+The mechanism + materialization are proven; only the parallel back-end remains.
 
 ## 11. Open questions / honest limits
 
