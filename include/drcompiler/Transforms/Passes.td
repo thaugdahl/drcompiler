@@ -792,6 +792,15 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
            "each inter-band edge for barrier elision (S1) -- ELIDE / HALO / "
            "REDISTRIBUTE / BARRIER. Emits par-shard / par-edge / par-spmd "
            "remarks.  See PARALLEL_SPMD_SPEC.md.">,
+    Option<"parSpmd", "par-spmd", "bool", "false",
+           "Materialize whole-function SPMD (S2): widen every top-level "
+           "shard-axis band into ONE par.region, hoist one par.forall over the "
+           "shard axis (maximal ELIDE-connected runs share a forall, "
+           "owner-computes; inner loops sink as scf.for), and place "
+           "par.barrier / par.redistribute only at non-elided edges. Constant "
+           "shard extent only; bails (with a remark) on a dynamic axis, an "
+           "off-axis / non-materializable / non-contiguous band, or an "
+           "inter-band value dependence.  See PARALLEL_SPMD_SPEC.md §7 (S2).">,
   ];
 
   let dependentDialects = [

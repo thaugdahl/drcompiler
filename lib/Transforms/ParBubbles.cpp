@@ -737,6 +737,162 @@ static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
 }
 
 //===----------------------------------------------------------------------===//
+// S2 — whole-function widening + materialization
+// (PARALLEL_SPMD_SPEC.md §7).  Widen every top-level shard-axis band into ONE
+// par.region; hoist one par.forall over the shard axis per maximal
+// ELIDE-connected run (owner-computes: bodies sequenced, inner loops sunk as
+// scf.for); a non-elided edge becomes par.redistribute (IV remap) or
+// par.barrier.  IR-mutating; default off; constant shard extent only.
+//===----------------------------------------------------------------------===//
+
+/// The perfect nest of `root` if it is an S2 shard band: outermost loop is the
+/// (parallel) shard axis with the given constant bounds, body materializable.
+/// Empty otherwise.
+static SmallVector<affine::AffineForOp, 4>
+spmdBand(affine::AffineForOp root, const ParAliasOracle &oracle, int64_t lb,
+         int64_t ub, int64_t step) {
+  SmallVector<affine::AffineForOp, 4> band;
+  affine::getPerfectlyNestedLoops(band, root);
+  affine::AffineForOp s = band.front();
+  if (classifyLoop(s.getOperation(), oracle) != AxisKind::Parallel)
+    return {};
+  if (!s.hasConstantLowerBound() || !s.hasConstantUpperBound())
+    return {};
+  if (s.getConstantLowerBound() != lb || s.getConstantUpperBound() != ub ||
+      s.getStepAsInt() != step)
+    return {};
+  if (!bandMaterializable(band))
+    return {};
+  return band;
+}
+
+/// Every value the whole nest reads from outside still defined before `anchor`
+/// (so it dominates a region inserted there).  Walks the FULL nest (unlike the
+/// M3 depth-1 bodyOperandsDominate).
+static bool nestOperandsDominate(affine::AffineForOp root, Operation *anchor) {
+  bool ok = true;
+  root.walk([&](Operation *op) {
+    for (Value v : op->getOperands()) {
+      if (isa<BlockArgument>(v))
+        continue; // IV (remapped) / enclosing-scope arg (dominates)
+      Operation *def = v.getDefiningOp();
+      if (!def || root->isAncestor(def))
+        continue; // defined inside the nest
+      if (def->getBlock() == anchor->getBlock() &&
+          !def->isBeforeInBlock(anchor))
+        ok = false;
+    }
+  });
+  return ok;
+}
+
+/// Materialize a contiguous run of shard-axis bands (`roots`, perfect nests
+/// `nests`) into ONE par.region over the shard space [lb,ub,step).  Maximal
+/// ELIDE-connected sub-runs share a par.forall (bodies sequenced); a non-elided
+/// boundary becomes par.redistribute (IV remap) or par.barrier.
+static void
+materializeSpmd(ArrayRef<affine::AffineForOp> roots,
+                ArrayRef<SmallVector<affine::AffineForOp, 4>> nests, int64_t lb,
+                int64_t ub, int64_t step, unsigned &nForall, unsigned &nBarrier,
+                unsigned &nRedist) {
+  affine::AffineForOp first = roots.front();
+  OpBuilder b(first);
+  Location loc = first.getLoc();
+  auto regionOp = b.create<par::RegionOp>(loc);
+  Block *rblk = b.createBlock(&regionOp.getRegion());
+
+  unsigned idx = 0, n = roots.size();
+  affine::AffineForOp prevLast = nullptr;
+  while (idx < n) {
+    // Grow a maximal ELIDE-connected sub-run.
+    unsigned k = idx + 1;
+    while (k < n && classifyEdge(roots[k - 1], roots[k]) == EdgeKind::Elide)
+      ++k;
+
+    // Sync at the boundary from the previous sub-run (a non-elided edge).
+    b.setInsertionPointToEnd(rblk);
+    if (prevLast) {
+      EdgeKind e = classifyEdge(prevLast, roots[idx]);
+      std::optional<RedistDesc> rd;
+      if (e == EdgeKind::Redistribute)
+        rd = findReshuffle({prevLast}, {roots[idx]});
+      if (rd) {
+        b.create<par::RedistributeOp>(loc, rd->buf, b.getStringAttr(rd->from),
+                                      b.getStringAttr(rd->to));
+        ++nRedist;
+      } else { // Halo / Barrier, or a Redistribute with no clean 1-D remap
+        b.create<par::BarrierOp>(loc);
+        ++nBarrier;
+      }
+    }
+
+    // One forall over the shard axis for this sub-run.
+    b.setInsertionPointToEnd(rblk);
+    auto forall = b.create<par::ForallOp>(
+        loc, b.getDenseI64ArrayAttr({lb}), b.getDenseI64ArrayAttr({ub}),
+        b.getDenseI64ArrayAttr({step}));
+    Block *fblk = b.createBlock(&forall.getRegion());
+    fblk->addArgument(b.getIndexType(), loc);
+    Value iv = fblk->getArgument(0);
+    b.setInsertionPointToStart(fblk);
+    for (unsigned i = idx; i < k; ++i) {
+      ArrayRef<affine::AffineForOp> band = nests[i];
+      affine::AffineForOp shardLoop = band.front();
+      IRMapping map;
+      map.map(shardLoop.getInductionVar(), iv);
+      buildSeq(b, band, /*idx=*/1, map); // inner loops -> scf.for, then body
+    }
+    b.create<par::YieldOp>(loc, ValueRange{});
+    ++nForall;
+
+    prevLast = roots[k - 1];
+    idx = k;
+  }
+
+  b.setInsertionPointToEnd(rblk);
+  b.create<par::YieldOp>(loc, ValueRange{});
+
+  for (affine::AffineForOp r : roots)
+    r.erase();
+}
+
+/// S0 shard-axis selection: the operand-agnostic bound id (shardAxisId) covering
+/// the most top-level parallel bands, preferring axes with real parallelism
+/// (extent != 1); falls back to any if all candidates are degenerate.  Reports
+/// the chosen axis `coverage` and the `total` parallel bands.  nullopt = none.
+static std::optional<std::string>
+selectShardAxis(ArrayRef<affine::AffineForOp> bands,
+                const ParAliasOracle &oracle, unsigned &coverage,
+                unsigned &total) {
+  std::map<std::string, unsigned> idCount;
+  std::set<std::string> degenerate; // extent==1 axes: no real parallelism
+  total = 0;
+  for (affine::AffineForOp band : bands)
+    if (auto id = shardAxisId(band, oracle)) {
+      idCount[*id]++;
+      ++total;
+      if (shardLabel(band) == "extent=1")
+        degenerate.insert(*id);
+    }
+  if (idCount.empty())
+    return std::nullopt;
+  std::string shardId;
+  coverage = 0;
+  for (auto &kv : idCount)
+    if (!degenerate.count(kv.first) && kv.second > coverage) {
+      coverage = kv.second;
+      shardId = kv.first;
+    }
+  if (coverage == 0)
+    for (auto &kv : idCount)
+      if (kv.second > coverage) {
+        coverage = kv.second;
+        shardId = kv.first;
+      }
+  return shardId;
+}
+
+//===----------------------------------------------------------------------===//
 
 struct DrParBubblesPass
     : public impl::DrParBubblesPassBase<DrParBubblesPass> {
@@ -816,33 +972,11 @@ struct DrParBubblesPass
         });
         // S0: pick the shard axis (by operand-agnostic bound identity)
         // covering the most top-level parallel bands.
-        std::map<std::string, unsigned> idCount;
-        std::set<std::string> degenerate; // extent==1 axes: no real parallelism
-        unsigned total = 0;
-        for (affine::AffineForOp band : bands)
-          if (auto id = shardAxisId(band, oracle)) {
-            idCount[*id]++;
-            ++total;
-            if (shardLabel(band) == "extent=1")
-              degenerate.insert(*id);
-          }
-        if (idCount.empty())
+        unsigned best = 0, total = 0;
+        auto sel = selectShardAxis(bands, oracle, best, total);
+        if (!sel)
           return;
-        // Prefer the max-coverage axis with real parallelism (extent != 1);
-        // fall back to any if all candidates are degenerate.
-        std::string shardId;
-        unsigned best = 0;
-        for (auto &kv : idCount)
-          if (!degenerate.count(kv.first) && kv.second > best) {
-            best = kv.second;
-            shardId = kv.first;
-          }
-        if (best == 0)
-          for (auto &kv : idCount)
-            if (kv.second > best) {
-              best = kv.second;
-              shardId = kv.first;
-            }
+        std::string shardId = *sel;
         std::string label;
         for (affine::AffineForOp band : bands)
           if (auto id = shardAxisId(band, oracle))
@@ -878,6 +1012,89 @@ struct DrParBubblesPass
         fn.emitRemark("par-spmd: elide=")
             << elide << " halo=" << halo << " redistribute=" << redist
             << " barrier=" << barrier << " (of " << edges << " shard edges)";
+      });
+    }
+
+    // S2 — whole-function widening + materialization into one par.region.
+    if (parSpmd) {
+      module.walk([&](func::FuncOp fn) {
+        if (fn.isExternal())
+          return;
+        SmallVector<affine::AffineForOp, 16> bands;
+        fn.walk([&](affine::AffineForOp loop) {
+          if (isBandRoot(loop))
+            bands.push_back(loop);
+        });
+        unsigned coverage = 0, total = 0;
+        auto sel = selectShardAxis(bands, oracle, coverage, total);
+        if (!sel)
+          return;
+        std::string shardId = *sel;
+
+        // The chosen axis must have a constant extent (par.forall is
+        // constant-bound).  A representative on-axis band gives the bounds;
+        // operand-agnostic shardAxisId => all on-axis bands share them.
+        int64_t lb = 0, ub = 0, step = 1;
+        bool constExtent = false;
+        for (affine::AffineForOp band : bands)
+          if (auto id = shardAxisId(band, oracle); id && *id == shardId) {
+            if (band.hasConstantLowerBound() && band.hasConstantUpperBound()) {
+              lb = band.getConstantLowerBound();
+              ub = band.getConstantUpperBound();
+              step = band.getStepAsInt();
+              constExtent = true;
+            }
+            break;
+          }
+        if (!constExtent) {
+          fn.emitRemark("par-spmd: not materialized (dynamic shard extent)");
+          return;
+        }
+
+        // Materialize only the function entry block's top-level bands.  Every
+        // one must be an on-axis materializable shard band; they must be
+        // contiguous; and their bodies must depend only on values dominating
+        // the first band (so the region is well-formed).  Any miss => bail
+        // (sound: real kernels with per-layer scratch / off-axis reductions /
+        // interleaved ops fall here -- the documented S2 blockers).
+        Block &entry = fn.getBody().front();
+        SmallVector<affine::AffineForOp, 8> roots;
+        for (Operation &op : entry)
+          if (auto f = dyn_cast<affine::AffineForOp>(&op))
+            roots.push_back(f);
+        if (roots.empty())
+          return;
+
+        SmallVector<SmallVector<affine::AffineForOp, 4>, 8> nests;
+        for (affine::AffineForOp r : roots) {
+          auto nest = spmdBand(r, oracle, lb, ub, step);
+          if (nest.empty()) {
+            fn.emitRemark(
+                "par-spmd: not materialized (off-axis or non-materializable "
+                "band)");
+            return;
+          }
+          nests.push_back(std::move(nest));
+        }
+        for (size_t i = 0; i + 1 < roots.size(); ++i)
+          if (roots[i]->getNextNode() != roots[i + 1].getOperation()) {
+            fn.emitRemark("par-spmd: not materialized (op between shard bands)");
+            return;
+          }
+        for (affine::AffineForOp r : roots)
+          if (!nestOperandsDominate(r, roots.front().getOperation())) {
+            fn.emitRemark(
+                "par-spmd: not materialized (inter-band value dependence)");
+            return;
+          }
+
+        unsigned nForall = 0, nBarrier = 0, nRedist = 0;
+        materializeSpmd(roots, nests, lb, ub, step, nForall, nBarrier,
+                        nRedist);
+        fn.emitRemark("par-spmd: materialized foralls=")
+            << nForall << " barriers=" << nBarrier
+            << " redistributes=" << nRedist << " (" << roots.size()
+            << " bands)";
       });
     }
   }
