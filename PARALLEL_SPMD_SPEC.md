@@ -324,6 +324,36 @@ ONNX kernels still need the §11.5 blockers (krnl, per-layer allocs, batch-1
 axis) before this runs on resnet50. S4 (halo recompute), S5 (libdrpar pinning),
 S6 (reduce-over-shard) are unchanged.
 
+## 11.9 Toward real kernels — two §11.5 blockers cleared (2026-06-19)
+
+Investigating the resnet50 `.03-dr` dump grounded the residual gap: weights
+(`krnl.global`) all dominate at the function top, **zero deallocs**, and the
+inter-band glue is exactly scratch `memref.alloc` + index/view ops. So two
+mechanical blockers, both now removed and execution-validated on synthetic
+real-ONNX-shaped kernels:
+
+- **Inter-band glue hoisting** (blocker #2, commit d16adbe): a shard-band run
+  separated only by hoistable glue (side-effect-free ops or fresh allocs, no
+  band-output dependence) now materializes — the glue is hoisted above the
+  first band (sound: nothing hoisted reads band-written memory or depends on a
+  band). Validated: interleaved-alloc kernel, par→omp checksum-identical,
+  14.68× @ 16t.
+- **Dynamic (runtime) shard extent** (blocker #3, commit 0417922): `par.forall`
+  now carries an optional dynamic upper bound (`dyn(%N)`); S2 shards a `0 to %N`
+  batch axis, requiring all bands to share the SAME runtime Value. Lowers to
+  `scf.parallel`/`omp.loop_nest ... to (%N)`. Validated: runtime batch N=48,
+  par→omp byte-identical to sequential, 15 runs × {1,2,4,8,16} threads, 0
+  mismatches (`scripts/validate-spmd-dyn.sh`).
+
+**S2 now expresses the real-ONNX batch-throughput shape** (interleaved scratch
+allocs + runtime batch). **Residual for full resnet50** (all need supervision /
+infra, none done): (a) **off-axis (reduction) bands** inside the region — S2 is
+still whole-function all-or-nothing, real nets interleave reduction layers that
+must shard the axis sequentially-within-shard or hit §6 reduce; (b) the
+**krnl.global weights + onnx execution runtime** (200 MB dump, dr-opt needs
+`-allow-unregistered-dialect`, no run harness); (c) **proving per-layer batch
+dims equal** (distinct `memref.dim` SSA values — currently bails as off-axis).
+
 ## 11. Open questions / honest limits
 
 - **Shard-axis matching across layers** (which loop indexes the same buffer
