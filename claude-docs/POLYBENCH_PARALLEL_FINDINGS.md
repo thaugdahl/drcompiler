@@ -151,10 +151,34 @@ inside the team). doitgen stays critical correctly (shared `sum[]` makes the
 outer axis genuinely non-parallel). Until stencil-diving lands, the upstream
 `affine-parallelize` lowering remains the measured stand-in for those (17–19×).
 
-Single-thread codegen (`affine-register-block`, 2.3–2.6× on contractions, see
-POLYBENCH_FAMILY_FINDINGS.md) is orthogonal and composes with this (parallelize
-the outer spatial loop, register-block the inner micro-kernel) — not yet measured
-together.
+Single-thread codegen (`affine-register-block`, 2.3–2.6× over clang -O3 on
+contractions, see POLYBENCH_FAMILY_FINDINGS.md) is orthogonal and composes with
+this — see below.
+
+## Codegen × parallelism compose (measured)
+
+`affine-register-block` (register-promote the k-loop accumulator + 8×16 vector
+micro-kernel) and `affine-parallelize`→omp (shard the outer `i` loop) are
+**independent, multiplicative, and correct together**. Canonical GEMM N=1024,
+7 iters, `mlir-runner --O3`, 16-core Zen4 (`scripts/codegen-x-parallel.sh`):
+
+| config | median (s) | vs baseline | correct |
+|---|---|---|---|
+| baseline (1t)   | 2.70   | 1.0×    | — |
+| **rb (1t)**     | 0.034  | **79×** | MATCH |
+| par (16t)       | 0.217  | 12×     | MATCH |
+| **rb + par (16t)** | 0.0026 | **1033×** | MATCH |
+
+rb+par parallelizes the register-blocked code (one omp.wsloop over `i`, the
+micro-kernel intact) → ~13× on top of rb's single-thread time. **Honest caveat:**
+the 79× is over the *naive MLIR* baseline (whose k-innermost memory accumulator
+`--O3` does not scalar-promote); against clang -O3 the codegen win is the
+documented ~2.5×. The result here is the **composition**: both transforms fire,
+the output is numerically MATCH, and parallelism multiplies the codegen speedup.
+Caveat for applying to PolyBench as-emitted: register-block needs the reduction
+loop **innermost** (canonical i,j,k); cgeist emits gemm as i,k,j (reduction
+middle), so a reduction-innermost interchange is the precondition to compose the
+two on the real kernels.
 
 ## Reproduce
 
