@@ -396,6 +396,25 @@ static bool deAffinable(affine::AffineForOp shard) {
   return ok;
 }
 
+/// A band is load-IMBALANCED across the shard axis when an inner loop's trip
+/// count depends on the shard induction variable (a triangular nest: syrk's
+/// `j:0..i`, covariance's gram triangle, trmm).  A static (block) OpenMP
+/// schedule then starves the low-IV workers; such a forall is tagged for a
+/// `dynamic` schedule by convert-par-to-omp.
+static bool bandImbalanced(affine::AffineForOp shard) {
+  Value iv = shard.getInductionVar();
+  bool found = false;
+  shard.getBody()->walk([&](affine::AffineForOp inner) {
+    for (Value o : inner.getLowerBoundOperands())
+      if (o == iv)
+        found = true;
+    for (Value o : inner.getUpperBoundOperands())
+      if (o == iv)
+        found = true;
+  });
+  return found;
+}
+
 /// Clone the (imperfect) shard loop's body into the forall, de-affined.  The
 /// shard IV must already be mapped to the forall arg.
 static void buildShardedBody(OpBuilder &b, affine::AffineForOp shard,
@@ -1310,6 +1329,10 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
         loc, TypeRange{}, b.getDenseI64ArrayAttr({info.lb}),
         b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({info.step}),
         dynOps, ValueRange{});
+    // Triangular / IV-dependent inner extent -> tag for a dynamic OpenMP
+    // schedule (a static block schedule starves the low-IV workers).
+    if (bandImbalanced(info.nest[info.shardIdx]))
+      forall->setAttr("par.dynamic", b.getUnitAttr());
     Block *fblk = b.createBlock(&forall.getRegion());
     fblk->addArgument(b.getIndexType(), loc);
     map.map(info.nest[info.shardIdx].getInductionVar(), fblk->getArgument(0));

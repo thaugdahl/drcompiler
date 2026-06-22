@@ -197,3 +197,41 @@ scripts/polybench-par-survey.sh
 # 3. measured OpenMP scaling + correctness for the representatives
 scripts/polybench-par-bench.sh gemm 2mm syrk covariance doitgen jacobi-2d heat-3d lu deriche mvt atax
 ```
+
+## Roofline (step 0) — where the walls are
+
+Square GEMM (i,k,j), `scripts/.../roofline.sh`, Zen4 16-core; GFLOP/s = 2N³/t:
+
+| N | working set | seq-MLIR-O3 1t | clang-O3 AOT 1t | par-omp 16t | 16t/1t |
+|---|---|---|---|---|---|
+| 256  | 1.5 MB | 24.7 GF | 37.2 GF | 234 GF | 9.5× |
+| 512  | 6 MB   | 18.5 GF | 29.4 GF | **290 GF** | 15.7× |
+| 1024 | 24 MB  | 19.5 GF | 31.5 GF | 148 GF | 7.6× |
+| 2048 | 96 MB  | **9.3 GF** | **12.0 GF** | 111 GF | 12× |
+
+Two walls confirmed: (1) single-thread MLIR-O3 is ~1.5× behind clang -O3 and both
+sit at ~20–30% of peak → **codegen headroom** (register-block, #2); (2) at N=2048
+(96 MB ≫ 32 MB L3) single-thread FLOP/s **halves** for *both* MLIR and clang (no
+tiling) → **the L3-spill bandwidth wall → tiling (#3) pays even past clang -O3**.
+16t peaks 290 GF (~29% of peak) → large compound headroom.
+
+## Dynamic schedule for triangular bands (#1, landed)
+
+A band whose inner extent depends on the shard IV (syrk `j:0..i`, covariance gram
+triangle, trmm) is load-IMBALANCED under a static block schedule. ParBubbles now
+tags such a forall `par.dynamic` (`bandImbalanced`: an inner loop bound references
+the shard IV) and `convert-par-to-omp` emits `omp.wsloop schedule(dynamic)`.
+Measured in-house (par→omp, MATCH): **syrk 7.4×→13.9×, covariance 7.6×→14.6× @16t**
+— the triangular imbalance recovered, both now near-linear. Balanced bands are
+untagged (static); ONNX bands are constant-bound so never tagged (mnist
+`0.000e+00`). lit `spmd-perband-dynamic.mlir`.
+
+## In-house par→omp coverage (landed this round)
+
+All measured via `dr-par-bubbles{par-spmd-perband}` → `convert-par-to-omp`,
+checksum-verified seq≡omp @16t: gemm 13.8×, 2mm 14.8×, **syrk 13.9×**,
+**covariance 14.6×**, mvt 10.4×, **jacobi-2d 20.6×**, **heat-3d 19.0×**. lu /
+doitgen stay `par.critical` (correctly: mostly-sequential / shared scratch).
+Next: #2 reduction-innermost interchange → register-block compose (per-thread
+codegen, the ~1.5–2.5× the roofline shows is on the table), then #3 tile-within-
+shard for the L3-spill regime.

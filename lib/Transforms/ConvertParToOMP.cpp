@@ -67,6 +67,10 @@ static void lowerForall(OpBuilder &b, par::ForallOp forall, bool nowait,
   auto ws = b.create<omp::WsloopOp>(loc);
   if (nowait)
     ws.setNowait(true);
+  // A band tagged load-imbalanced (triangular / IV-dependent inner extent) gets
+  // a dynamic schedule so workers pull rows on demand instead of a static block.
+  if (forall->hasAttr("par.dynamic"))
+    ws.setScheduleKind(omp::ClauseScheduleKind::Dynamic);
   Block *wsBlk = b.createBlock(&ws.getRegion());
   b.setInsertionPointToStart(wsBlk);
 
