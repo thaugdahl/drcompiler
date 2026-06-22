@@ -483,4 +483,56 @@ dr-opt … --emit-bytecode -o - \         # MLIR bytecode: weights stay BINARY
   fork/join + barrier constants for the dev host first.
 - **Inter-procedural** kernels (calls between layers): pure calls already
   consumed (M4); impure cross-layer calls need the deferred forwarding analysis.
-```
+
+## 11.12 Batch-1 speedup CLOSED — the cap was Amdahl, not bandwidth (2026-06-22)
+
+§11.11 concluded resnet50 batch-1 SPMD was ~1.36×@16t and "memory-bound — an
+inherent property of memory-bound CNNs."  **That diagnosis was wrong.**  The cap
+was **Amdahl**: ~22 of 170 bands — including the heavy convs — fell to
+`par.critical` (serial) because `par-spmd-perband`'s de-affine path could not
+shard them, and the per-thread reductions were slow memref-accumulator
+round-trips.  Both are now fixed; batch-1 scales **near-linearly**.
+
+**Fix (3 edits to `ParBubbles.cpp`, the de-affine path):**
+1. `cloneDeAffine` lowers `affine.for` *with iter_args* → `scf.for` carrying the
+   iter_args (init operands, region iter args, `affine.yield`→`scf.yield`).  scf
+   supports this natively; a promoted register-accumulator reduction now survives
+   de-affining.  Sound: the shard axis is oracle-PARALLEL (owner-computes,
+   disjoint output) and the accumulator is loop-local (iter_arg, not shared).
+2. `deAffinable` accepts iter_arg reductions (was an explicit bail).
+3. The de-affine path is no longer gated `shardIdx==0`.  Loops above the shard
+   axis are guaranteed degenerate (extent≤step) by the shard-selection loop;
+   `emitForall` maps their IVs to their lower bound (a sound trivial interchange
+   past once-iterating loops), so a parallel axis BELOW a degenerate batch/extent-1
+   loop — the resnet50 conv shape — shards.
+
+**Pipeline:** add `dr-scalar-reduction-promote` after demote
+(`func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote,dr-scalar-reduction-promote)`).
+Promote lifts the memref accumulator to an iter_arg register (no per-step DRAM
+round-trip); the de-affine fix keeps that promoted band sharded.
+
+**Result (resnet50-v2-7 batch-1, static `1x3x224x224`, krnl-free OpenMP back-end,
+16-core Zen4, median of 7, `scripts/validate-spmd-parallel.sh`):**
+
+| config | structure | t1 | t16 | scaling | vs plain-seq@16t | err |
+|--------|-----------|----|----|---------|------------------|-----|
+| plain-seq | (no SPMD) | 2.11s | 2.11s | — | 1.00× | 0 |
+| demote→perband (old perband) | 148 fa / 22 crit | 3.34s | 2.44s | 1.36× | 0.86× | 1e-6 |
+| demote→perband (**+fix**) | **168 fa / 2 crit** | 3.34s | 0.227s | **14.7×** | 9.3× | 1e-6 |
+| demote+**promote**→perband (**+fix**) | **168 fa / 2 crit** | **2.21s** | **0.153s** | **14.5×** | **13.8×** | 1e-6 |
+
+So the fix alone lifts the *existing* (demote-only) pipeline 1.36×→14.7× — proof
+the cap was the 22 serial bands, not bandwidth.  Adding promote restores the fast
+per-thread baseline (3.34s→2.21s ≈ plain-seq) on top, for **13.8× over the
+equivalent sequential lowering**, numerically exact (err 1.05e-6 vs the seq
+reference).  Lit: `test/Parallel/spmd-perband-reduction.mlir`; full suite 244/0
+(16 pre-existing ONNX unresolved).
+
+**Honest scope.** The 13.8× is the *parallelization* contribution measured against
+the **same (scalar) codegen** sequential baseline — apples-to-apples, not a claim
+vs onnx-mlir's vectorized `--O3` EmitObj.  Per-thread code is still non-vectorized:
+`affine-register-block` would speed each thread further but currently turns the
+stepped/unroll-jammed band back to `par.critical` (122/170 forall — the same
+register-block × perband gap seen on PolyBench).  Closing THAT (shard the
+register-blocked band) is the remaining frontier and would compound on top of the
+14× parallel scaling.

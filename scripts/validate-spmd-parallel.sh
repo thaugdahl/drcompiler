@@ -85,12 +85,17 @@ build_cfg(){ # $1=name  $2=dr-opt pass pipeline
 }
 echo "== seq reference (krnl-free, no SPMD) =="
 build_cfg seq "builtin.module(lower-krnl-global)"
-echo "== spmd (perfect reductions + lower-krnl-global + par-spmd-perband + par->omp) =="
+echo "== spmd (perfect+promote reductions + lower-krnl-global + par-spmd-perband + par->omp) =="
 # dr-affine-loop-distribute + dr-scalar-reduction-demote PERFECT the conv/gemm
 # reduction bands (fission init out, single-level memref-accumulator) so they
 # materialize as par.forall (sharded) instead of par.critical (serial) -- the
-# heavy convs become parallel.  Both passes are exact (semantics-preserving).
-build_cfg spmd "builtin.module(func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
+# heavy convs become parallel.  dr-scalar-reduction-promote then lifts the
+# memref accumulator back into an iter_arg register (no per-step DRAM round-trip)
+# -- par-spmd-perband's de-affine path carries the iter_arg through to scf.for,
+# so the band stays sharded AND the reduction is fast.  All three passes are
+# exact (semantics-preserving).  resnet50 batch-1: 168/170 bands parallel,
+# ~14x@16t over the krnl-free sequential reference (was 1.36x w/o promote+fix).
+build_cfg spmd "builtin.module(func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote,dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
 
 OMP_NUM_THREADS=1 "$W/seq.bin" "$W/seq.logits" 1 >/dev/null 2>&1
 echo "== correctness (spmd vs seq, per thread count) + median time =="

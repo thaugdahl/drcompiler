@@ -350,12 +350,32 @@ static void cloneDeAffine(OpBuilder &b, Operation *op, IRMapping &map) {
     Value ub = expandForBound(b, loc, f.getUpperBoundMap(),
                               f.getUpperBoundOperands(), /*isUpper=*/true, map);
     Value st = b.create<arith::ConstantIndexOp>(loc, f.getStepAsInt());
-    auto nf = b.create<scf::ForOp>(loc, lb, ub, st);
-    map.map(f.getInductionVar(), nf.getInductionVar());
-    OpBuilder::InsertionGuard g(b);
-    b.setInsertionPointToStart(nf.getBody());
-    for (Operation &inner : f.getBody()->without_terminator())
-      cloneDeAffine(b, &inner, map);
+    // Carry iter_args (a promoted register-accumulator reduction) through to the
+    // scf.for: scf supports them natively.  Init operands map to scf init args,
+    // region iter args to scf's, and the affine.yield to scf.yield.  Soundness:
+    // the enclosing shard loop is oracle-PARALLEL (owner-computes, disjoint
+    // output), and the accumulator is loop-local (an iter_arg, not shared
+    // memory), so a within-shard sequential reduction is correct.
+    SmallVector<Value> inits;
+    for (Value v : f.getInits())
+      inits.push_back(map.lookupOrDefault(v));
+    auto nf = b.create<scf::ForOp>(
+        loc, lb, ub, st, inits,
+        [&](OpBuilder &nb, Location nloc, Value iv, ValueRange iterArgs) {
+          map.map(f.getInductionVar(), iv);
+          for (unsigned i = 0, e = iterArgs.size(); i < e; ++i)
+            map.map(f.getRegionIterArgs()[i], iterArgs[i]);
+          for (Operation &inner : f.getBody()->without_terminator())
+            cloneDeAffine(nb, &inner, map);
+          SmallVector<Value> yields;
+          if (auto y =
+                  dyn_cast<affine::AffineYieldOp>(f.getBody()->getTerminator()))
+            for (Value v : y.getOperands())
+              yields.push_back(map.lookupOrDefault(v));
+          nb.create<scf::YieldOp>(nloc, yields);
+        });
+    for (unsigned i = 0, e = nf.getNumResults(); i < e; ++i)
+      map.map(f.getResult(i), nf.getResult(i));
     return;
   }
   if (auto ap = dyn_cast<affine::AffineApplyOp>(op)) {
@@ -378,11 +398,9 @@ static bool deAffinable(affine::AffineForOp shard) {
   shard.getBody()->walk([&](Operation *op) {
     if (op == shard.getOperation())
       return;
-    if (auto f = dyn_cast<affine::AffineForOp>(op)) {
-      if (f.getNumResults() != 0)
-        ok = false; // iter_arg reduction: not handled
-      return;
-    }
+    if (isa<affine::AffineForOp>(op))
+      return; // nested affine.for (incl. iter_arg reductions): cloneDeAffine
+              // lowers it to scf.for, carrying any iter_args through.
     if (isa<affine::AffineLoadOp, affine::AffineStoreOp, affine::AffineApplyOp,
             affine::AffineYieldOp>(op))
       return;
@@ -1107,11 +1125,23 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
   if (bandMaterializable(info.nest,
                          /*dynOuterUb=*/info.dynUb != nullptr || info.dynExpr)) {
     info.perfect = true;
-  } else if (info.shardIdx == 0 && deAffinable(shard)) {
-    // Imperfect body (sibling sub-loops / inner memref reduction).  Sound to
-    // shard because `shard` is oracle-PARALLEL (owner-computes); the body is
-    // de-affined into the forall.  Restricted to shardIdx==0 (no degenerate
-    // outer loops to interchange past).
+  } else if (deAffinable(shard) && [&] {
+               // The degenerate loops above the shard axis are mapped IV->lb by
+               // emitForall (they run once); that is only sound if they carry no
+               // iter_args (whose results we would otherwise drop).  Guaranteed
+               // for the conv/batch prefix; bail to par.critical if not.
+               for (unsigned k = 0; k < info.shardIdx; ++k)
+                 if (info.nest[k].getNumResults() != 0)
+                   return false;
+               return true;
+             }()) {
+    // Imperfect body (sibling sub-loops / inner memref or iter_arg reduction).
+    // Sound to shard because `shard` is oracle-PARALLEL (owner-computes); the
+    // body is de-affined into the forall.  Any loops ABOVE the shard axis
+    // (shardIdx>0) are guaranteed degenerate (extent<=step) by the selection
+    // loop above -- they run once, so emitForall maps their IVs to their lower
+    // bound and the de-affined shard body is emitted directly under the forall
+    // (a sound trivial interchange past the once-iterating outer loops).
     info.perfect = false;
   } else {
     return std::nullopt;
@@ -1337,10 +1367,20 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
     fblk->addArgument(b.getIndexType(), loc);
     map.map(info.nest[info.shardIdx].getInductionVar(), fblk->getArgument(0));
     b.setInsertionPointToStart(fblk);
-    if (info.perfect)
+    if (info.perfect) {
       buildSeqSkip(b, info.nest, /*idx=*/0, info.shardIdx, map);
-    else
+    } else {
+      // Degenerate loops above the shard axis run exactly once: map their IVs to
+      // their constant lower bound so the de-affined shard body, which may
+      // reference them, resolves correctly (sound trivial interchange).
+      for (unsigned k = 0; k < info.shardIdx; ++k) {
+        affine::AffineForOp dl = info.nest[k];
+        Value c = b.create<arith::ConstantIndexOp>(
+            loc, dl.getConstantLowerBound());
+        map.map(dl.getInductionVar(), c);
+      }
       buildShardedBody(b, info.nest[info.shardIdx], map);
+    }
     b.create<par::YieldOp>(loc, ValueRange{});
     ++nForall;
     ++shardable;
