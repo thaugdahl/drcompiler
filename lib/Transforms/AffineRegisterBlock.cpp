@@ -956,6 +956,14 @@ static bool canonicalizeOnce(func::FuncOp func) {
     // give the mr rows different reduction ranges -- we have no reduction-peel
     // for that.  Interchanging without blocking would just leave a cache-hostile
     // order, so leave such nests untouched (clang vectorizes the original).
+    // NOTE: this also requires CONSTANT bounds because the spatial unroll-jam /
+    // peel micro-kernel downstream is constant-bound; relaxing only this guard
+    // to loop-invariant symbolic bounds (PolyBench `nk`) lets the interchange
+    // fire but the micro-kernel still can't peel a symbolic spatial extent, so
+    // it half-transforms (unroll-jams the wrong nest) without vectorizing.
+    // Symbolic-bound register-blocking (dynamic remainder loops) is future work;
+    // until then PolyBench must be size-specialized (constant bounds) to compose
+    // register-block with the parallel path (see POLYBENCH_PARALLEL_FINDINGS.md).
     if (!red.hasConstantLowerBound() || !red.hasConstantUpperBound())
       continue;
     SmallVector<AffineForOp, 2> band{red, inner};

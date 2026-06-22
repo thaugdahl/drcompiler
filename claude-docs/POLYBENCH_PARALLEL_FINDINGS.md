@@ -232,6 +232,31 @@ All measured via `dr-par-bubbles{par-spmd-perband}` → `convert-par-to-omp`,
 checksum-verified seq≡omp @16t: gemm 13.8×, 2mm 14.8×, **syrk 13.9×**,
 **covariance 14.6×**, mvt 10.4×, **jacobi-2d 20.6×**, **heat-3d 19.0×**. lu /
 doitgen stay `par.critical` (correctly: mostly-sequential / shared scratch).
-Next: #2 reduction-innermost interchange → register-block compose (per-thread
-codegen, the ~1.5–2.5× the roofline shows is on the table), then #3 tile-within-
-shard for the L3-spill regime.
+
+## #2 register-block on the real kernels — NO-GO without size-specialization
+
+`affine-register-block` already canonicalizes the PolyBench i-k-j GEMM order
+(`canonicalizeOnce` interchanges k↔j to put the reduction innermost) **and fires
+when bounds are CONSTANT** (verified: a constant-bound i-k-j GEMM → 16 `vector.fma`
+micro-kernel; composes with the parallel path = the 1033× of `0ec6192`). But the
+cgeist-emitted PolyBench kernels carry **symbolic** loop bounds (`ni/nj/nk`
+runtime args), and the interchange guard requires constant reduction bounds —
+because the downstream spatial unroll-jam/peel micro-kernel is constant-bound.
+Relaxing only the guard (allow loop-invariant symbolic) lets the interchange fire
+but the micro-kernel can't peel a symbolic spatial extent → it half-transforms
+(unroll-jams the wrong nest, no GEMM vectorization). So **register-block does not
+compose on PolyBench as-emitted**; it needs either (a) **size-specialization**
+(compile for a fixed dataset → constant bounds → fires + composes, the natural
+deployment path), or (b) **symbolic-bound register-blocking** (dynamic remainder
+loops) — a separate, larger effort. Reverted the relaxation (added risk without
+delivering); register-block lit 29/29.
+
+## Next lever (roofline-prioritized): #3 cache-tiling within the shard
+
+The roofline's dominant single-thread loss is the **L3 spill** (N=2048: 9.3 GF,
+half of in-cache) — and it hits **clang -O3 too**, so it is the highest-value,
+most broadly applicable lever, *and* unlike register-block it does **not** need
+constant bounds (`dr-affine-loop-tile` is symbolic-bound-clean). Tile (i,j,k)
+inside each `par.forall` shard so a thread's working set is L2-resident → cut DRAM
+traffic in the bandwidth-bound regime (large-N GEMM, BLAS-2). Recommended next
+step over #2.
