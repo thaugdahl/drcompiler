@@ -409,3 +409,37 @@ deployment with no new pass — register-block fires on the size-specialized
 only thing that needs symbolic-bound register-blocking is the size-*parameterized*
 library form (kernel as a standalone runtime-N function) — a genuinely separate,
 larger effort (dynamic remainder loops), not required for the benchmark.
+
+## #11 diamond/parallel-cache stencils — feasibility verdict (scoped, deferred)
+
+**When it matters.** The *parallel* stencil spill point is much later than the
+single-thread one, because 16 threads spread the working set across the aggregate
+~64 MB L3 (2 CCDs). Measured jacobi-2D par-16t: **N=2048 (64 MB) 83.8 GF →
+N=3072 (144 MB) 28.2 GF → 4096 17.2 → 6144 12.4**. So SEQWRAP-parallel stencils are
+fine up to N≈2048; the parallel-cache lever only pays at **N≳3072 (grids >144 MB)**,
+where it could recover par from ~28 toward the ~80 GF in-cache rate (~3×).
+
+**Why the simple compose fails (recap).** Skewed time-tiling makes the tile loops
+(tt, ii, jj) a **wavefront** (all oracle-SEQUENTIAL); only the innermost per-tile
+spatial sweep is parallel. SEQWRAP wants a sequential-outer / parallel-inner-*band*
+shape, so it falls to `par.critical`. Locality and coarse parallelism genuinely
+conflict in the skewed form.
+
+**Implementable designs** (both real new passes, ~1–2 days each):
+1. **Overlapped (redundant-halo) row-strip tiling** — *recommended*. Shard rows
+   into P strips (`par.forall`, embarrassingly parallel, no per-step barrier); move
+   the time loop INSIDE each strip; expand each strip's input range by ±T (halo)
+   and recompute the halo redundantly into a **private per-strip buffer**. Maps
+   cleanly to `par.forall(strip){ scf.for(t){ strip±halo } }` — the inverse nesting
+   of the current SEQWRAP. Cost: redundant halo compute (~halo/strip-height, e.g.
+   ~30–50% at H=128/T=30) traded for cache-residency + zero sync. Needs: private
+   buffer alloc per strip, halo bound arithmetic, copy-in/out, ping-pong handling.
+2. **Skewed-tile wavefront parallel** — keep the existing skew, parallelize tiles
+   along anti-diagonals (tiles with ii+jj=const are independent), `par.barrier`
+   between diagonals. No redundancy, but needs diagonal-schedule codegen.
+
+**Verdict:** real win (~3×) but only for very large grids (>144 MB); it is a
+genuine new pass, not a session-scale change, so it is **scoped and deferred**.
+Recommended approach = overlapped row-strip tiling (design above). The enabling
+parallelism is sound (anti-diagonal tiles / independent strips); the work is the
+halo/buffer materialization.
