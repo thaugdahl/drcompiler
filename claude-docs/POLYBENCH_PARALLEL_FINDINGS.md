@@ -351,3 +351,35 @@ for the reuse-rich contraction class and stays out of BLAS-2 and stencil-spatial
 so nothing is mis-tiled. Completing cache-residency across all classes = composing
 the two existing levers with the SPMD path under their own spill-gates: BLAS-2
 **fusion-then-shard**, stencil **time-tile-then-SEQWRAP**.
+
+## Composing the cache levers with SPMD — outcomes (honest)
+
+Attempted the two remaining per-class cache levers as composes with the SPMD path.
+
+**Stencil time-tiling — single-thread WIN, but does NOT compose with SPMD.**
+`dr-affine-stencil-time-tile` (skewed time-tiling) recovers the jacobi-2D
+single-thread L3 spill: N=2048, T=30, untiled seq **7.3 GF → 16.8 GF (2.29×)** at
+tile-t=8/tile-s=64 (64²×2 arrays = 64 KiB → L2-resident, reused over 8 timesteps),
+checksum-correct (`scripts/polybench-stencil-timetile-bench.sh`). **But** the
+skewed form is a **wavefront**: the oracle classifies all three tile loops
+(tt, ii, jj) SEQUENTIAL (carried) — only the innermost per-tile spatial sweep is
+parallel — so `par-spmd-perband` makes the whole nest `par.critical` (0 parallel).
+Time-tiling (locality) and the simple SEQWRAP (coarse parallelism) therefore
+**conflict**: classic skewing serializes the tiles. Getting BOTH needs
+**diamond / concurrent-start tiling** (a hyperplane-parallel schedule) — a
+substantially harder polyhedral transform the skewing pass does not produce.
+Net stencil picture, two regimes: **N fits L3 → SEQWRAP per-timestep = 18–20×**
+(landed); **N spills L3 → time-tiling recovers single-thread 2.29×** but is
+sequential; coarse parallel + locality at large N = diamond tiling (future).
+
+**BLAS-2 fusion — NO cache lever (confirmed).** `dr-affine-loop-fusion` declines
+to fuse mvt's two matvecs: they are independent (no producer-consumer) and read
+the matrix in *different* patterns (A vs Aᵀ), so fusing captures no reuse and the
+cost model correctly leaves them split. BLAS-2 is bandwidth-bound by its
+O(N²)-work / O(N²)-data ratio (≈1 flop/byte) — there is **no spatial-cache lever**;
+its only win is parallel bandwidth aggregation (have it, up to the L3 spill).
+
+**Cache-residency status across classes:**
+- contraction → spatial tiling + model-driven gate — **landed, real win** (+45% par / +113% seq at the spill).
+- BLAS-2 → none (bandwidth-bound; tiling/fusion both correctly decline) — **honest no-lever**.
+- stencil → time-tiling recovers single-thread (2.29×) but conflicts with SPMD; parallel+locality = diamond tiling — **partial / future**.
