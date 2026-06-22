@@ -318,6 +318,92 @@ static void cloneBodyOp(OpBuilder &b, Operation *op, IRMapping &map) {
   b.clone(*op, map);
 }
 
+/// Expand an affine.for bound (a max-affine for the lower, min-affine for the
+/// upper) to a single index Value, remapping operands.  Used to de-affine an
+/// inner loop whose bounds may depend on the (now non-affine) shard IV.
+static Value expandForBound(OpBuilder &b, Location loc, AffineMap m,
+                            ValueRange operands, bool isUpper, IRMapping &map) {
+  SmallVector<Value> mapped;
+  for (Value v : operands)
+    mapped.push_back(map.lookupOrDefault(v));
+  auto vals = affine::expandAffineMap(b, loc, m, mapped);
+  Value acc = (*vals)[0];
+  for (unsigned i = 1, e = vals->size(); i < e; ++i)
+    acc = isUpper ? b.create<arith::MinSIOp>(loc, acc, (*vals)[i]).getResult()
+                  : b.create<arith::MaxSIOp>(loc, acc, (*vals)[i]).getResult();
+  return acc;
+}
+
+/// Recursively clone an op subtree into the par.forall body, fully DE-AFFINING:
+/// affine.for -> scf.for (bounds expanded), affine.load/store -> memref, affine
+/// .apply -> expanded SSA.  Lets a parallel shard loop with an IMPERFECT body
+/// (sibling sub-loops, an inner memref reduction) materialize as a real forall
+/// instead of falling back to par.critical.  Soundness comes from the shard
+/// loop being oracle-PARALLEL (owner-computes: each shard writes disjoint
+/// memory); the body just runs sequentially per shard iteration.  Callers must
+/// gate on deAffinable() first so every op here is handled.
+static void cloneDeAffine(OpBuilder &b, Operation *op, IRMapping &map) {
+  Location loc = op->getLoc();
+  if (auto f = dyn_cast<affine::AffineForOp>(op)) {
+    Value lb = expandForBound(b, loc, f.getLowerBoundMap(),
+                              f.getLowerBoundOperands(), /*isUpper=*/false, map);
+    Value ub = expandForBound(b, loc, f.getUpperBoundMap(),
+                              f.getUpperBoundOperands(), /*isUpper=*/true, map);
+    Value st = b.create<arith::ConstantIndexOp>(loc, f.getStepAsInt());
+    auto nf = b.create<scf::ForOp>(loc, lb, ub, st);
+    map.map(f.getInductionVar(), nf.getInductionVar());
+    OpBuilder::InsertionGuard g(b);
+    b.setInsertionPointToStart(nf.getBody());
+    for (Operation &inner : f.getBody()->without_terminator())
+      cloneDeAffine(b, &inner, map);
+    return;
+  }
+  if (auto ap = dyn_cast<affine::AffineApplyOp>(op)) {
+    SmallVector<Value> operands;
+    for (Value v : ap.getMapOperands())
+      operands.push_back(map.lookupOrDefault(v));
+    auto r = affine::expandAffineMap(b, loc, ap.getAffineMap(), operands);
+    map.map(ap.getResult(), (*r)[0]);
+    return;
+  }
+  cloneBodyOp(b, op, map); // affine.load/store -> memref; else verbatim clone
+}
+
+/// Can the shard loop's body be fully de-affined by cloneDeAffine()?  Accepts
+/// nested affine.for (no iter_args), affine.load/store/apply, and region-less
+/// pure / pure-call ops.  Rejects affine.if, iter_arg reductions, and any other
+/// region op (would clone to invalid IR under the non-affine forall IV).
+static bool deAffinable(affine::AffineForOp shard) {
+  bool ok = true;
+  shard.getBody()->walk([&](Operation *op) {
+    if (op == shard.getOperation())
+      return;
+    if (auto f = dyn_cast<affine::AffineForOp>(op)) {
+      if (f.getNumResults() != 0)
+        ok = false; // iter_arg reduction: not handled
+      return;
+    }
+    if (isa<affine::AffineLoadOp, affine::AffineStoreOp, affine::AffineApplyOp,
+            affine::AffineYieldOp>(op))
+      return;
+    if (op->getNumRegions() != 0) {
+      ok = false; // affine.if / scf / unknown region op
+      return;
+    }
+    if (!isMemoryEffectFree(op) && !ParAliasOracle::isPureCall(op))
+      ok = false; // region-less op with effects we can't safely replicate
+  });
+  return ok;
+}
+
+/// Clone the (imperfect) shard loop's body into the forall, de-affined.  The
+/// shard IV must already be mapped to the forall arg.
+static void buildShardedBody(OpBuilder &b, affine::AffineForOp shard,
+                             IRMapping &map) {
+  for (Operation &op : shard.getBody()->without_terminator())
+    cloneDeAffine(b, &op, map);
+}
+
 /// Build the sequential suffix loops band[idx..] as scf.for, then clone the
 /// innermost body.
 static void buildSeq(OpBuilder &b, ArrayRef<affine::AffineForOp> band,
@@ -942,6 +1028,8 @@ struct PerBandInfo {
   unsigned shardIdx; // which loop in the nest is the shard axis
   int64_t lb, step, ubConst;
   Value dynUb;
+  bool perfect; // true: perfect nest (buildSeqSkip); false: imperfect body
+                // (cloneDeAffine the shard loop's whole body)
 };
 
 /// A loop runs <=1 iteration (e.g. the batch axis at batch=1): sharding it
@@ -986,8 +1074,17 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
     ; // dynamic extent only supported on the outermost axis
   else
     return std::nullopt;
-  if (!bandMaterializable(info.nest, /*dynOuterUb=*/info.dynUb != nullptr))
+  if (bandMaterializable(info.nest, /*dynOuterUb=*/info.dynUb != nullptr)) {
+    info.perfect = true;
+  } else if (info.shardIdx == 0 && deAffinable(shard)) {
+    // Imperfect body (sibling sub-loops / inner memref reduction).  Sound to
+    // shard because `shard` is oracle-PARALLEL (owner-computes); the body is
+    // de-affined into the forall.  Restricted to shardIdx==0 (no degenerate
+    // outer loops to interchange past).
+    info.perfect = false;
+  } else {
     return std::nullopt;
+  }
   return info;
 }
 
@@ -1179,7 +1276,10 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
       map.map(info->nest[info->shardIdx].getInductionVar(),
               fblk->getArgument(0));
       b.setInsertionPointToStart(fblk);
-      buildSeqSkip(b, info->nest, /*idx=*/0, info->shardIdx, map);
+      if (info->perfect)
+        buildSeqSkip(b, info->nest, /*idx=*/0, info->shardIdx, map);
+      else
+        buildShardedBody(b, info->nest[info->shardIdx], map);
       b.create<par::YieldOp>(loc, ValueRange{});
       ++nForall;
       break;

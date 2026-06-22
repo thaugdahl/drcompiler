@@ -112,26 +112,44 @@ materializable on the chosen axis.
   every (r,q)); only a small inner loop parallelizes. Privatizing `sum` per
   thread is the fix — a clear, scoped opportunity.
 
-## Key technical finding — why the in-house `par`/SPMD materializer doesn't apply yet
+## Key technical finding + fix — bringing PolyBench under the in-house SPMD path
 
 The proven whole-kernel SPMD materializer (`dr-par-bubbles{par-spmd-perband}` →
-`convert-par-to-omp`, validated end-to-end on ResNet-50 / MNIST) **declines every
-PolyBench kernel** — it emits `par.critical` (serial), not `par.forall`. Root
-cause: its shardability test leans on **Tier-0 allocation-root provenance**
-(buffers are local `memref.alloc`s in the ONNX models, so disjoint ownership is
-trivial to prove). PolyBench kernels take their arrays as **function-argument
-memrefs**, which have no known allocation root → the oracle is conservative and
-the band falls back to `par.critical`. Even fissioning the init loops
-(`dr-affine-loop-distribute,dr-scalar-reduction-demote`, the trick that perfects
-ONNX conv/gemm bands) does not help, because the blocker is provenance, not band
-shape.
+`convert-par-to-omp`, validated on ResNet-50 / MNIST) originally **declined every
+PolyBench kernel** — it emitted `par.critical` (serial), not `par.forall`.
 
-**Implication / next step.** To bring PolyBench under the in-house SPMD path, the
-materializer must accept **Tier-1 polyhedral shardability on function-argument
-memrefs** (the oracle already computes the affine dependence; the materializer
-just doesn't trust it for arg-rooted buffers). Until then, the upstream
-`affine-parallelize` lowering (used here) is the sound, measured stand-in — the
-parallelism *facts* come from the same dependence analysis either way.
+**Real root cause** (an earlier draft mis-attributed this to Tier-0 allocation-
+root provenance — wrong): `bandMaterializable` required a **perfect loop nest
+with a straight-line innermost body** (only affine.load/store + pure ops). The
+oracle correctly classifies the outer spatial loop as PARALLEL, but a PolyBench
+contraction's parallel `i`-loop holds an **imperfect body** — sibling sub-nests
+(e.g. gemm's beta-scale row, then the k/j accumulation) — so the perfect-nest
+gate rejected it and the band fell back to `par.critical`. Fissioning the init
+loops did not help because the blocker was nest *shape*, not provenance.
+
+**Fix (landed).** When the shard loop is oracle-PARALLEL but its body is
+imperfect, **de-affine the whole body into the `par.forall`** (`affine.for` →
+`scf.for` with expanded bounds, `affine.load/store` → `memref`), gated by a
+`deAffinable` pre-check (no iter-arg reductions / `affine.if` / unknown region
+ops). Soundness is owner-computes: the oracle's PARALLEL verdict means distinct
+shard iterations touch disjoint memory, so the body runs sequentially per shard
+unchanged. (`lib/Transforms/ParBubbles.cpp`; lit `spmd-perband-imperfect.mlir`.)
+
+**Result — contraction / gram / BLAS-2 now materialize under the in-house par
+dialect** (`dr-par-bubbles{par-spmd-perband}` → `convert-par-to-omp`), numerically
+MATCH, same speedups as the stock stand-in: gemm 13.4×, 2mm 14.2×, syrk 7.0×,
+covariance 7.6×, mvt 12.8× @16t. ResNet-50 / MNIST re-validated **norm_rel_err =
+0.000e+00** (resnet50 materialization counts unchanged: 82 forall / 55 critical),
+full lit 241/0.
+
+**Remaining gap (next):** **stencils** (jacobi-2d, heat-3d) and **solvers** (lu)
+still go `par.critical` — their outermost band is a *sequential* loop (the time
+step / the k-sweep) wrapping parallel inner loops. perband shards the outermost
+axis only; it does not yet dive past a sequential outer loop to shard an inner
+parallel one (the proper form is `scf.for(seq) { par.forall(inner); barrier }`
+inside the team). doitgen stays critical correctly (shared `sum[]` makes the
+outer axis genuinely non-parallel). Until stencil-diving lands, the upstream
+`affine-parallelize` lowering remains the measured stand-in for those (17–19×).
 
 Single-thread codegen (`affine-register-block`, 2.3–2.6× on contractions, see
 POLYBENCH_FAMILY_FINDINGS.md) is orthogonal and composes with this (parallelize
