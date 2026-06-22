@@ -316,3 +316,38 @@ unconditionally tiled, now ≈ untiled). Cache-tiling is now a safe default. lit
 *symbolic*-bound PolyBench-as-emitted the footprint isn't known statically, so the
 gate needs a runtime check or size-specialization (the constant-size path above
 is the deployment case).
+
+## Spill-points across classes — where each bandwidth wall is, and the right lever
+
+Roofline-style scaling-vs-N (seq-1t + in-house par-16t) plus the
+`dr-affine-loop-tile` decision, for one kernel per memory-behavior class
+(`scripts/polybench-spill-{blas2,stencil}.sh`, Zen4, L3=32 MiB):
+
+| class | kernel | in-cache (N=1024) | spill point | spilled | tile decision | lever |
+|---|---|---|---|---|---|---|
+| contraction | gemm | seq 19.5 GF | N=2048, 96 MB | seq 9.3 → gated-tile **19.9** | gate **TILE** | spatial tiling (landed) |
+| BLAS-2 | mvt | seq ~1 GF (mem-bound at *all* N) | N=2048, A=32 MB=L3 | par 19.9 → **7.3** | gate SKIP / V2 **REJECT no-evicted-reuse** | **fusion** |
+| stencil | jacobi-2d | seq 17.4 GF | N=2048, 2N²=64 MB | seq **6.6** (2.6× loss) | **REJECT out-of-model** | **time-tiling** |
+
+Reading:
+- **BLAS-2** (mvt/atax/gemver/gesummv/bicg) reads each matrix element ~once →
+  compute intensity ≈1 flop/byte → **memory-bound at every size** (seq ~1 GF flat,
+  no in-cache plateau). The parallel run still rides shared-L3 bandwidth until the
+  matrix exceeds L3 (N=2048, A=32 MB), then halves. Spatial tiling is **correctly
+  declined** — V2's `no-evicted-reuse` gate sees there is nothing to keep resident.
+  The only cache lever is **fusion**: mvt/gemver/etc. make multiple passes over the
+  same matrix, so fusing them cuts the dominant A-streaming in half
+  (`dr-affine-loop-fusion`, cost-model-driven, already in-tree).
+- **Stencil** (jacobi/heat/fdtd/seidel) has spatial + temporal reuse, so it runs
+  compute-ish *in cache* (17.4 GF) and **spills hard at N=2048** (2N² = 64 MB > L3,
+  seq 17.4 → 6.6 GF, 2.6×). Spatial tiling is declined (`out-of-model`: the
+  sequential time loop wraps two spatial bands → not a tileable perfect band). The
+  right lever is **time-tiling** (temporal blocking keeps a spatial tile resident
+  across timesteps — `dr-affine-stencil-time-tile`, already in-tree), composed with
+  the SEQWRAP parallelization.
+
+**Net:** the spatial-tiling gate (landed) is correctly *selective* — it fires only
+for the reuse-rich contraction class and stays out of BLAS-2 and stencil-spatial,
+so nothing is mis-tiled. Completing cache-residency across all classes = composing
+the two existing levers with the SPMD path under their own spill-gates: BLAS-2
+**fusion-then-shard**, stencil **time-tile-then-SEQWRAP**.
