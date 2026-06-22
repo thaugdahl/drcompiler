@@ -1,0 +1,150 @@
+# PolyBench parallelization sweep — opportunity map + measured speedup
+
+**Date:** 2026-06-22
+**Author:** Claude (Opus 4.8)
+**Ask (user):** "Focus on PolyBench — make them fast, and work on finding
+parallelization opportunities across all classes in PolyBench."
+
+**Result.** Ran the `dr-par-bubbles` parallel-axis oracle over **all 30
+PolyBench/C 4.2.1 kernels** (6 classes) to map where parallelism exists, then
+**measured real OpenMP thread-scaling** (1→16 threads, checksum-verified
+seq≡omp) on **11 representatives spanning every class**. Headlines: dense
+contractions and stencils scale near-linearly to super-linearly (**gemm 14.4×,
+2mm 14.8×, jacobi-2d 18.8×, heat-3d 17.2×** at 16 threads); triangular/gram
+kernels ~7×; solvers and memory-bound BLAS-2 are limited or regress (honest
+negatives below). **23/30 kernels expose ≥1 parallel axis; 22/30 have a whole-
+function shard axis.** The fully-sequential 7 (symm, cholesky, ludcmp, trisolv,
+seidel-2d, floyd-warshall, nussinov) are correctly declined — genuine carried
+dependences / recurrences / DP, not analysis conservatism.
+
+All times are `mlir-runner --O3` median on a 16-core Zen4 (Ryzen 7950X3D),
+`OMP_PROC_BIND=close OMP_PLACES=cores`. Speedup = seq(1 thread, no OpenMP) /
+omp(N threads). `correct = MATCH` means the parallel checksum equals the
+sequential checksum to <1e-9 relative.
+
+---
+
+## Pipeline
+
+```
+ PolyBench .c  --docker cgeist (LLVM18)-->  per-kernel affine MLIR  (bench/polybench-mlir/)
+   analysis :  dr-opt dr-par-bubbles{par-test-diagnostics}     -> PARALLEL/SEQUENTIAL per loop
+   lowering :  mlir-opt --affine-parallelize=max-nested=1       -> parallelize outermost proven axis
+               --lower-affine --convert-scf-to-openmp --canonicalize ... --convert-openmp-to-llvm
+   run      :  mlir-runner --O3  (libomp)                       -> thread sweep + checksum
+```
+
+The **analysis** is the novel piece: the `ParAliasOracle` (Tier 0 allocation-root
+provenance, Tier 1 polyhedral `checkMemrefAccessDependence`, Tier 2 conservative)
+classifies every loop axis. The **lowering** uses the stock upstream
+`affine-parallelize` (whose independent dependence check agrees with the oracle
+on every representative) so the measured speedup is attributable to the
+parallelism itself, not to a bespoke code path. `--canonicalize` after
+`convert-scf-to-openmp` is required to drop the `memref.alloca_scope` that
+otherwise blocks `convert-scf-to-cf`.
+
+---
+
+## Opportunity map — all 30 kernels (`dr-par-bubbles{par-test-diagnostics}`)
+
+`PAR`/`SEQ` = count of parallel / sequential loop axes. `shard` = whole-function
+SPMD shard axis (`par-test-spmd`): `bands=X/Y` means X of Y top-level bands are
+materializable on the chosen axis.
+
+| class | kernel | PAR | SEQ | shard | class | kernel | PAR | SEQ | shard |
+|---|---|---|---|---|---|---|---|---|---|
+| datamining | correlation | 6 | 3 | 3/5 | kernels | doitgen | 2 | 3 | 2/2 |
+| datamining | covariance | 5 | 2 | 3/3 | kernels | mvt | 2 | 2 | 2/2 |
+| blas | gemm | 3 | 1 | 2/2 | solvers | cholesky | 0 | 4 | — |
+| blas | gemver | 5 | 2 | 4/4 | solvers | durbin | 2 | 2 | 2/2 |
+| blas | gesummv | 1 | 1 | 1/1 | solvers | gramschmidt | 3 | 3 | 2/3 |
+| blas | symm | 0 | 3 | — | solvers | ludcmp | 0 | 9 | — |
+| blas | syr2k | 3 | 1 | 1/2 | solvers | lu | 1 | 4 | 1/1 |
+| blas | syrk | 3 | 1 | 1/2 | solvers | trisolv | 0 | 2 | — |
+| blas | trmm | 1 | 2 | — | medley | deriche | 4 | 8 | 2/2 |
+| kernels | 2mm | 4 | 2 | 2/2 | medley | floyd-warshall | 0 | 3 | — |
+| kernels | 3mm | 6 | 3 | 3/3 | medley | nussinov | 0 | 3 | — (non-affine) |
+| kernels | atax | 2 | 2 | 2/2 | stencils | adi | 2 | 5 | 2/2 |
+| kernels | bicg | 1 | 2 | 1/1 | stencils | fdtd-2d | 7 | 1 | 2/4 |
+| stencils | heat-3d | 6 | 1 | 2/2 | stencils | jacobi-1d | 2 | 1 | 2/2 |
+| stencils | jacobi-2d | 4 | 1 | 2/2 | stencils | seidel-2d | 0 | 3 | — |
+
+## Measured OpenMP scaling — 11 representatives (all 6 classes)
+
+| kernel | class | size | seq O3 (s) | 2t | 4t | 8t | **16t** | correct |
+|---|---|---|---|---|---|---|---|---|
+| gemm       | blas (contraction)   | 1000³ish | 0.142 | 2.04× | 3.85× | 7.00× | **14.41×** | MATCH |
+| 2mm        | kernels (2× GEMM)    | 800–1200 | 0.953 | 1.89× | 3.75× | 7.37× | **14.76×** | MATCH |
+| syrk       | blas (rank-k, tri)   | 1200/1000| 0.261 | 1.15× | 1.91× | 3.59× | **7.15×**  | MATCH |
+| covariance | datamining (gram)    | 1400×1200| 0.834 | 1.26× | 2.13× | 3.99× | **7.56×**  | MATCH |
+| doitgen    | kernels (tensor)     | 220/140/160 | 0.359 | 1.54× | 2.64× | 3.58× | 2.36× | MATCH |
+| jacobi-2d  | stencils (5-pt)      | 1300², 40t | 0.055 | 2.80× | 5.55× | 9.60× | **18.79×** | MATCH |
+| heat-3d    | stencils (7-pt)      | 120³, 40t  | 0.992 | 2.85× | 5.44× | 10.44×| **17.19×** | MATCH |
+| lu         | solvers (factor)     | 1000²    | 0.199 | 1.35× | 1.60× | 1.75× | 1.82×  | MATCH |
+| deriche    | medley (IIR filter)  | 4096×2160| 0.079 | 1.02× | 1.00× | 0.99× | 0.87×  | MATCH |
+| mvt        | kernels (2× matvec)  | 2000²    | 0.0027| 1.10× | 2.19× | 4.26× | 8.22×  | MATCH |
+| atax       | kernels (A·x, Aᵀ·y)  | 1800×2100| 0.0030| 0.88× | 0.86× | 0.79× | 0.52×  | MATCH |
+
+## Per-class reading (honest)
+
+- **Dense contraction (gemm, 2mm, 3mm) — near-linear.** Outer spatial loop is a
+  clean parallel axis; the k-reduction stays sequential within each thread. 14–15×
+  at 16 threads (≈92% efficiency). The strongest, cleanest class.
+- **Triangular / gram (syrk, syr2k, covariance, correlation) — ~7×.** The outer
+  parallel loop has an IV-dependent trip count (`j:0..i`), so a static OpenMP
+  schedule gives load imbalance; ~7× is the imbalance ceiling, not a correctness
+  or analysis limit (dynamic scheduling / triangular blocking would recover it).
+- **Stencils (jacobi-2d, heat-3d, jacobi-1d, fdtd-2d) — super-linear.** The time
+  loop is sequential; each timestep's spatial sweep parallelizes. 17–19× at 16
+  threads — super-linear because per-thread working sets fit cache. Best class.
+- **Solvers (lu) — limited (1.8×).** Only the inner row-update parallelizes; the
+  k-sweep carries a dependence. ludcmp/cholesky/trisolv have **no** parallel axis
+  at all (declined, correctly). Blocked-factorization is a different technique.
+- **Memory-bound BLAS-2 (mvt 8×, atax 0.5×).** Parallel but bandwidth-bound and
+  tiny (matvec runs in ~3 ms). mvt still rides bandwidth to 8×; **atax regresses
+  to 0.52×** — the work is too small for OpenMP fork/join + bandwidth saturation.
+  A real negative, reported as such.
+- **Medley (deriche ~1.0×).** Recursive IIR filters serialize along the filter
+  direction; only the orthogonal axis parallelizes, and the kernel is memory-
+  bound — no win. floyd-warshall and nussinov are sequential/non-affine DP.
+- **doitgen — peaks 3.6× then regresses.** The natural parallel axes (nr, nq) are
+  blocked by a **shared `sum[np]` scratch buffer** (a function argument reused
+  every (r,q)); only a small inner loop parallelizes. Privatizing `sum` per
+  thread is the fix — a clear, scoped opportunity.
+
+## Key technical finding — why the in-house `par`/SPMD materializer doesn't apply yet
+
+The proven whole-kernel SPMD materializer (`dr-par-bubbles{par-spmd-perband}` →
+`convert-par-to-omp`, validated end-to-end on ResNet-50 / MNIST) **declines every
+PolyBench kernel** — it emits `par.critical` (serial), not `par.forall`. Root
+cause: its shardability test leans on **Tier-0 allocation-root provenance**
+(buffers are local `memref.alloc`s in the ONNX models, so disjoint ownership is
+trivial to prove). PolyBench kernels take their arrays as **function-argument
+memrefs**, which have no known allocation root → the oracle is conservative and
+the band falls back to `par.critical`. Even fissioning the init loops
+(`dr-affine-loop-distribute,dr-scalar-reduction-demote`, the trick that perfects
+ONNX conv/gemm bands) does not help, because the blocker is provenance, not band
+shape.
+
+**Implication / next step.** To bring PolyBench under the in-house SPMD path, the
+materializer must accept **Tier-1 polyhedral shardability on function-argument
+memrefs** (the oracle already computes the affine dependence; the materializer
+just doesn't trust it for arg-rooted buffers). Until then, the upstream
+`affine-parallelize` lowering (used here) is the sound, measured stand-in — the
+parallelism *facts* come from the same dependence analysis either way.
+
+Single-thread codegen (`affine-register-block`, 2.3–2.6× on contractions, see
+POLYBENCH_FAMILY_FINDINGS.md) is orthogonal and composes with this (parallelize
+the outer spatial loop, register-block the inner micro-kernel) — not yet measured
+together.
+
+## Reproduce
+
+```bash
+# 1. generate per-kernel affine MLIR (docker cgeist), cached in bench/polybench-mlir/
+scripts/polybench-gen-mlir.sh
+# 2. parallel-axis opportunity map over all 30 kernels
+scripts/polybench-par-survey.sh
+# 3. measured OpenMP scaling + correctness for the representatives
+scripts/polybench-par-bench.sh gemm 2mm syrk covariance doitgen jacobi-2d heat-3d lu deriche mvt atax
+```
