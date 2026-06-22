@@ -142,14 +142,21 @@ covariance 7.6×, mvt 12.8× @16t. ResNet-50 / MNIST re-validated **norm_rel_err
 0.000e+00** (resnet50 materialization counts unchanged: 82 forall / 55 critical),
 full lit 241/0.
 
-**Remaining gap (next):** **stencils** (jacobi-2d, heat-3d) and **solvers** (lu)
-still go `par.critical` — their outermost band is a *sequential* loop (the time
-step / the k-sweep) wrapping parallel inner loops. perband shards the outermost
-axis only; it does not yet dive past a sequential outer loop to shard an inner
-parallel one (the proper form is `scf.for(seq) { par.forall(inner); barrier }`
-inside the team). doitgen stays critical correctly (shared `sum[]` makes the
-outer axis genuinely non-parallel). Until stencil-diving lands, the upstream
-`affine-parallelize` lowering remains the measured stand-in for those (17–19×).
+**Stencils now land too (SEQWRAP, also landed).** A band whose outermost loop is
+*sequential* (the time step) wrapping parallel inner bands is materialized as one
+team holding `scf.for(t) { par.forall ; par.forall }` — the team persists across
+timesteps and re-distributes the spatial work each step. No `par.barrier` (it may
+not nest under `scf.for`); consecutive bands synchronize via the implicit
+end-of-`omp.wsloop` barrier (`convert-par-to-omp` emits each nested wsloop
+*without* `nowait`, and now recurses into the cloned `scf.for`). The shard axis
+also accepts an **affine upper bound** (e.g. `N-1`), expanded to an SSA value at
+emit. Measured in-house (par→omp, MATCH): **jacobi-2d 20.6×, heat-3d 19.0× @16t**
+— now exceeding the affine-parallelize stand-in. lit `spmd-perband-stencil.mlir`;
+ResNet-50/MNIST re-validated `0.000e+00` (counts unchanged); full lit 242/0.
+
+**Still `par.critical` (correctly):** lu (the k-sweep body interleaves a division
+glue with the update — not a clean sequential-wrapper), doitgen (shared `sum[]`
+makes the outer axis genuinely non-parallel). Both are mostly-sequential anyway.
 
 Single-thread codegen (`affine-register-block`, 2.3–2.6× over clang -O3 on
 contractions, see POLYBENCH_FAMILY_FINDINGS.md) is orthogonal and composes with

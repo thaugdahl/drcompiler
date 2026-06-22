@@ -127,7 +127,20 @@ static void lowerRegion(par::RegionOp region) {
         b.clone(cop, cmap);
       b.create<omp::TerminatorOp>(loc);
     } else {
-      b.clone(*op, m); // replicated glue: record results in the shared map
+      Operation *cl = b.clone(*op, m); // replicated glue / control flow
+      // A cloned control-flow op (e.g. a sequential scf.for time loop wrapping
+      // spatial par.forall bands -- the stencil SEQWRAP shape) may hold nested
+      // par.forall ops the direct-children walk above never saw.  Lower each in
+      // place to an omp.wsloop WITHOUT nowait, so its implicit end barrier
+      // synchronizes consecutive bands within the loop body (par.barrier cannot
+      // nest under scf.for, so the implicit barrier is the only sync available).
+      SmallVector<par::ForallOp> nested;
+      cl->walk([&](par::ForallOp f) { nested.push_back(f); });
+      for (par::ForallOp f : nested) {
+        OpBuilder fb(f);
+        lowerForall(fb, f, /*nowait=*/false, m);
+        f.erase();
+      }
     }
   }
 

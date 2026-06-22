@@ -1027,7 +1027,9 @@ struct PerBandInfo {
   SmallVector<affine::AffineForOp, 4> nest;
   unsigned shardIdx; // which loop in the nest is the shard axis
   int64_t lb, step, ubConst;
-  Value dynUb;
+  Value dynUb;  // shard upper bound is a bare runtime value
+  bool dynExpr; // shard upper bound is an affine expression (e.g. N-1) to be
+                // expanded to an SSA value at emit time
   bool perfect; // true: perfect nest (buildSeqSkip); false: imperfect body
                 // (cloneDeAffine the shard loop's whole body)
 };
@@ -1067,14 +1069,24 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
   info.lb = shard.getConstantLowerBound();
   info.step = shard.getStepAsInt();
   info.dynUb = nullptr;
+  info.dynExpr = false;
   info.ubConst = 0;
-  if (shard.hasConstantUpperBound())
+  if (shard.hasConstantUpperBound()) {
     info.ubConst = shard.getConstantUpperBound();
-  else if (d == 0 && (info.dynUb = simpleDynUb(shard)))
-    ; // dynamic extent only supported on the outermost axis
-  else
+  } else if (d == 0) {
+    // dynamic extent only supported on the outermost axis of the band
+    info.dynUb = simpleDynUb(shard); // bare runtime value (fast path)
+    if (!info.dynUb) {
+      // a single-result affine bound (e.g. N-1): expand it to a value at emit.
+      if (shard.getUpperBoundMap().getNumResults() != 1)
+        return std::nullopt; // min-bound (multi-result): not handled
+      info.dynExpr = true;
+    }
+  } else {
     return std::nullopt;
-  if (bandMaterializable(info.nest, /*dynOuterUb=*/info.dynUb != nullptr)) {
+  }
+  if (bandMaterializable(info.nest,
+                         /*dynOuterUb=*/info.dynUb != nullptr || info.dynExpr)) {
     info.perfect = true;
   } else if (info.shardIdx == 0 && deAffinable(shard)) {
     // Imperfect body (sibling sub-loops / inner memref reduction).  Sound to
@@ -1146,12 +1158,40 @@ static bool usedAfter(Operation *op, Operation *lastBand, Block &entry) {
   return false;
 }
 
+/// A SEQUENTIAL outer band that wraps parallel inner bands (a time-stepped
+/// stencil: `for t (seq) { spatial1 (par); spatial2 (par) }`, or any
+/// sequential-outer / parallel-inner shape).  Materialized as `scf.for(t)`
+/// (run redundantly by the whole team) wrapping one `par.forall` per inner band,
+/// with the implicit end-of-wsloop barrier between them (no `par.barrier`, which
+/// may not nest under scf.for).  True iff `root`'s own axis is non-degenerate
+/// SEQUENTIAL and every immediate child is either a perBandShard-able parallel
+/// band or pure (replicable) glue; conservative otherwise (-> par.critical).
+static bool seqWrappable(affine::AffineForOp root, const ParAliasOracle &oracle) {
+  if (classifyLoop(root.getOperation(), oracle) == AxisKind::Parallel)
+    return false; // a parallel outer is a normal forall, not a seq wrapper
+  if (degenerateExtent(root))
+    return false;
+  bool hasBand = false;
+  for (Operation &child : root.getBody()->without_terminator()) {
+    if (auto cb = dyn_cast<affine::AffineForOp>(&child)) {
+      if (!perBandShard(cb, oracle))
+        return false; // an inner band we can't shard: bail (stay critical)
+      hasBand = true;
+    } else if (!isMemoryEffectFree(&child)) {
+      return false; // side-effecting glue we won't replicate per worker
+    }
+  }
+  return hasBand;
+}
+
 /// Whole-function widening (PARALLEL_SPMD_SPEC.md §2/§7): wrap the band span of
 /// `fn`'s entry block in ONE par.region.  Each span op is dispositioned:
 ///   MOVE        — allocs + pure metadata/index ops whose operands all dominate
 ///                 the region: hoisted before the team (computed once, shared,
 ///                 may escape post-span e.g. the output buffer/view);
 ///   FORALL      — a band shardable on its own output axis;
+///   SEQWRAP     — a sequential outer band wrapping parallel inner bands
+///                 (scf.for { par.forall ... }, implicit wsloop barriers);
 ///   CRITICAL    — a non-shardable band, or write/free glue: one worker, in
 ///                 order (effect visible after its implicit barrier);
 ///   REPLICATE   — read-only/pure glue depending on in-region data: cloned into
@@ -1182,7 +1222,7 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
       break;
   }
 
-  enum class Disp { Move, Forall, Critical, Replicate };
+  enum class Disp { Move, Forall, SeqWrap, Critical, Replicate };
   // Plan pass: classify; `moved` tracks ops hoisted before the region so a
   // pure op depending only on moved/pre-span values can be moved too.
   llvm::SmallPtrSet<Operation *, 32> moved;
@@ -1199,7 +1239,9 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
   for (Operation *op : span) {
     Disp d;
     if (auto band = dyn_cast<affine::AffineForOp>(op)) {
-      d = perBandShard(band, oracle) ? Disp::Forall : Disp::Critical;
+      d = perBandShard(band, oracle)  ? Disp::Forall
+          : seqWrappable(band, oracle) ? Disp::SeqWrap
+                                       : Disp::Critical;
     } else {
       bool operandsDominate = llvm::all_of(
           op->getOperands(), [&](Value v) { return dominatesRegion(v); });
@@ -1247,6 +1289,40 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
     ++nCritical;
   };
 
+  // Build ONE par.forall (no preceding barrier) at b's current insertion point,
+  // sharding `info`'s axis; leaves b inside the forall body.  Shared by the
+  // top-level Forall band and the SeqWrap inner bands.
+  auto emitForall = [&](PerBandInfo info) {
+    bool dyn = info.dynUb || info.dynExpr;
+    int64_t ubEntry = dyn ? ShapedType::kDynamic : info.ubConst;
+    SmallVector<Value> dynOps;
+    if (info.dynExpr) {
+      // Expand the shard loop's affine upper bound (e.g. N-1) to an SSA value
+      // at the forall's insertion point (operands dominate the region).
+      affine::AffineForOp shard = info.nest[info.shardIdx];
+      dynOps.push_back(expandForBound(b, loc, shard.getUpperBoundMap(),
+                                      shard.getUpperBoundOperands(),
+                                      /*isUpper=*/true, map));
+    } else if (info.dynUb) {
+      dynOps.push_back(map.lookupOrDefault(info.dynUb));
+    }
+    auto forall = b.create<par::ForallOp>(
+        loc, TypeRange{}, b.getDenseI64ArrayAttr({info.lb}),
+        b.getDenseI64ArrayAttr({ubEntry}), b.getDenseI64ArrayAttr({info.step}),
+        dynOps, ValueRange{});
+    Block *fblk = b.createBlock(&forall.getRegion());
+    fblk->addArgument(b.getIndexType(), loc);
+    map.map(info.nest[info.shardIdx].getInductionVar(), fblk->getArgument(0));
+    b.setInsertionPointToStart(fblk);
+    if (info.perfect)
+      buildSeqSkip(b, info.nest, /*idx=*/0, info.shardIdx, map);
+    else
+      buildShardedBody(b, info.nest[info.shardIdx], map);
+    b.create<par::YieldOp>(loc, ValueRange{});
+    ++nForall;
+    ++shardable;
+  };
+
   for (size_t i = 0, e = span.size(); i < e; ++i) {
     Operation *op = span[i];
     switch (disp[i]) {
@@ -1257,31 +1333,41 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
     case Disp::Forall: {
       ++nBands;
       auto info = perBandShard(cast<affine::AffineForOp>(op), oracle);
-      ++shardable;
       b.setInsertionPointToEnd(rblk);
       if (nForall + nCritical > 0) {
         b.create<par::BarrierOp>(loc);
         ++nBarrier;
       }
-      int64_t ubEntry = info->dynUb ? ShapedType::kDynamic : info->ubConst;
-      SmallVector<Value> dynOps;
-      if (info->dynUb)
-        dynOps.push_back(map.lookupOrDefault(info->dynUb));
-      auto forall = b.create<par::ForallOp>(
-          loc, TypeRange{}, b.getDenseI64ArrayAttr({info->lb}),
-          b.getDenseI64ArrayAttr({ubEntry}),
-          b.getDenseI64ArrayAttr({info->step}), dynOps, ValueRange{});
-      Block *fblk = b.createBlock(&forall.getRegion());
-      fblk->addArgument(b.getIndexType(), loc);
-      map.map(info->nest[info->shardIdx].getInductionVar(),
-              fblk->getArgument(0));
-      b.setInsertionPointToStart(fblk);
-      if (info->perfect)
-        buildSeqSkip(b, info->nest, /*idx=*/0, info->shardIdx, map);
-      else
-        buildShardedBody(b, info->nest[info->shardIdx], map);
-      b.create<par::YieldOp>(loc, ValueRange{});
-      ++nForall;
+      emitForall(*info);
+      break;
+    }
+    case Disp::SeqWrap: {
+      // Sequential outer band -> scf.for (run by the whole team); each inner
+      // parallel band -> par.forall, synchronized by the implicit
+      // end-of-wsloop barrier (par.barrier may not nest under scf.for).
+      ++nBands;
+      auto outer = cast<affine::AffineForOp>(op);
+      b.setInsertionPointToEnd(rblk);
+      if (nForall + nCritical > 0) {
+        b.create<par::BarrierOp>(loc);
+        ++nBarrier;
+      }
+      Value slb = expandForBound(b, loc, outer.getLowerBoundMap(),
+                                 outer.getLowerBoundOperands(),
+                                 /*isUpper=*/false, map);
+      Value sub = expandForBound(b, loc, outer.getUpperBoundMap(),
+                                 outer.getUpperBoundOperands(),
+                                 /*isUpper=*/true, map);
+      Value sst = b.create<arith::ConstantIndexOp>(loc, outer.getStepAsInt());
+      auto sfor = b.create<scf::ForOp>(loc, slb, sub, sst);
+      map.map(outer.getInductionVar(), sfor.getInductionVar());
+      for (Operation &child : outer.getBody()->without_terminator()) {
+        b.setInsertionPoint(sfor.getBody()->getTerminator());
+        if (auto cb = dyn_cast<affine::AffineForOp>(&child))
+          emitForall(*perBandShard(cb, oracle));
+        else
+          cloneDeAffine(b, &child, map); // pure glue, replicated in the loop
+      }
       break;
     }
     case Disp::Critical:
