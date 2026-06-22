@@ -260,3 +260,32 @@ constant bounds (`dr-affine-loop-tile` is symbolic-bound-clean). Tile (i,j,k)
 inside each `par.forall` shard so a thread's working set is L2-resident → cut DRAM
 traffic in the bandwidth-bound regime (large-N GEMM, BLAS-2). Recommended next
 step over #2.
+
+## #3 cache-tiling within the shard — measured (tile→perband→omp)
+
+`dr-affine-loop-tile` → `dr-par-bubbles{par-spmd-perband}` → `convert-par-to-omp`
+(tile *then* shard; perband's de-affine handles the tiled imperfect nest).
+Square i-k-j GEMM (the streaming/spill-prone form), `scripts/polybench-tile-bench.sh`,
+checksum-verified seq≡omp:
+
+| N | working set | seq untiled | seq **tiled** | par 16t untiled | par 16t **tiled** |
+|---|---|---|---|---|---|
+| 1024 | 24 MB (*fits* L3) | 17.8 GF | 11.2 GF ↓ | 146 GF | 67.6 GF ↓ |
+| 2048 | 96 MB (*spills* L3) | 9.6 GF | **19.9 GF (+107%)** | 117 GF | **162 GF (+38%)** |
+
+**Tiling recovers exactly the L3-spill loss** the roofline exposed: at N=2048
+single-thread climbs 9.6→19.9 GF (back to in-cache FLOP/s) and parallel 117→162 GF
+(+38%), correct. **But it HURTS when the set already fits cache** (N=1024): tiling
+the i-k-j nest adds loop overhead and (for the wrong form) breaks register reuse
+with no DRAM to save. So tiling is **not a free default** — it must be **gated to
+the spill regime** (tile a band only when its *per-shard* working set exceeds the
+effective LLC = `l3 / sharers`; the repo's contention-aware reuse-distance model
+has this machinery). Caveat: for symbolic-bound PolyBench-as-emitted the size is
+not known statically, so the gate needs runtime info or size-specialization.
+Also note: tiling the **i-j-k** (k-innermost) form hurts (it tiles the reduction,
+forcing C re-load per k-tile) — the win is specific to the i-k-j streaming form.
+
+**Verdict:** cache-tiling within the shard is a real bandwidth-regime win
+(+38% parallel / +107% single-thread at the spill point) and composes correctly
+with the SPMD path; productionizing = wiring a per-shard working-set-vs-LLC gate
+into the tile→shard pipeline so it fires only where it pays.
