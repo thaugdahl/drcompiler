@@ -23,6 +23,13 @@
 // RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile))' | FileCheck %s --check-prefix=OFF
 // OFF-LABEL: func.func @matmul
 // OFF:         affine.for %{{.*}} = 0 to 256 step
+
+// llc-gate-from-model: derive the gate from the MachineModel's shared LLC
+// (built-in Zen4 L3 = 32 MiB).  768 KiB << 32 MiB -> SKIP, no hard-coded value.
+// RUN: dr-opt %s --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile{llc-gate-from-model=true}))' | FileCheck %s --check-prefix=MODEL
+// MODEL-LABEL: func.func @matmul
+// MODEL:         affine.for %{{.*}} = 0 to 256 {
+// MODEL-NOT:     step
 func.func @matmul(%A: memref<256x256xf32>, %B: memref<256x256xf32>, %C: memref<256x256xf32>) {
   // expected-remark @below {{tile-rationale: SKIP reason=fits-llc footprint=786432 llc-gate=2097152}}
   affine.for %i = 0 to 256 {

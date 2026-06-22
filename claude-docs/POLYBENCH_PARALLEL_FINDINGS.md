@@ -298,8 +298,11 @@ bandwidth-bound. **Empirically the relevant cache is the SHARED LLC, not
 `l3/sharers`** — the owner-computes shards share the read-only operand (B), so the
 crossover sits at the full L3 (≈32 MB) for *both* the single-thread and the
 16-thread runs; an `l3/sharers` (≈4 MB) gate would over-tile and regress the
-in-cache sizes. Set `llc-gate` to the L3 size in the tile→shard pipeline. Gated
-result (square i-k-j GEMM, `llc-gate=32768`, checksum-correct):
+in-cache sizes. The gate threshold comes from the **MachineModel** (single source
+of truth) via `llc-gate-from-model=true` (= `mm.l3Size`, built-in Zen4 32 MiB or
+`cpu-cost-model-file`) — no hard-coded value; `llc-gate=<KiB>` remains as an
+explicit override for tests/tuning. Gated result (square i-k-j GEMM,
+`llc-gate-from-model=true`, checksum-correct):
 
 | N | footprint | gate | par 16t untiled | par 16t **gated-tiled** | seq 1t **gated** |
 |---|---|---|---|---|---|

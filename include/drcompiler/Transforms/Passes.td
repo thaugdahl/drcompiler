@@ -471,11 +471,16 @@ def DrAffineLoopTilePass
            "Working-set gate (KiB, 0 = off): tile a band ONLY when its full "
            "memory footprint EXCEEDS this size -- i.e. when the untiled set "
            "spills the last-level cache and the kernel is bandwidth-bound. "
-           "Set to the (shared) LLC size for the SPMD tile->shard pipeline so "
-           "cache-tiling fires at the L3-spill point and stays out of the way "
-           "when the set already fits cache (POLYBENCH_PARALLEL_FINDINGS.md #3). "
-           "The relevant cache is the SHARED LLC (owner-computes shards share "
-           "the read-only operand), not LLC/sharers.">,
+           "Below the gate the set is cache-resident so tiling only adds "
+           "overhead (POLYBENCH_PARALLEL_FINDINGS.md #3). Prefer "
+           "llc-gate-from-model over a hard-coded value; this is the explicit "
+           "override (for tests / tuning). The relevant cache is the SHARED LLC "
+           "(owner-computes shards share the read-only operand), not LLC/sharers.">,
+    Option<"llcGateFromModel", "llc-gate-from-model", "bool", /*default=*/"false",
+           "Derive the working-set gate from the MachineModel's shared LLC "
+           "(l3Size; cpu-cost-model-file or built-in Zen4 default) instead of a "
+           "hard-coded llc-gate. The single-source-of-truth way to enable the "
+           "gate in the SPMD tile->shard pipeline. Overrides llc-gate when set.">,
     Option<"separate", "separate", "bool", /*default=*/"false",
            "Separate full and partial tiles (default: false)">,
     Option<"tileSize", "tile-size", "unsigned", /*default=*/"",

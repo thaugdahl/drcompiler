@@ -31,6 +31,7 @@
 // DR-DIVERGE: pull in our cost-model primitives + ensure our tablegen Base
 // is found in `mlir::` rather than `mlir::affine::`.
 #include "drcompiler/Analysis/CpuCostModel.h"
+#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Analysis/ReuseAnalysis.h"
 #include "drcompiler/Transforms/AffineLoopTile.h"
 
@@ -354,6 +355,16 @@ bool DrAffineLoopTilePass::getTileSizesV2(
 }
 
 void DrAffineLoopTilePass::runOnOperation() {
+  // Working-set gate threshold (bytes; 0 = off).  Prefer the MachineModel's
+  // shared LLC (single source of truth, Zen4 default or cpu-cost-model-file) so
+  // the gate is not a hard-coded constant; fall back to the explicit llc-gate.
+  uint64_t gateBytes = 0;
+  if (llcGateFromModel)
+    gateBytes = static_cast<uint64_t>(
+        drcompiler::MachineModel::fromJson(cpuCostModelFile).l3Size);
+  else if (llcGateInKiB > 0)
+    gateBytes = llcGateInKiB * 1024;
+
   // Bands of loops to tile.
   std::vector<SmallVector<AffineForOp, 6>> bands;
   getTopLevelTileableBands(getOperation(), bands);
@@ -366,13 +377,13 @@ void DrAffineLoopTilePass::runOnOperation() {
     // tiling only adds loop/peel overhead (POLYBENCH_PARALLEL_FINDINGS.md #3:
     // measured, N=1024 24MB<32MB tiling HURTS, N=2048 96MB>32MB tiling
     // +38/107%).
-    if (llcGateInKiB > 0) {
+    if (gateBytes > 0) {
       std::optional<int64_t> fp = getMemoryFootprintBytes(band[0], 0);
-      if (fp && static_cast<uint64_t>(*fp) <= llcGateInKiB * 1024) {
+      if (fp && static_cast<uint64_t>(*fp) <= gateBytes) {
         if (emitRationale)
           band[0].emitRemark("tile-rationale: SKIP reason=fits-llc footprint=" +
                              std::to_string(*fp) + " llc-gate=" +
-                             std::to_string(llcGateInKiB * 1024));
+                             std::to_string(gateBytes));
         continue;
       }
     }

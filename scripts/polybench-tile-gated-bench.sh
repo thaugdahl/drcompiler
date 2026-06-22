@@ -81,13 +81,13 @@ for N in 1024 2048; do
   drv "$N" > "$D/g.mlir"
   $OPT "$D/g.mlir" "${SEQ[@]}" -o "$D/su.ll" 2>/dev/null
   o=$(run1 1 "$D/su.ll"); sut=$(echo "$o"|med); base=$(echo "$o"|ckv)
-  $DROPT --allow-unregistered-dialect --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile{llc-gate=32768}))' "$D/g.mlir" -o "$D/gt.mlir" 2>/dev/null
+  $DROPT --allow-unregistered-dialect --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile{llc-gate-from-model=true}))' "$D/g.mlir" -o "$D/gt.mlir" 2>/dev/null
   $OPT "$D/gt.mlir" "${SEQ[@]}" -o "$D/st.ll" 2>"$D/e1"
   o=$(run1 1 "$D/st.ll"); stt=$(echo "$o"|med); stc=$(echo "$o"|ckv)
   $DROPT --allow-unregistered-dialect --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))' "$D/g.mlir" -o "$D/pu.mlir" 2>/dev/null
   $OPT "$D/pu.mlir" "${OMPL[@]}" -o "$D/pu.ll" 2>/dev/null
   o=$(run1 16 "$D/pu.ll"); put=$(echo "$o"|med); puc=$(echo "$o"|ckv)
-  $DROPT --allow-unregistered-dialect --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile{llc-gate=32768}),dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))' "$D/g.mlir" -o "$D/pt.mlir" 2>"$D/e2"
+  $DROPT --allow-unregistered-dialect --pass-pipeline='builtin.module(func.func(dr-affine-loop-tile{llc-gate-from-model=true}),dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))' "$D/g.mlir" -o "$D/pt.mlir" 2>"$D/e2"
   $OPT "$D/pt.mlir" "${OMPL[@]}" -o "$D/pt.ll" 2>"$D/e3"
   o=$(run1 16 "$D/pt.ll"); ptt=$(echo "$o"|med); ptc=$(echo "$o"|ckv)
   echo "N=$N (working set $(awk -v n=$N 'BEGIN{printf "%dMB",3*n*n*8/1048576}'))"
