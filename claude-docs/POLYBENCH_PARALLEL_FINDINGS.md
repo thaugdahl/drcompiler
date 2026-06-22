@@ -443,3 +443,70 @@ genuine new pass, not a session-scale change, so it is **scoped and deferred**.
 Recommended approach = overlapped row-strip tiling (design above). The enabling
 parallelism is sound (anti-diagonal tiles / independent strips); the work is the
 halo/buffer materialization.
+
+---
+
+# Campaign: speedup data for the new-won passes (2026-06-22)
+
+Measured campaign over **constant-bound (deployment-form) PolyBench kernels**,
+spanning all six classes, comparing the four configurations that the parallel +
+codegen campaign produced. Harness: `scripts/polybench-campaign.sh` +
+`scripts/polybench_campaign_gen.py`; plot: `polybench-plotter` (`--single --logy`,
+`output/campaign_speedup.png`); data: `benchmarks/results/polybench-campaign.csv`.
+
+**Why constant bounds.** The size-*parameterized* extract (`bench/polybench-mlir`,
+runtime `ni/nj/nk`) has symbolic loop bounds, which blocks `affine-register-block`.
+The fixed-dataset deployment form (`#define`-constant dims) does not — so this is
+the form that exercises the codegen pass (see commit 9e7efa8 / §2-resolution).
+
+**Configs** (baseline = `seq-1t`, naive affine lowered straight through `-O3`,
+no dr passes; speedup = seq-1t median / config median; 16 threads, `OMP_PROC_BIND
+=close OMP_PLACES=cores`; every config checksum-verified seq≡config, all MATCH):
+- `reg-block` — `affine-register-block{cache-tile}` (1 thread; codegen only).
+- `par-spmd` — **in-house** `dr-par-bubbles{par-spmd-perband}` → `convert-par-to-omp`
+  (the campaign's contribution).
+- `rb+par` — register-block THEN upstream `affine-parallelize` → omp (the codegen ×
+  parallel COMPOSE; perband does not yet shard the unroll-jammed/stepped band, so
+  the parallel layer of the compose uses the upstream parallelizer — identical OpenMP).
+
+| kernel | class | reg-block | par-spmd | rb+par |
+|--------|-------|-----------|----------|--------|
+| gemm | contraction | 2.67× | 13.25× | **37.84×** |
+| 2mm | contraction | 2.75× | 13.85× | **39.08×** |
+| syrk | BLAS-3 (triangular) | 6.32× | 14.97× | **49.39×** |
+| mvt | BLAS-2 | 0.89× | 9.41× | 9.23× |
+| atax | BLAS-2 | 0.17× | 2.83× | 1.85× |
+| jacobi-2d | stencil | 1.02× | 13.40× | 13.43× |
+| heat-3d | stencil | 0.94× | 17.25× | 17.65× |
+| covariance | datamining | 0.98× | 13.14× | 12.93× |
+| lu | solver | 0.82× | 0.77× | 1.95× |
+
+**Reading the data (honest):**
+- **`par-spmd` is the headline and is artifact-free** — same sequential code, just
+  sharded over threads, so the number is pure parallel speedup with no
+  baseline-order confound. It wins on **8/9** across every class: contraction/BLAS-3
+  13–15×, stencil (SEQWRAP) 13–17×, BLAS-2 (bandwidth-bound) 9.4× (mvt), datamining
+  13×. The one no-go is **lu** (0.77×): genuine loop-carried dependences, perband
+  correctly bails to `par.critical`. (Upstream `affine-parallelize` still extracts
+  lu's inner per-column parallelism → `rb+par` 1.95×.)
+- **`reg-block` (codegen) is BLAS-3-shaped, and we report where it does NOT help.**
+  Honest 2.7–6.3× on contraction/BLAS-3 (gemm/2mm/syrk); a correct ~1× no-op on
+  stencil/datamining; and a **6× regression on atax** (0.17×) — applying a GEMM
+  register-blocker to a matrix-vector product is pure overhead. This motivates a
+  shape-gate on the pass (the cost model already gates tiling); it is not a win
+  config for BLAS-2.
+- **`rb+par` compose** reaches **37–49×** on contraction/BLAS-3 — the codegen ILP
+  win (≈2.7×, the documented ~2.5× vs clang -O3, NOT an inflated pathological-
+  baseline figure) multiplied by ~14× parallel. On classes where reg-block is a
+  no-op, `rb+par ≈ par-spmd` (expected).
+
+**Baseline-fairness scars addressed during this campaign** (so nothing is inflated):
+- `syrk` was first written in the polybench-reference **k-outer** order, which
+  reloads `C[i,j]` N times → a 1.14 s strawman baseline → a bogus 187× rb+par. Fixed
+  to the cache-fair **k-innermost** reduction; the honest number is 49×.
+- `covariance` first used the naive **column-access** (`data[k,i]`) transposed-GEMM,
+  catastrophically cache-bound (4.08 s) → a bogus 1253× rb+par. Rewritten in
+  cache-friendly **i-k-j** form (hoist `data[k,i]`, contiguous `data[k,j]`/`cov[i,j]`)
+  → reg-block is a fair ~1× and `par-spmd` 13×.
+Both rewrites follow the project rule: measure against the baseline a competent
+programmer would actually write, never a cache-pathological strawman.
