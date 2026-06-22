@@ -30,12 +30,12 @@
 
 // DR-DIVERGE: pull in our cost-model primitives + ensure our tablegen Base
 // is found in `mlir::` rather than `mlir::affine::`.
-#include "drcompiler/Transforms/AffineLoopTile.h"
-#include "drcompiler/Analysis/ReuseAnalysis.h"
 #include "drcompiler/Analysis/CpuCostModel.h"
+#include "drcompiler/Analysis/ReuseAnalysis.h"
+#include "drcompiler/Transforms/AffineLoopTile.h"
 
 namespace mlir {
-using affine::FusionMode;  // unused here but kept for parity with Fusion fork
+using affine::FusionMode; // unused here but kept for parity with Fusion fork
 #define GEN_PASS_DEF_DRAFFINELOOPTILEPASS
 #include "drcompiler/Transforms/Passes.h.inc"
 } // namespace mlir
@@ -54,7 +54,7 @@ struct DrAffineLoopTilePass
     : public impl::DrAffineLoopTilePassBase<DrAffineLoopTilePass> {
   DrAffineLoopTilePass() = default;
   explicit DrAffineLoopTilePass(uint64_t cacheSizeBytes,
-                                 bool avoidMaxMinBounds = true)
+                                bool avoidMaxMinBounds = true)
       : avoidMaxMinBounds(avoidMaxMinBounds) {
     this->cacheSizeInKiB = cacheSizeBytes / 1024;
   }
@@ -125,7 +125,7 @@ static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
 // TODO: evolve this model. Tile size determination is a large area
 // to play with in general.
 bool DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
-                              SmallVectorImpl<unsigned> *tileSizes) {
+                                        SmallVectorImpl<unsigned> *tileSizes) {
   if (band.empty())
     return false;
 
@@ -183,8 +183,8 @@ bool DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
   }
 
   // Upstream: nth root of excess factor, last dimension covers the balance.
-  unsigned tSize = static_cast<unsigned>(
-      floorl(std::pow(excessFactor, 1.0 / band.size())));
+  unsigned tSize =
+      static_cast<unsigned>(floorl(std::pow(excessFactor, 1.0 / band.size())));
   unsigned cumulProductOfTileSizes = 1;
   for (unsigned i = 0, e = band.size(); i < e; i++) {
     if (i < e - 1)
@@ -217,8 +217,8 @@ bool DrAffineLoopTilePass::getTileSizes(ArrayRef<AffineForOp> band,
 //     inter-tile traffic  sum_ref (writeFactor * tiles * refFootprint(T))
 //     subject to footprint(T) <= target.  This replaces v1's uniform-c
 //     GEMM-shaped formula (reuse ~c for every kernel, c^2 accumulators).
-bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
-                                          SmallVectorImpl<unsigned> *tileSizes) {
+bool DrAffineLoopTilePass::getTileSizesV2(
+    ArrayRef<AffineForOp> band, SmallVectorImpl<unsigned> *tileSizes) {
   auto rationale = [&](const std::string &msg) {
     if (emitRationale)
       band.front()->emitRemark("tile-rationale: " + msg);
@@ -346,8 +346,7 @@ bool DrAffineLoopTilePass::getTileSizesV2(ArrayRef<AffineForOp> band,
     llvm::raw_string_ostream os(buf);
     os << "TILE sizes=[";
     llvm::interleaveComma(*tileSizes, os);
-    os << "] footprint=" << info.footprintBytes(best)
-       << " target=" << target
+    os << "] footprint=" << info.footprintBytes(best) << " target=" << target
        << " traffic=" << static_cast<uint64_t>(bestTraffic);
     rationale(buf);
   }
@@ -361,6 +360,22 @@ void DrAffineLoopTilePass::runOnOperation() {
 
   // Tile each band.
   for (auto &band : bands) {
+    // Working-set gate (opt-in): only tile a band whose FULL footprint exceeds
+    // the LLC -- i.e. the untiled set spills last-level cache and the kernel is
+    // bandwidth-bound.  Below the gate the set is already cache-resident, so
+    // tiling only adds loop/peel overhead (POLYBENCH_PARALLEL_FINDINGS.md #3:
+    // measured, N=1024 24MB<32MB tiling HURTS, N=2048 96MB>32MB tiling
+    // +38/107%).
+    if (llcGateInKiB > 0) {
+      std::optional<int64_t> fp = getMemoryFootprintBytes(band[0], 0);
+      if (fp && static_cast<uint64_t>(*fp) <= llcGateInKiB * 1024) {
+        if (emitRationale)
+          band[0].emitRemark("tile-rationale: SKIP reason=fits-llc footprint=" +
+                             std::to_string(*fp) + " llc-gate=" +
+                             std::to_string(llcGateInKiB * 1024));
+        continue;
+      }
+    }
     // Set up tile sizes; fill missing tile sizes at the end with default tile
     // size or tileSize if one was provided.
     SmallVector<unsigned, 6> tileSizes;

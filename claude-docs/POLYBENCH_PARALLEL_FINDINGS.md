@@ -287,5 +287,29 @@ forcing C re-load per k-tile) — the win is specific to the i-k-j streaming for
 
 **Verdict:** cache-tiling within the shard is a real bandwidth-regime win
 (+38% parallel / +107% single-thread at the spill point) and composes correctly
-with the SPMD path; productionizing = wiring a per-shard working-set-vs-LLC gate
-into the tile→shard pipeline so it fires only where it pays.
+with the SPMD path.
+
+## Working-set gate (landed) — cache-tiling as a safe default
+
+`dr-affine-loop-tile` gained an opt-in `llc-gate=<KiB>` option (default 0 = off,
+prior behavior + lit preserved): tile a band **only when its full memory footprint
+exceeds the gate**, i.e. the untiled set spills the LLC and the kernel is
+bandwidth-bound. **Empirically the relevant cache is the SHARED LLC, not
+`l3/sharers`** — the owner-computes shards share the read-only operand (B), so the
+crossover sits at the full L3 (≈32 MB) for *both* the single-thread and the
+16-thread runs; an `l3/sharers` (≈4 MB) gate would over-tile and regress the
+in-cache sizes. Set `llc-gate` to the L3 size in the tile→shard pipeline. Gated
+result (square i-k-j GEMM, `llc-gate=32768`, checksum-correct):
+
+| N | footprint | gate | par 16t untiled | par 16t **gated-tiled** | seq 1t **gated** |
+|---|---|---|---|---|---|
+| 1024 | 24 MB | < L3 → **skip** | 154 GF | 145 GF (≈untiled, no regression) | 18.4 GF (≈untiled) |
+| 2048 | 96 MB | > L3 → **tile** | 111 GF | **162 GF (+45%)** | **19.8 GF (+113%)** |
+
+So the gate keeps the spill-regime win (+45% parallel / +113% single-thread at
+N=2048) while **eliminating the in-cache regression** (N=1024 was 67 GF / 11 GF
+unconditionally tiled, now ≈ untiled). Cache-tiling is now a safe default. lit
+`Analysis/DrAffineLoopTile/llc-gate.mlir`; full suite 244/0. Remaining: for
+*symbolic*-bound PolyBench-as-emitted the footprint isn't known statically, so the
+gate needs a runtime check or size-specialization (the constant-size path above
+is the deployment case).

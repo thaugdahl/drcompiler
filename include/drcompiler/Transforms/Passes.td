@@ -467,6 +467,15 @@ def DrAffineLoopTilePass
   let options = [
     Option<"cacheSizeInKiB", "cache-size", "uint64_t", /*default=*/"512",
            "Set size of cache to tile for in KiB (default: 512)">,
+    Option<"llcGateInKiB", "llc-gate", "uint64_t", /*default=*/"0",
+           "Working-set gate (KiB, 0 = off): tile a band ONLY when its full "
+           "memory footprint EXCEEDS this size -- i.e. when the untiled set "
+           "spills the last-level cache and the kernel is bandwidth-bound. "
+           "Set to the (shared) LLC size for the SPMD tile->shard pipeline so "
+           "cache-tiling fires at the L3-spill point and stays out of the way "
+           "when the set already fits cache (POLYBENCH_PARALLEL_FINDINGS.md #3). "
+           "The relevant cache is the SHARED LLC (owner-computes shards share "
+           "the read-only operand), not LLC/sharers.">,
     Option<"separate", "separate", "bool", /*default=*/"false",
            "Separate full and partial tiles (default: false)">,
     Option<"tileSize", "tile-size", "unsigned", /*default=*/"",
