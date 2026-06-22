@@ -383,3 +383,29 @@ its only win is parallel bandwidth aggregation (have it, up to the L3 spill).
 - contraction → spatial tiling + model-driven gate — **landed, real win** (+45% par / +113% seq at the spill).
 - BLAS-2 → none (bandwidth-bound; tiling/fusion both correctly decline) — **honest no-lever**.
 - stencil → time-tiling recovers single-thread (2.29×) but conflicts with SPMD; parallel+locality = diamond tiling — **partial / future**.
+
+## #2 resolved — size-specialization is the default, not extra work
+
+The "#2 NO-GO on symbolic bounds" turns out to be an artifact of how the survey
+*extracted* kernels (as standalone functions taking `ni/nj/nk` as runtime args).
+When PolyBench is compiled the normal way — whole program, fixed dataset — the
+dataset dims are `#define` **compile-time constants**, so the kernel's loop bounds
+are constant and `affine-register-block` fires + composes with the parallel path.
+
+Confirmed on the actual PolyBench GEMM structure (beta-scale + i-k-j accumulate),
+constant-bound N=1024, checksum-correct
+(`scripts/polybench-codegen-x-parallel-pbstruct.sh`):
+
+| config | vs baseline | note |
+|---|---|---|
+| baseline 1t | 1.0× | naive MLIR --O3 |
+| **rb 1t** | **2.8×** | register-block (canonicalize i-k-j→i-j-k, 32 vector.fma; the *honest* codegen win, ≈ documented 2.5× vs clang -O3) |
+| par 16t | 13.7× | affine-parallelize → omp |
+| **rb + par 16t** | **40.0×** | both fire (parallel bands=2 after register-block), MATCH |
+
+So per-thread codegen × parallelism (≈ 2.8× × 14×) **is** available on real PolyBench
+deployment with no new pass — register-block fires on the size-specialized
+(constant-bound) kernels, which is the default for a fixed-dataset compile. The
+only thing that needs symbolic-bound register-blocking is the size-*parameterized*
+library form (kernel as a standalone runtime-N function) — a genuinely separate,
+larger effort (dynamic remainder loops), not required for the benchmark.
