@@ -640,6 +640,15 @@ def AffineRegisterBlockPass
            "register blocking, to keep the working set resident at large N "
            "(register blocking alone is DRAM-bound once the matrices exceed "
            "the last-level cache). Only applies to perfect nests.">,
+    Option<"noCacheTile", "no-cache-tile", "bool", "false",
+           "Suppress cache-tiling (even under a GEMM cost-model that would "
+           "otherwise auto-tile) while keeping canonicalizeAllocaGemm + the "
+           "register-block vectorizer.  For the whole-function SPMD compose: "
+           "sharding already gives per-thread locality, and the cache-tile "
+           "loops (K-tile reduction + packed/C-tile scratch) introduce carried "
+           "dependences that make par-spmd-perband bail the GEMM to par.critical "
+           "(serial).  Skipping them leaves the simple stepped register-blocked "
+           "band that shards (PARALLEL_SPMD_SPEC.md §11.18).">,
     Option<"mc", "mc", "unsigned", "256",
            "Cache-tile rows (i) when cache-tile is set">,
     Option<"nc", "nc", "unsigned", "256",

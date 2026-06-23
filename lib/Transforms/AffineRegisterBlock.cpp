@@ -1269,6 +1269,10 @@ public:
         // Both routes share the ONE shrink definition in MachineModel::macroTile.
         SmallVector<unsigned, 3> sizes;
         if (mm.hasExplicitGemmModel) {
+          if (noCacheTile)
+            continue; // SPMD compose: keep canonicalizeAllocaGemm + Stage 2
+                      // vectorization, but skip the cache-tile loops whose
+                      // carried deps make par-spmd-perband serialize the GEMM.
           drcompiler::MachineModel::GemmTiling gt = mm.gemmBlocking(ie, je, ke, eb);
           if (!gt.cacheTile)
             continue; // band fits L2 / not worth tiling

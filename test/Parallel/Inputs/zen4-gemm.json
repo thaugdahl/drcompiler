@@ -1,0 +1,4 @@
+{
+  "cache": { "l2_size": 1048576, "l3_size": 134217728 },
+  "arch": { "fma_units": 2, "vector_bits_native": 256, "vector_bits_arch": 512 }
+}

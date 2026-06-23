@@ -75,8 +75,12 @@ echo "== seq reference (krnl-free, no SPMD) =="
 build_cfg seq "builtin.module(lower-krnl-global)"
 echo "== spmd (scalar per-thread: demote+promote -> par-spmd-perband -> par->omp) =="
 build_cfg spmd "builtin.module(func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote,dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
-echo "== spmd-codegen (VEC x PAR: register-block{gemm model} vectorizes the GEMMs, then SPMD shards) =="
-build_cfg spmd-codegen "builtin.module(func.func(dr-scalar-reduction-demote,affine-register-block{mr=8 nr=16 cpu-cost-model-file=$GM},dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
+echo "== spmd-codegen (VEC x PAR: register-block{gemm model, no-cache-tile} vectorizes the GEMMs, then SPMD shards) =="
+# no-cache-tile is REQUIRED: under a GEMM model, cache-tiling fires and its
+# carried deps serialize the GEMMs (par.critical); no-cache-tile keeps the
+# vectorization but leaves the shardable stepped band -> vec x par.  This is the
+# config that beats onnx-mlir --parallel (0.078s vs 0.120s @16t). See §11.18.
+build_cfg spmd-codegen "builtin.module(func.func(dr-scalar-reduction-demote,affine-register-block{mr=8 nr=16 cpu-cost-model-file=$GM no-cache-tile},dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
 
 OMP_NUM_THREADS=1 "$W/seq.bin" "$W/seq.logits" 1 >/dev/null 2>&1
 med(){ sort -n "$1" | awk -v n="$ITERS" 'NR==int((n+1)/2){print;exit}'; }

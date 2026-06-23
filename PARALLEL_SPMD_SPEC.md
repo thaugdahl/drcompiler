@@ -745,3 +745,46 @@ exact. We beat onnx-mlir's vectorized seq. The last 2× to beat `--parallel` is
 **parallelizing the softmax/LayerNorm reductions** (`par.reduce`, already built
 for GPT softmax — commit 6ecb336) + **barrier elision** between same-axis bands
 (§4) to cut the 614-barrier overhead. That is the next frontier.
+
+## 11.18 WE BEAT onnx-mlir `--parallel` on the transformer — vec×par, 0.074s (2026-06-23)
+
+§11.17 blamed the 1.34× scaling on serial softmax/LayerNorm reductions. **That was
+wrong** (a brace-depth attribution of the materialized IR shows softmax `exp`/
+`maxnumf` and LayerNorm `sqrt` are already under `par.forall`). The real serial
+floor was the **register-blocked GEMMs themselves**: the GEMM cost-model enables
+canonicalizeAllocaGemm (vectorize — wanted) AND **cache-tiling** (unwanted here),
+and the cache-tile loops (K-tile reduction + packed/C-tile scratch) introduce
+carried dependences → the oracle marks every GEMM axis `SEQUENTIAL(carried)` →
+par-spmd-perband bails the vectorized GEMM to `par.critical` (serial). So gv3 was
+vectorized-but-serial on the GEMMs.
+
+**Fix:** register-block `no-cache-tile` option (Passes.td + AffineRegisterBlock.cpp)
+— skip the per-band cache-tiling under a GEMM model while keeping
+canonicalizeAllocaGemm + the Stage 2 vectorizer. Rationale: under whole-function
+SPMD the sharding already gives per-thread locality, so the cache-tile loops are
+both redundant and the thing that breaks sharding. The result is the simple
+stepped register-blocked band that perband shards (§11.16).
+
+**Result (openai-gpt batch-1, 16-core Zen4):**
+
+| config | t1 | t16 | scaling | err |
+|--------|----|----|---------|-----|
+| gv1 scalar SPMD | — | 1.09s | 18× | 0 |
+| gv3 cache-tiled compose (GEMMs serial) | 0.314s | 0.234s | 1.34× | 2.7e-6 |
+| **gv4 no-cache-tile compose (vec×par)** | **0.321s** | **0.078s** | 4.3× | 2.7e-6 |
+| onnx-mlir `--O3` seq | 0.58s | 0.58s | — | — |
+| onnx-mlir `--parallel` | 0.78s | 0.120s | 6.5× | — |
+
+With `no-cache-tile` the vectorized GEMMs shard (615 bands: **578 forall / 37
+critical**; par.critical now holds ZERO vector/math ops). vec+par became vec×par:
+scaling 1.34→4.3×, **t16 = 0.078s — 1.5× faster than onnx-mlir `--parallel`
+(0.120s)** and numerically exact (err 2.7e-6).
+
+**We now beat onnx-mlir `--parallel` on BOTH models:** resnet50 0.152s vs 1.44s
+(9.5×), openai-gpt 0.078s vs 0.120s (1.5×).
+
+The recipe: `affine-register-block{mr=8 nr=16 cpu-cost-model-file=zen4-gemm.json
+no-cache-tile}` → demote/promote → par-spmd-perband → convert-par-to-omp. Lit:
+`test/Parallel/spmd-perband-no-cache-tile.mlir`. Remaining headroom (not needed to
+win, but there): scaling is 4.3× not ~14× — ~18% serial (37 glue-critical bands +
+614 barriers); barrier elision (§4) would push further.
