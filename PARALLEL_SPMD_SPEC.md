@@ -669,3 +669,38 @@ the stepped/unroll-jammed band back to `par.critical` — the register-block ×
 perband gap). Closing that — register-block / transcendentals INSIDE each shard —
 is the one change that would beat onnx-mlir on BOTH (≈14× parallel × ≈30×
 per-thread vec headroom on the transformer). That is the next work item (§11.16).
+
+## 11.16 SPMD × vectorization compose — mechanism LANDED, gated by register-block coverage (2026-06-23)
+
+The §11.15 conclusion: to beat onnx-mlir we must compose vectorization WITH
+parallelism. `affine-register-block` (the per-thread vectorizer) emits a stepped,
+unroll-jammed band with `affine.vector_load/store` + `vector<Nxf32>` iter_args;
+`par-spmd-perband` used to bail that to `par.critical` (the register-block ×
+perband gap, §11.12). 
+
+**Fix (ParBubbles.cpp):** `deAffinable` accepts `affine.vector_load/store`, and
+`cloneBodyOp` lowers them to `vector.load/store` (same affine-map expansion as the
+scalar case). So a register-blocked band shards into a `par.forall` whose body is
+the vectorized kernel — each SPMD shard runs the vectorized micro-kernel.
+
+**Mechanism proven** (constant-bound gemm N=1024, mlir-runner --O3,
+checksum-MATCH): seq 1t; rb 1t; par-spmd 16t; **rb+par-spmd 16t — both fire
+(1 wsloop, vector ops preserved), numerically exact.** The compose is
+near-multiplicative where register-block fully fires. (In-house now; no upstream
+`affine-parallelize` fallback as PolyBench needed.) Lit:
+`test/Parallel/spmd-perband-register-blocked.mlir`; Parallel suite 21/21.
+
+**But on the real models it is currently NEUTRAL — gated by register-block
+COVERAGE, not the compose.** openai-gpt rb+par-spmd: 482 forall + 576 vector ops
+(both fire), e2e 16t = **1.085s ≈ par-spmd-only 1.09s** (err 2.95e-6). The
+register-block vectorizes only minor bands; the **dominant QKV/FC GEMMs stay
+scalar** because they are in onnx-mlir's `iter_args`/alloca-accumulator/GEMV form
+that plain `affine-register-block{mr,nr}` does not catch (needs the transformer
+campaign's `canonicalizeAllocaGemm`; convs need `vectorizeConvBand`). So the
+compose multiplies a ~1× per-thread win → no e2e change, still 1.085s vs
+onnx-mlir's 0.120s.
+
+**Status.** Compose mechanism: DONE, correct, tested, removes the §11.12
+limitation. Beating onnx-mlir on the transformer now reduces to a *register-block
+coverage* problem (vectorize onnx-mlir's GEMM/conv forms), which the compose then
+multiplies by the 18× SPMD factor. That coverage work is the next frontier.

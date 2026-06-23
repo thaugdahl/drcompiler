@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -315,6 +316,30 @@ static void cloneBodyOp(OpBuilder &b, Operation *op, IRMapping &map) {
                               *idx);
     return;
   }
+  // affine.vector_load/store (emitted by affine-register-block) -> vector.load/
+  // store: same affine-map expansion, vector element type.  Lets a REGISTER-
+  // BLOCKED band (the per-thread vectorized GEMM kernel) shard under par.forall,
+  // composing codegen x parallelism (PARALLEL_SPMD_SPEC.md §11.16).
+  if (auto vld = dyn_cast<affine::AffineVectorLoadOp>(op)) {
+    SmallVector<Value> operands;
+    for (Value v : vld.getMapOperands())
+      operands.push_back(map.lookupOrDefault(v));
+    auto idx = affine::expandAffineMap(b, loc, vld.getAffineMap(), operands);
+    auto nl = b.create<vector::LoadOp>(loc, vld.getVectorType(),
+                                       map.lookupOrDefault(vld.getMemRef()), *idx);
+    map.map(vld.getResult(), nl.getResult());
+    return;
+  }
+  if (auto vst = dyn_cast<affine::AffineVectorStoreOp>(op)) {
+    Value val = map.lookupOrDefault(vst.getValueToStore());
+    SmallVector<Value> operands;
+    for (Value v : vst.getMapOperands())
+      operands.push_back(map.lookupOrDefault(v));
+    auto idx = affine::expandAffineMap(b, loc, vst.getAffineMap(), operands);
+    b.create<vector::StoreOp>(loc, val, map.lookupOrDefault(vst.getMemRef()),
+                              *idx);
+    return;
+  }
   b.clone(*op, map);
 }
 
@@ -402,8 +427,11 @@ static bool deAffinable(affine::AffineForOp shard) {
       return; // nested affine.for (incl. iter_arg reductions): cloneDeAffine
               // lowers it to scf.for, carrying any iter_args through.
     if (isa<affine::AffineLoadOp, affine::AffineStoreOp, affine::AffineApplyOp,
-            affine::AffineYieldOp>(op))
-      return;
+            affine::AffineYieldOp, affine::AffineVectorLoadOp,
+            affine::AffineVectorStoreOp>(op))
+      return; // affine.vector_load/store (register-block output) -> cloneBodyOp
+              // lowers to vector.load/store; sharding the register-blocked band
+              // composes codegen x parallelism.
     if (isa<memref::AllocaOp>(op))
       return; // thread-private stack scratch (e.g. a demote/promote scalar
               // accumulator left over from a GEMM+bias band).  Replicating it
