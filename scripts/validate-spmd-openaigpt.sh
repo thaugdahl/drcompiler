@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # validate-spmd-openaigpt.sh — apply whole-function SPMD (the resnet50-winning
 # pipeline: demote+promote -> par-spmd-perband -> par->omp) to the openai-gpt
-# transformer and measure scaling + correctness.  VERDICT: NO-GO (serial-bound) —
-# see PARALLEL_SPMD_SPEC.md §11.13.  Unlike resnet50 (14.5x@16t), openaigpt does
-# NOT scale (~1.01x@16t): 519 small bands / 518 barriers, the heavy work is in the
-# 85 SERIAL critical bands (softmax max/sum + LayerNorm mean/var reductions) and
-# scalar transcendentals (Gelu powf+tanh, softmax exp).  At 16t the OpenMP team
-# spins ~700% CPU at the barriers with ZERO wall-time benefit; wall-clock = the
-# serial critical path (OMP_WAIT_POLICY=passive leaves it unchanged).
+# transformer and measure scaling + correctness.  VERDICT: SCALES 18.0x@16t,
+# numerically EXACT (err 0) -- see PARALLEL_SPMD_SPEC.md §11.14.
+#
+# (An earlier run found ~1.01x and was wrongly called serial-bound, §11.13.  The
+# cause was a ParAliasOracle bug: the per-output memref.alloca scalar accumulator
+# on each GEMM+bias band was not privatized, so the GEMM row/col axes were marked
+# SEQUENTIAL(conservative) and the heavy QKV/FC GEMMs fell to par.critical.  With
+# in-loop allocas privatized, critical 85 -> 37, the GEMMs are forall, and the
+# transformer scales like the convnet.)
 #
 # This is the 2-input transformer harness (input_ids i64[1,128] + attention_mask
 # f32[1,128] -> hidden f32[1,128,768]), the analogue of validate-spmd-parallel.sh's

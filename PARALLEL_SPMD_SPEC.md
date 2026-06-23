@@ -539,6 +539,13 @@ register-blocked band) is the remaining frontier and would compound on top of th
 
 ## 11.13 openai-gpt (transformer) SPMD — NO-GO, serial-bound (2026-06-23)
 
+> **SUPERSEDED by §11.14 (same day).** The "serial-bound" diagnosis below was
+> WRONG — the serialization was an `ParAliasOracle` bug (an in-loop `memref.alloca`
+> scalar accumulator was not privatized, so the GEMM row/col axes were marked
+> SEQUENTIAL(conservative) and the heavy QKV/FC GEMMs fell to `par.critical`).
+> With the oracle fixed, openai-gpt SPMD scales **18.0× @16t** (err 0). Kept for
+> the record; read §11.14 for the real result.
+
 Applied the resnet50-winning pipeline (demote+promote → par-spmd-perband →
 par→omp, with the §11.12 de-affine fix) to openai-gpt
 (`openaigpt_Opset18.onnx`, static 1×128, two inputs: input_ids i64 +
@@ -581,3 +588,50 @@ codegen path (T1–T5c), where the remaining headroom is the scalar transcendent
 (Gelu `powf(x,3)` never strength-reduced ~20–45% of runtime) and attention
 fusion, NOT parallelism. Barrier elision in perband would cut the spin waste but
 not the serial critical path, so it does not rescue scaling here.
+
+## 11.14 CORRECTION — openai-gpt SPMD scales 18× (the §11.13 cap was an oracle bug) (2026-06-23)
+
+§11.13 concluded the transformer was "serial-bound, SPMD is a convnet-only lever."
+That was wrong, and the giveaway was exactly the right question: a transformer is
+full of independent work (every GEMM row, every head, every token) — so why would
+it be serial?
+
+**Root cause.** `ParAliasOracle::axisConflict` saw the per-output `memref.alloca`
+scalar accumulator that demote/promote leaves on a GEMM+bias band, and (a) its
+allocation effect set `sawOpaque` → `Unknown`, and (b) its scalar load/store
+looked like a same-address carried dependence. So the GEMM's **row (m=128) and
+col (n=2304/3072) axes were marked `SEQUENTIAL(conservative)`** and the heavy
+QKV/FC GEMMs — the bulk of the FLOPs — fell to `par.critical` (serial). At 16
+threads the team then spun ~700% CPU at the 518 barriers with no progress, which
+looked like an inherent serial bound but was Amdahl on mis-classified GEMMs.
+
+**Fix** (`lib/Analysis/ParAliasOracle.cpp`, `axisConflict`): an alloca created
+INSIDE the classified loop is loop-private — a fresh allocation per iteration that
+never escapes the band (only its loaded value is stored to the owner-computes
+output). Privatize it: exclude its accesses from the dependence test and don't
+treat its allocation as opaque. Sound — distinct per-iteration memory carries no
+cross-iteration dependence, and replicating thread-private stack scratch is race-
+free. (Also `deAffinable` accepts `memref.alloca` so the de-affine emit clones it
+per shard.)
+
+**Result.** openai-gpt critical bands **85 → 37** (forall 434 → 482; the 37 left
+are the genuine softmax max/sum + LayerNorm mean/var reductions). E2E
+(`scripts/validate-spmd-openaigpt.sh`, batch-1, 16-core Zen4, median of 7):
+
+| | t1 | t16 | self-scaling | vs plain-seq@16t | err |
+|--|----|----|--------------|------------------|-----|
+| openai-gpt SPMD (was §11.13) | — | — | — | 1.01× | 0 |
+| openai-gpt SPMD (oracle fix) | 20.16s | **1.09s** | **18.5×** | **18.0×** | 0.00e+00 |
+
+Numerically EXACT (byte-identical to the sequential reference). resnet50 also
+improved 168/2 → 169/1 forall (no regression, e2e re-validated). Lit:
+`test/Parallel/spmd-perband-alloca-scratch.mlir`; full suite 246/0 (16 pre-existing
+ONNX unresolved).
+
+**Corrected verdict.** Whole-function SPMD IS a transformer lever after all —
+openai-gpt scales 18× (the GEMMs + pointwise are owner-computes parallel; only the
+true reductions stay serial). The earlier "convnet-only" claim was a measurement
+artifact of the oracle conservatism, not a property of transformers. This is
+ORTHOGONAL to the per-thread codegen lever (register-block + transcendentals,
+§ONNX_O3_GAP): SPMD parallelizes across threads, codegen speeds each thread —
+they compose (each parallel shard would run the vectorized per-thread kernel).

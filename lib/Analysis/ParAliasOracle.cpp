@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -108,19 +109,42 @@ ConflictKind ParAliasOracle::axisConflict(Operation *loopOp) const {
 
   // Gather affine accesses; flag any opaque effectful op (a call, a non-affine
   // memref.store, …) we cannot reason about ⇒ conservative.
+  // An alloca created INSIDE `loopOp` is loop-private: each iteration gets a
+  // fresh allocation, so its accesses carry no cross-iteration dependence and
+  // its allocation effect is benign under parallel execution (each thread/
+  // iteration owns its own scratch).  This is the demote/promote scalar
+  // accumulator pattern (GEMM+bias) -- without privatizing it the oracle marks
+  // the enclosing GEMM loops SEQUENTIAL(conservative) and they serialize.
+  auto isLoopPrivateScratch = [&](Value memref) {
+    Value root = allocationRoot(memref);
+    auto al = root.getDefiningOp<memref::AllocaOp>();
+    return al && loopOp->isProperAncestor(al.getOperation());
+  };
+  auto accessMemref = [](Operation *op) -> Value {
+    if (auto w = dyn_cast<affine::AffineWriteOpInterface>(op))
+      return w.getMemRef();
+    if (auto r = dyn_cast<affine::AffineReadOpInterface>(op))
+      return r.getMemRef();
+    return nullptr;
+  };
+
   SmallVector<Operation *, 16> accesses;
   bool sawOpaque = false;
   loop->walk([&](Operation *op) {
     if (op == loopOp)
       return;
     if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(op)) {
-      accesses.push_back(op);
-      return;
+      if (!isLoopPrivateScratch(accessMemref(op)))
+        accesses.push_back(op);
+      return; // loop-private alloca scratch: no cross-iteration dependence
     }
     if (op->hasTrait<OpTrait::IsTerminator>())
       return;
     if (isa<affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp>(
             op))
+      return;
+    // A loop-private alloca's allocation effect is benign under parallelism.
+    if (isa<memref::AllocaOp>(op) && loopOp->isProperAncestor(op))
       return;
     // A call to a provably-pure function touches no memory — benign under
     // parallel execution (M4 interprocedural consumption, sound subset).

@@ -404,6 +404,14 @@ static bool deAffinable(affine::AffineForOp shard) {
     if (isa<affine::AffineLoadOp, affine::AffineStoreOp, affine::AffineApplyOp,
             affine::AffineYieldOp>(op))
       return;
+    if (isa<memref::AllocaOp>(op))
+      return; // thread-private stack scratch (e.g. a demote/promote scalar
+              // accumulator left over from a GEMM+bias band).  Replicating it
+              // per shard is sound: the alloca address never escapes the band
+              // (only its loaded value is stored to the owner-computes output),
+              // so each forall iteration gets its own scratch.  Without this the
+              // alloca's allocation effect bails the whole band to par.critical
+              // -- which serialized openai-gpt's QKV/FC GEMMs (PARALLEL_SPMD §11.13).
     if (op->getNumRegions() != 0) {
       ok = false; // affine.if / scf / unknown region op
       return;
