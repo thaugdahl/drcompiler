@@ -536,3 +536,48 @@ stepped/unroll-jammed band back to `par.critical` (122/170 forall — the same
 register-block × perband gap seen on PolyBench).  Closing THAT (shard the
 register-blocked band) is the remaining frontier and would compound on top of the
 14× parallel scaling.
+
+## 11.13 openai-gpt (transformer) SPMD — NO-GO, serial-bound (2026-06-23)
+
+Applied the resnet50-winning pipeline (demote+promote → par-spmd-perband →
+par→omp, with the §11.12 de-affine fix) to openai-gpt
+(`openaigpt_Opset18.onnx`, static 1×128, two inputs: input_ids i64 +
+attention_mask f32 → hidden f32[1,128,768]). Repro:
+`scripts/validate-spmd-openaigpt.sh`.
+
+**Structurally it parallelizes** — 434/519 bands forall (84%), and promote
+composes (V0==V1, the de-affine fix carries over from convs to the transformer's
+GEMM/projection reductions). **But it does NOT scale:**
+
+| model | bands forall | scaling @16t | err |
+|-------|--------------|--------------|-----|
+| resnet50 (convnet)    | 168/170 (99%) | **14.5×** | 1e-6 |
+| openaigpt (transformer) | 434/519 (84%) | **1.01×** | 0 |
+
+plain-seq 20.5s; spmd 1t 21.2s / 16t 21.1s — flat.
+
+**Diagnosis (measured, not guessed).** At 16 threads the OpenMP team spins
+~600–700% CPU (not 1600%) with ZERO wall-time improvement — ~147 CPU-s to do
+21 CPU-s of work. `OMP_WAIT_POLICY=passive` leaves wall-time at 21.0s. So the
+700% CPU is barrier-spin waste; the forall bands hold ~none of the runtime, and
+wall-clock = the **serial critical path**:
+- **85 critical bands** = the genuine reductions (softmax max/sum over keys,
+  LayerNorm mean/var over hidden) that don't shard owner-computes;
+- **518 barriers** between 519 small bands — per-band parallel work is too small
+  to amortize the sync;
+- scalar transcendentals (Gelu `powf`+`tanh`, softmax `exp`) dominate compute.
+
+**Why convnet ≠ transformer for SPMD.** resnet50's convs are a few large dense
+parallel chunks (each forall is millions of MACs → barriers amortize). The
+transformer's runtime lives in serial reductions + scalar transcendentals spread
+over many tiny bands. Whole-function per-band SPMD exposes parallel *bands* but
+not parallel *work*.
+
+**Verdict.** SPMD is a CONVNET lever, not a transformer lever. This reinforces
+the prior transformer findings (`ONNX_O3_GAP_OPENAIGPT.md`,
+`TRANSFORMER_ELTWISE_SPEC.md`): openai-gpt's lever is **per-thread codegen** —
+the naive 20.5s seq drops ~70× to ~0.29s under the demote+register-block+promote
+codegen path (T1–T5c), where the remaining headroom is the scalar transcendentals
+(Gelu `powf(x,3)` never strength-reduced ~20–45% of runtime) and attention
+fusion, NOT parallelism. Barrier elision in perband would cut the spin waste but
+not the serial critical path, so it does not rescue scaling here.
