@@ -704,3 +704,44 @@ onnx-mlir's 0.120s.
 limitation. Beating onnx-mlir on the transformer now reduces to a *register-block
 coverage* problem (vectorize onnx-mlir's GEMM/conv forms), which the compose then
 multiplies by the 18× SPMD factor. That coverage work is the next frontier.
+
+## 11.17 Compose × register-block coverage — vec+par lands 4.6×, exposes the reduction floor (2026-06-23)
+
+§11.16 left the compose neutral on openai-gpt because `affine-register-block`
+didn't vectorize the dominant QKV/FC GEMMs. Cause found: `canonicalizeAllocaGemm`
+(which rewrites onnx-mlir's scalar-alloca-accumulator GEMM into a perfect
+register-blockable band) is **gated `if (mm.hasExplicitGemmModel)`** — it only
+runs when register-block is given a GEMM cost-model JSON. We never passed one.
+
+**Fix (pipeline, no code):** `affine-register-block{mr=8 nr=16
+cpu-cost-model-file=bench/zen4-gemm.json}`. With the GEMM model, vector ops jump
+**576 → 2880**, the dominant GEMMs vectorize, and the result still shards
+(530/615 forall).
+
+**Result (openai-gpt batch-1, 16-core Zen4; gv3 = demote, register-block{gemm
+model}, promote, perband → omp):**
+
+| config | t1 | t16 | scaling | err |
+|--------|----|----|---------|-----|
+| gv1 scalar SPMD | — | 1.09s | 18× | 0 |
+| **gv3 vec+SPMD compose** | **0.314s** | **0.234s** | 1.34× | 2.7e-6 |
+| onnx-mlir `--O3` seq | 0.58s | 0.58s | — | — |
+| onnx-mlir `--parallel` | 0.78s | 0.120s | 6.5× | — |
+
+Vectorization cut per-thread **20.1s → 0.314s (64×)**. gv3 @16t **0.234s** is
+**4.6× faster than our scalar SPMD** and **2.5× faster than onnx-mlir `--O3`
+seq** — but **2× behind onnx-mlir `--parallel` (0.120s)**.
+
+**Why the scaling collapsed to 1.34×: Amdahl flipped.** Once the GEMMs are
+vectorized (fast), the **serial part dominates** — ~73% of gv3's runtime is the
+**85 critical bands (softmax max/sum + LayerNorm mean/var reductions) + 614
+barriers**. So vec + par here is vec **+** par, not vec **×** par: vectorizing
+the parallel work made the *unparallelized reductions* the floor. onnx-mlir
+`--parallel` wins because it also parallelizes/fuses those reductions.
+
+**Status.** The full chain now fires: canonicalizeAllocaGemm vectorizes the
+GEMMs, perband shards the register-blocked bands (§11.16), compose is numerically
+exact. We beat onnx-mlir's vectorized seq. The last 2× to beat `--parallel` is
+**parallelizing the softmax/LayerNorm reductions** (`par.reduce`, already built
+for GPT softmax — commit 6ecb336) + **barrier elision** between same-axis bands
+(§4) to cut the 614-barrier overhead. That is the next frontier.

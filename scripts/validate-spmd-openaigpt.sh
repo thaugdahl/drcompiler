@@ -28,7 +28,8 @@ THREADS="${*:-1 2 4 8 16}"; ITERS="${ITERS:-7}"
 W="$(mktemp -d /tmp/spmd-ogpt.XXXX)"; trap 'rm -rf "$W"' EXIT
 MA="$(realpath "$MODEL")"
 dockt(){ local t=$1; shift; docker run --rm --entrypoint "$OMB/$t" -v "$W:$W" -v "$(dirname "$MA"):$(dirname "$MA")" "$IMG" "$@"; }
-LOWER="--lower-affine --convert-scf-to-cf --convert-math-to-libm --expand-strided-metadata --finalize-memref-to-llvm --convert-cf-to-llvm --convert-arith-to-llvm --convert-func-to-llvm --convert-openmp-to-llvm --reconcile-unrealized-casts"
+LOWER="--lower-affine --convert-vector-to-llvm --convert-scf-to-cf --convert-math-to-libm --expand-strided-metadata --finalize-memref-to-llvm --convert-cf-to-llvm --convert-arith-to-llvm --convert-func-to-llvm --convert-openmp-to-llvm --reconcile-unrealized-casts"
+GM="$REPO/bench/zen4-gemm.json"   # GEMM cost model -> hasExplicitGemmModel -> canonicalizeAllocaGemm
 
 echo "== front: static affine (openaigpt is already 1x128) =="
 dockt onnx-mlir --O2 --EmitMLIR -o "$W/m" "$MA" >/dev/null 2>&1
@@ -72,18 +73,23 @@ build_cfg(){ local nm=$1 pipe=$2
 }
 echo "== seq reference (krnl-free, no SPMD) =="
 build_cfg seq "builtin.module(lower-krnl-global)"
-echo "== spmd (demote+promote -> par-spmd-perband -> par->omp) =="
+echo "== spmd (scalar per-thread: demote+promote -> par-spmd-perband -> par->omp) =="
 build_cfg spmd "builtin.module(func.func(dr-affine-loop-distribute,dr-scalar-reduction-demote,dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
+echo "== spmd-codegen (VEC x PAR: register-block{gemm model} vectorizes the GEMMs, then SPMD shards) =="
+build_cfg spmd-codegen "builtin.module(func.func(dr-scalar-reduction-demote,affine-register-block{mr=8 nr=16 cpu-cost-model-file=$GM},dr-scalar-reduction-promote),lower-krnl-global,dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))"
 
 OMP_NUM_THREADS=1 "$W/seq.bin" "$W/seq.logits" 1 >/dev/null 2>&1
 med(){ sort -n "$1" | awk -v n="$ITERS" 'NR==int((n+1)/2){print;exit}'; }
-echo "== scaling + correctness (spmd vs seq) =="
-SREF=""
-for t in $THREADS; do
-  OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores "$W/spmd.bin" "$W/s.$t" "$ITERS" >"$W/t.$t" 2>/dev/null
-  m=$(med "$W/t.$t")
-  err=$(paste "$W/seq.logits" "$W/s.$t" | awk '{d=$1-$2;if(d<0)d=-d;if(d>ma)ma=d;a=($1<0?-$1:$1);if(a>mx)mx=a}END{printf "%.2e",(mx>0?ma/mx:ma)}')
-  [ -z "$SREF" ] && SREF=$m
-  spd=$(awk -v r="$SREF" -v m="$m" 'BEGIN{printf "%.2f",r/m}')
-  printf "  threads=%-3s median=%.3fs speedup=%sx norm_rel_err=%s\n" "$t" "$m" "$spd" "$err"
+for cfg in spmd spmd-codegen; do
+  [ -x "$W/$cfg.bin" ] || { echo "$cfg: no bin"; continue; }
+  echo "== $cfg: scaling + correctness (vs seq) =="
+  SREF=""
+  for t in $THREADS; do
+    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores "$W/$cfg.bin" "$W/$cfg.s.$t" "$ITERS" >"$W/$cfg.t.$t" 2>/dev/null
+    m=$(med "$W/$cfg.t.$t")
+    err=$(paste "$W/seq.logits" "$W/$cfg.s.$t" | awk '{d=$1-$2;if(d<0)d=-d;if(d>ma)ma=d;a=($1<0?-$1:$1);if(a>mx)mx=a}END{printf "%.2e",(mx>0?ma/mx:ma)}')
+    [ -z "$SREF" ] && SREF=$m
+    spd=$(awk -v r="$SREF" -v m="$m" 'BEGIN{printf "%.2f",r/m}')
+    printf "  threads=%-3s median=%.3fs speedup=%sx norm_rel_err=%s\n" "$t" "$m" "$spd" "$err"
+  done
 done
