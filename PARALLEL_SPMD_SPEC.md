@@ -635,3 +635,37 @@ artifact of the oracle conservatism, not a property of transformers. This is
 ORTHOGONAL to the per-thread codegen lever (register-block + transcendentals,
 §ONNX_O3_GAP): SPMD parallelizes across threads, codegen speeds each thread —
 they compose (each parallel shard would run the vectorized per-thread kernel).
+
+## 11.15 SPMD vs onnx-mlir native `--parallel` (batch-1) — split decision (2026-06-23)
+
+Head-to-head against onnx-mlir's own `--parallel` (its native EmitObj backend +
+OpenMP), batch-1, 16-core Zen4, 16 threads.  Scripts:
+`scripts/spmd-vs-native-parallel-{resnet50,openaigpt}.sh` (native EmitObj +
+OMTensor harness; the `--parallel` object needs libomp `__kmpc_*`, mounted from
+the host since neither onnx-mlir image ships it).
+
+| model | onnx-mlir `--O3` (vec, seq) | onnx-mlir `--O3 --parallel` @16t | our SPMD @16t (scalar/thread) | winner |
+|-------|---------------------------|----------------------------------|-------------------------------|--------|
+| resnet50  | 1.29s | 1.44s (**0.99×**, did NOT parallelize) | **0.152s** (14×) | **SPMD, 8.5×** |
+| openai-gpt | 0.58s | **0.120s** (6.52×, vec+par) | 1.09s (18×) | **onnx-mlir, 9.1×** |
+
+**onnx-mlir `--parallel` is inconsistent at batch-1**: it scales the transformer
+(6.5×) but completely fails resnet50 conv (0.99× — flat). Our SPMD scales BOTH
+(14× / 18×), so on *coverage* SPMD wins. (`--EmitMLIR` shows 0 `krnl.parallel`
+for both; misleading — the parallelization is applied in the `--EmitObj`
+lowering, so the binary is authoritative, not the krnl dump.)
+
+**The absolute winner flips on vectorization headroom, because onnx-mlir composes
+VEC + PAR and our SPMD is PAR-only (scalar per thread):**
+- resnet50: conv vec headroom is small (1.29s vec vs 2.11s our scalar = 1.6×), so
+  our 14× parallel beats their (failed-parallel) vectorized seq → SPMD wins 8.5×.
+- openai-gpt: transformer vec headroom is huge (0.58s vec vs 20.5s our scalar =
+  35×), so even our 18× parallel loses to their vec+par → onnx-mlir wins 9.1×.
+
+**Conclusion.** The decisive lever is not parallelism — it is composing
+vectorization WITH parallelism. onnx-mlir does both; our SPMD does only the
+parallel half (scalar per-thread, because `affine-register-block` currently turns
+the stepped/unroll-jammed band back to `par.critical` — the register-block ×
+perband gap). Closing that — register-block / transcendentals INSIDE each shard —
+is the one change that would beat onnx-mlir on BOTH (≈14× parallel × ≈30×
+per-thread vec headroom on the transformer). That is the next work item (§11.16).
