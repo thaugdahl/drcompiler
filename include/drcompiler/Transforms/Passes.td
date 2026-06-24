@@ -891,7 +891,7 @@ def LowerKrnlGlobalPass : Pass<"lower-krnl-global", "mlir::ModuleOp">
   }];
 
   let dependentDialects = ["memref::MemRefDialect", "scf::SCFDialect",
-                           "arith::ArithDialect"];
+                           "arith::ArithDialect", "affine::AffineDialect"];
   let constructor = "mlir::createLowerKrnlGlobalPass()";
 }
 
