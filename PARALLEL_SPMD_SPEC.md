@@ -788,3 +788,62 @@ no-cache-tile}` → demote/promote → par-spmd-perband → convert-par-to-omp. 
 `test/Parallel/spmd-perband-no-cache-tile.mlir`. Remaining headroom (not needed to
 win, but there): scaling is 4.3× not ~14× — ~18% serial (37 glue-critical bands +
 614 barriers); barrier elision (§4) would push further.
+
+## 11.19 Barrier elision LANDED — sound, 300/614 barriers removed, perf-NEUTRAL (2026-06-24)
+
+§4's barrier-elision analysis was diagnostic-only (the S1 spike, §11.5): it
+classified each inter-band edge ELIDE/HALO/REDISTRIBUTE/BARRIER but the
+perband materializer (`materializeWholeFunc`) still emitted a `par.barrier`
+before **every** band unconditionally. This wires the analysis INTO the
+materializer.
+
+**Mechanism (ParBubbles.cpp).** Generalize `classifyEdge` → `classifyEdgeShard`
+(takes the actual shard IVs, since the perband shard axis may sit below
+degenerate outer loops). Track every Forall band emitted since the last barrier
+(`pending`); a non-Forall producer (Critical band/glue, SeqWrap) sets
+`forcesBarrier`. A Forall band B elides its preceding barrier iff EVERY pending
+band A satisfies all three:
+1. **same owner partition** — identical `(lb, ub, step)` so the omp static
+   schedule maps iteration `s` to the same worker in both bands;
+2. **not imbalanced** — neither A nor B carries `par.dynamic` (a dynamic
+   schedule makes the owner of `s` non-static → no owner-aligned guarantee);
+3. **owner-aligned** — `classifyEdgeShard(A,B) == Elide` (every cross-band
+   write-pair on a shared buffer is the same affine map with the shard IV in the
+   same slots → worker `t` reads exactly what worker `t` wrote).
+
+This **only ever removes** barriers the pre-elision path emitted: every other
+sync site is byte-for-byte unchanged, so a non-elidable edge always keeps its
+`par.barrier` and any cross-shard glue read is still guarded.
+
+**Lowering (ConvertParToOMP.cpp).** The implicit end-of-wsloop barrier is the
+real sync, so elision must reach the omp form: a `par.forall` now gets `nowait`
+when its next op is a barrier/redistribute **OR another par.forall** (the elided
+edge — two foralls left adjacent only because the materializer proved them
+owner-aligned). A forall followed by replicated glue keeps `nowait=false`, so
+its implicit barrier still syncs the team before a cross-shard glue read (this
+is what keeps `@glue`'s read of `B[0]` sound). An S2 region never has adjacent
+foralls (always split by a barrier), so S2 is unaffected.
+
+**Soundness — execution-validated (not just IR).**
+- `test/Parallel/spmd-perband.mlir`: `@perlayer` keeps the cross-shard barrier
+  (`B[63-i]`, extent 64→32) and elides the owner-aligned one (`C[i]`, both 32);
+  `@glue` elides but band 1 keeps its implicit barrier; remark counts pinned.
+- **openai-gpt batch-1, scalar SPMD (gv1): 288 of 518 barriers elided, output
+  BYTE-IDENTICAL to sequential (err 0.00e+00), 12/12 repeated 16-thread runs
+  maxabsdiff 0** — a race in any of the 288 elisions would perturb the scalar
+  path; it doesn't.
+- gv4 vec×par: 300 of 614 elided, err 2.7e-6 (unchanged — the register-block FP
+  reassociation, NOT elision; elision reorders no arithmetic).
+- resnet50 batch-1: 16/171 elided, materializes clean (per-layer extent changes
+  64→128→256 mean most edges are different-partition → barrier kept).
+
+**Honest perf verdict: NEUTRAL on these kernels.** gv4 t16 = 0.079s (was 0.078s);
+gv1 t16 = 1.096s (was 1.09s) — both within run-to-run noise. Removing 300
+barriers did not move wall-clock: on pinned cores with busy-wait barriers each
+costs ~µs, negligible against an 0.079s kernel. The 4.3× cap is **Amdahl** (37
+serial critical bands), not barrier overhead — and eliding barriers cannot lift
+an Amdahl floor. The win lands where barriers ARE binding: the libdrpar pinned
+back-end (barriers cross NUMA, far more expensive) or many-tiny-band kernels at
+high thread counts. So this is the sound completion of the §4 mechanism (S1→S2
+analysis now actually fires), validated correct, kept because it never regresses
+— but it is NOT the lever for the transformer's remaining serial floor.

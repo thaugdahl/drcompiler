@@ -861,10 +861,12 @@ static bool alignedOnShard(Operation *x, Operation *y, Value sX, Value sY) {
 }
 
 /// Classify the barrier-elision verdict for the inter-band edge A -> B, sharded
-/// on their outermost (parallel) loops.  Sound: any non-provably-owner-aligned
-/// dependence keeps its sync.
-static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
-  Value sA = A.getInductionVar(), sB = B.getInductionVar();
+/// on the given shard IVs `sA`/`sB` (the outermost real-extent parallel loop of
+/// each, which may sit below degenerate outer loops -- so the caller passes the
+/// actual shard IV rather than A/B's outermost induction var).  Sound: any
+/// non-provably-owner-aligned dependence keeps its sync.
+static EdgeKind classifyEdgeShard(Operation *A, Value sA, Operation *B,
+                                  Value sB) {
   SmallVector<Operation *, 8> aa, bb;
   collectAccesses(A, aa);
   collectAccesses(B, bb);
@@ -900,6 +902,13 @@ static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
     }
   }
   return worst;
+}
+
+/// Diagnostic S0/S1 convenience: classify A -> B sharded on each band's
+/// outermost induction var.
+static EdgeKind classifyEdge(affine::AffineForOp A, affine::AffineForOp B) {
+  return classifyEdgeShard(A.getOperation(), A.getInductionVar(),
+                           B.getOperation(), B.getInductionVar());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1288,7 +1297,8 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
                                  unsigned &nForall, unsigned &nCritical,
                                  unsigned &nReplicated, unsigned &nMoved,
                                  unsigned &nBarrier, unsigned &shardable,
-                                 unsigned &nBands, StringRef &bailReason) {
+                                 unsigned &nBands, unsigned &nElided,
+                                 StringRef &bailReason) {
   Block &entry = fn.getBody().front();
   Operation *firstBand = nullptr, *lastBand = nullptr;
   for (Operation &op : entry)
@@ -1422,6 +1432,61 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
     ++shardable;
   };
 
+  // Barrier elision (PARALLEL_SPMD_SPEC.md §4).  A barrier before a Forall band
+  // is needed iff, since the last barrier, some worker wrote a location that a
+  // *different* worker accesses in this band.  Track every Forall band emitted
+  // since the last barrier (`pending`); a non-Forall state producer (Critical
+  // band/glue, SeqWrap) sets `forcesBarrier` so the next band always syncs (the
+  // conservative case -- this matches the pre-elision behavior exactly).  A
+  // Forall band B elides its barrier iff EVERY pending band A shards the SAME
+  // owner partition (identical lb/ub/step => omp static schedule maps iteration
+  // s to the same worker in both) AND A->B is owner-aligned on the shard axis
+  // (classifyEdgeShard == Elide).  This only ever *removes* barriers the
+  // pre-elision code emitted; every other sync site is unchanged.
+  struct Pend {
+    affine::AffineForOp shardLoop;
+    Value shardIV;
+    PerBandInfo info;
+  };
+  SmallVector<Pend, 32> pending;
+  bool forcesBarrier = false;
+  auto samePartition = [](const PerBandInfo &a, const PerBandInfo &b) {
+    if (a.dynExpr || b.dynExpr)
+      return false; // affine-expr extents: don't reason about the partition
+    if (a.lb != b.lb || a.step != b.step)
+      return false;
+    if ((a.dynUb != nullptr) != (b.dynUb != nullptr))
+      return false;
+    if (a.dynUb)
+      return a.dynUb == b.dynUb; // same runtime extent value
+    return a.ubConst == b.ubConst;
+  };
+  // Decide whether a barrier must precede Forall band B (info `bInfo`).
+  auto needBarrierForall = [&](const PerBandInfo &bInfo) -> bool {
+    if (nForall + nCritical == 0)
+      return false; // nothing emitted yet
+    if (forcesBarrier)
+      return true; // a non-Forall producer since the last barrier
+    affine::AffineForOp bShard = bInfo.nest[bInfo.shardIdx];
+    Value bIV = bShard.getInductionVar();
+    // Elision relies on the omp STATIC schedule mapping iteration s to the same
+    // worker in both bands.  An imbalanced band lowers to a DYNAMIC schedule
+    // (par.dynamic) -> the owner of s is not statically determined -> no aligned
+    // owner-computes guarantee; keep its sync.
+    if (bandImbalanced(bShard))
+      return true;
+    for (Pend &p : pending) {
+      if (bandImbalanced(p.shardLoop))
+        return true;
+      if (!samePartition(p.info, bInfo))
+        return true; // different owner partition: can't prove owner-aligned
+      if (classifyEdgeShard(p.shardLoop.getOperation(), p.shardIV,
+                            bShard.getOperation(), bIV) != EdgeKind::Elide)
+        return true; // a non-aligned cross-shard dependence
+    }
+    return false; // all pending bands are owner-aligned on B: elide
+  };
+
   for (size_t i = 0, e = span.size(); i < e; ++i) {
     Operation *op = span[i];
     switch (disp[i]) {
@@ -1433,11 +1498,17 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
       ++nBands;
       auto info = perBandShard(cast<affine::AffineForOp>(op), oracle);
       b.setInsertionPointToEnd(rblk);
-      if (nForall + nCritical > 0) {
+      if (needBarrierForall(*info)) {
         b.create<par::BarrierOp>(loc);
         ++nBarrier;
+        pending.clear();
+        forcesBarrier = false;
+      } else if (nForall + nCritical > 0) {
+        ++nElided; // a barrier the pre-elision path would have emitted
       }
       emitForall(*info);
+      affine::AffineForOp sl = info->nest[info->shardIdx];
+      pending.push_back({sl, sl.getInductionVar(), *info});
       break;
     }
     case Disp::SeqWrap: {
@@ -1451,6 +1522,8 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
         b.create<par::BarrierOp>(loc);
         ++nBarrier;
       }
+      pending.clear();
+      forcesBarrier = true; // its internal wsloop barriers don't fully sync it
       Value slb = expandForBound(b, loc, outer.getLowerBoundMap(),
                                  outer.getLowerBoundOperands(),
                                  /*isUpper=*/false, map);
@@ -1477,8 +1550,12 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
           b.create<par::BarrierOp>(loc);
           ++nBarrier;
         }
+        pending.clear();
       }
       cloneCritical(op);
+      // A critical band/glue op writes shared state single-worker; the next
+      // band must barrier to see it (matches the pre-elision nCritical>0 gate).
+      forcesBarrier = true;
       break;
     case Disp::Replicate:
       b.setInsertionPointToEnd(rblk);
@@ -1757,10 +1834,11 @@ struct DrParBubblesPass
         if (fn.isExternal())
           return;
         unsigned nForall = 0, nCritical = 0, nReplicated = 0, nMoved = 0,
-                 nBarrier = 0, shardable = 0, nBands = 0;
+                 nBarrier = 0, shardable = 0, nBands = 0, nElided = 0;
         StringRef bail;
         if (!materializeWholeFunc(fn, oracle, nForall, nCritical, nReplicated,
-                                  nMoved, nBarrier, shardable, nBands, bail)) {
+                                  nMoved, nBarrier, shardable, nBands, nElided,
+                                  bail)) {
           if (!bail.empty())
             fn.emitRemark("par-spmd-perband: not materialized (") << bail << ")";
           return;
@@ -1768,8 +1846,8 @@ struct DrParBubblesPass
         fn.emitRemark("par-spmd-perband: materialized foralls=")
             << nForall << " critical=" << nCritical
             << " replicated=" << nReplicated << " moved=" << nMoved
-            << " barriers=" << nBarrier << " (" << nBands << " bands, "
-            << shardable << " parallel)";
+            << " barriers=" << nBarrier << " elided=" << nElided << " ("
+            << nBands << " bands, " << shardable << " parallel)";
       });
     }
   }

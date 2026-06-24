@@ -111,10 +111,22 @@ static void lowerRegion(par::RegionOp region) {
     b.setInsertionPointToEnd(pblk);
     Operation *op = ops[i];
     if (auto forall = dyn_cast<par::ForallOp>(op)) {
-      // Suppress the implicit end-of-wsloop barrier when an explicit boundary
-      // barrier/redistribute follows (an elided edge inside an S2 region).
+      // Suppress the implicit end-of-wsloop barrier (`nowait`) when the next op
+      // is a boundary that already provides the right synchronization:
+      //   - par.barrier / par.redistribute: an explicit boundary does the sync
+      //     (S2 split run, or a non-elided perband edge).
+      //   - another par.forall: an ELIDED perband edge (PARALLEL_SPMD_SPEC.md
+      //     §4).  The materializer leaves two foralls adjacent (no par.barrier
+      //     between) ONLY when it proved the edge owner-aligned & same-partition
+      //     -> worker t reads exactly what worker t wrote -> no sync needed.  An
+      //     S2 region never has adjacent foralls (always split by a barrier),
+      //     so this case is unique to the perband path.
+      // Any other next op (replicated glue read, critical, control flow) keeps
+      // the implicit barrier (nowait=false): it conservatively syncs the team
+      // before a cross-shard glue access.
       bool nowait = (i + 1 < n) &&
-                    isa<par::BarrierOp, par::RedistributeOp>(ops[i + 1]);
+                    isa<par::BarrierOp, par::RedistributeOp, par::ForallOp>(
+                        ops[i + 1]);
       lowerForall(b, forall, nowait, m);
     } else if (isa<par::BarrierOp, par::RedistributeOp>(op)) {
       b.create<omp::BarrierOp>(loc);
