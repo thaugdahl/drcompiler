@@ -847,3 +847,58 @@ back-end (barriers cross NUMA, far more expensive) or many-tiny-band kernels at
 high thread counts. So this is the sound completion of the §4 mechanism (S1→S2
 analysis now actually fires), validated correct, kept because it never regresses
 — but it is NOT the lever for the transformer's remaining serial floor.
+
+## 11.20 Critical-band leverage panel + multi-D memcpy fix — serial floor 37→1, modest gain (2026-06-24)
+
+§11.19 left the openai-gpt scaling cap at 4.3×/16t with "37 glue-critical bands"
+as the suspected floor. A `par-spmd-diag` option (commit 782d806) characterized
+all 37 — per-level loop bounds + AxisKind + op histogram. They are exactly two
+classes of **pure layout glue, no FP math**:
+- **1 embedding Gather**: `loops[1,128,768]` all Conservative — an indirect
+  (data-dependent) `memref.load` the affine oracle treats as opaque.
+- **36 attention reshape/transpose**: `loops[1,128,12]`/`[1,12,128]` (12 heads,
+  128 seq, inner copy 64) all Conservative — built on `krnl.memcpy`, which
+  `lower-krnl-global` lowered to `scf.for { memref.load; memref.store }` over 1-D
+  `reinterpret_cast` views.
+
+**Panel (multi-agent, 4 lenses + adversarial verify + synthesis).** Winner:
+rewrite `lowerMemcpy`, not the oracle/materializer. The materializer-side "copy
+recognizer" was REJECTED — its soundness gate (shard IV hits one index slot
+injectively) does NOT prove per-shard write *images* disjoint through a strided
+`reinterpret_cast` (verified counterexample; the GPT reshapes are sound only
+because 64×12=768 tiles exactly — a property of the input, not the gate).
+
+**Perf attribution (perf, gv4 @16t, the panel's gating measurement).** ~75%
+real compute, **~18–20% `libomp` (`__kmpc_barrier` + spin)**, ~2.5% `libm`
+(tanhf 1.15%). This REFUTED the "transcendental floor" hypothesis and confirmed
+the serial bands' single-worker execution (15 idle cores spinning in the
+barrier) as the visible cost.
+
+**Fix (commit df557f0, `lib/Transforms/LowerKrnlGlobal.cpp`).** `lowerMemcpy`
+emits a MULTI-DIMENSIONAL affine copy on the original memrefs by delinearizing
+the flat offset against the memref strides (each offset term `operand_k *
+stride_d` → memref dim `d`; the copy IV fills the contiguous innermost dim):
+`dst[b][h][s][i] = src[b][s][h][i]`. Per-dimension subscripts let the dependence
+test prove the shard axis owner-disjoint (a transpose is disjoint on every axis),
+so the band shards into a `par.forall`. The flat 1-D form's LINEARIZED index
+(`64*s + 8192*h + i`) is what defeated the test on the seq axis (it proved head,
+stride 8192, but not seq, stride 64 vs `i<64`). SELF-GATING: emitted only when
+the pattern matches exactly; otherwise the known-correct flat copy is kept (band
+stays critical — sound).
+
+**Result.** critical **37 → 1** (only the gather remains; foralls 578 → 614).
+EXECUTION-VALIDATED: err vs sequential UNCHANGED at 2.7e-6 (a wrong
+delinearization would blow up). t16 0.079→**0.075s**, t8 0.095→**0.083s (−13%)**,
+scaling 4.17→**4.41×**. resnet50 uses ZERO krnl.memcpy → unaffected.
+
+**Honest verdict: MODEST (~5% @t16).** The floor was never the criticals'
+*compute* (~3–14ms, which is what we recovered) — the scaling cap is
+STRUCTURAL: ~600 small sequential bands each needing a team barrier (barriers
+only dropped 314→302; the kernel is seq=128/hidden=768, tiny per-band work).
+Parallelizing individual bands can't Amdahl past a 600-barrier sequence. The next
+real lever is **band FUSION** (merge adjacent same-axis foralls into fewer,
+larger parallel regions to cut the barrier count) — a bigger architectural change
+than this campaign. The gather (Class A) is 1 band, negligible; the panel's
+`oracle-gather-recognizer` (sound: distinct read-only root, owner-computes write)
+is parked unless measurement justifies it. Margin vs onnx-mlir `--parallel`:
+~1.5× → ~1.6×. Lit: `spmd-memcpy-reshape.mlir`, `spmd-memcpy-fallback.mlir`.
