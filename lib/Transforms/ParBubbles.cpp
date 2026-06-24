@@ -34,6 +34,7 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Twine.h"
 #include <map>
@@ -73,6 +74,17 @@ static StringRef describe(AxisKind k) {
     return "par-bubble axis: SEQUENTIAL (conservative)";
   }
   return "par-bubble axis: SEQUENTIAL (conservative)";
+}
+
+/// Compact one-glyph tag for a per-level AxisKind dump.
+static StringRef axisTag(AxisKind k) {
+  switch (k) {
+  case AxisKind::Parallel:     return "P";
+  case AxisKind::Carried:      return "Cd";
+  case AxisKind::Reduction:    return "Rd";
+  case AxisKind::Conservative: return "Cv";
+  }
+  return "Cv";
 }
 
 /// Classify the loop carried by `loopOp` (an affine.for or scf.for).
@@ -1293,11 +1305,56 @@ static bool seqWrappable(affine::AffineForOp root, const ParAliasOracle &oracle)
 /// par.barrier precedes each band.  Bails (no mutation) only if an in-region
 /// value (replicate/critical glue) escapes the span -- it can't (it lives
 /// inside omp.parallel).
+/// Emit a remark characterizing a CRITICAL (single-worker) band: per-level loop
+/// bounds + AxisKind (why no parallel shard axis exists) + an op-type histogram
+/// (what it computes).  Diagnostic only -- the leverage-point scout for the
+/// serial floor.
+static void describeCriticalBand(affine::AffineForOp band,
+                                 const ParAliasOracle &oracle) {
+  SmallVector<affine::AffineForOp, 4> nest;
+  affine::getPerfectlyNestedLoops(nest, band);
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "par-spmd-critical: loops[";
+  for (unsigned i = 0; i < nest.size(); ++i) {
+    affine::AffineForOp l = nest[i];
+    if (i)
+      os << ",";
+    if (l.hasConstantLowerBound() && l.hasConstantUpperBound())
+      os << l.getConstantLowerBound() << ":" << l.getConstantUpperBound();
+    else
+      os << "dyn";
+    os << "(" << axisTag(classifyLoop(l.getOperation(), oracle)) << ")";
+  }
+  os << "]";
+  if (nest.back().getNumResults() > 0)
+    os << " iter_args=" << nest.back().getNumResults();
+  // Op-type histogram over the whole band subtree (skip the loop/yield scaffold).
+  llvm::MapVector<StringRef, unsigned> hist;
+  band.getBody()->walk([&](Operation *op) {
+    StringRef n = op->getName().getStringRef();
+    if (n.starts_with("affine.for") || n.ends_with(".yield") ||
+        n.starts_with("affine.apply"))
+      return;
+    hist[n]++;
+  });
+  os << " ops{";
+  bool first = true;
+  for (auto &kv : hist) {
+    if (!first)
+      os << " ";
+    os << kv.first << ":" << kv.second;
+    first = false;
+  }
+  os << "}";
+  band->emitRemark(os.str());
+}
+
 static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
                                  unsigned &nForall, unsigned &nCritical,
                                  unsigned &nReplicated, unsigned &nMoved,
                                  unsigned &nBarrier, unsigned &shardable,
-                                 unsigned &nBands, unsigned &nElided,
+                                 unsigned &nBands, unsigned &nElided, bool diag,
                                  StringRef &bailReason) {
   Block &entry = fn.getBody().front();
   Operation *firstBand = nullptr, *lastBand = nullptr;
@@ -1543,8 +1600,10 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
       break;
     }
     case Disp::Critical:
-      if (isa<affine::AffineForOp>(op)) {
+      if (auto cband = dyn_cast<affine::AffineForOp>(op)) {
         ++nBands;
+        if (diag)
+          describeCriticalBand(cband, oracle);
         b.setInsertionPointToEnd(rblk);
         if (nForall + nCritical > 0) {
           b.create<par::BarrierOp>(loc);
@@ -1838,7 +1897,7 @@ struct DrParBubblesPass
         StringRef bail;
         if (!materializeWholeFunc(fn, oracle, nForall, nCritical, nReplicated,
                                   nMoved, nBarrier, shardable, nBands, nElided,
-                                  bail)) {
+                                  parSpmdDiag, bail)) {
           if (!bail.empty())
             fn.emitRemark("par-spmd-perband: not materialized (") << bail << ")";
           return;

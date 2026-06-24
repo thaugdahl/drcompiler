@@ -823,6 +823,12 @@ def DrParBubblesPass : Pass<"dr-par-bubbles", "mlir::ModuleOp">
            "consecutive bands (the consumer reads the full producer output). "
            "Bails (with a count) if any band's outer loop is not a "
            "materializable parallel axis. See PARALLEL_SPMD_SPEC.md.">,
+    Option<"parSpmdDiag", "par-spmd-diag", "bool", "false",
+           "With par-spmd-perband: emit one remark per CRITICAL (non-shardable, "
+           "single-worker) band describing its loop-nest bounds, the per-level "
+           "AxisKind (why no parallel shard axis was found), and an op-type "
+           "histogram (what it computes).  Diagnostic for finding the serial "
+           "floor; no IR change beyond the perband materialization.">,
     Option<"parSpmd", "par-spmd", "bool", "false",
            "Materialize whole-function SPMD (S2): widen every top-level "
            "shard-axis band into ONE par.region, hoist one par.forall over the "

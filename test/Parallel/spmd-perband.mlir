@@ -2,6 +2,10 @@
 // RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband})' -verify-diagnostics
 // RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-scf))' | FileCheck %s --check-prefix=SCF
 // RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband},func.func(convert-par-to-omp))' | FileCheck %s --check-prefix=OMP
+// par-spmd-diag characterizes each CRITICAL band (loop bounds + AxisKind + op
+// histogram) -- the serial-floor scout.  @with_critical's band carries B[i]<-B[i-1].
+// RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband par-spmd-diag})' 2>&1 | FileCheck %s --check-prefix=DIAG
+// DIAG: par-spmd-critical: loops[1:64(Cd)] ops{affine.load:1 arith.addf:1 affine.store:1}
 
 // S7 batch-1 within-sample: each band shards its OWN outermost parallel loop
 // (extents differ per layer: 64, 32, 32), one par.region.  Layer 2 reads B
