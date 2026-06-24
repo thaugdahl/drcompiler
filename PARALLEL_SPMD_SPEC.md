@@ -902,3 +902,44 @@ than this campaign. The gather (Class A) is 1 band, negligible; the panel's
 `oracle-gather-recognizer` (sound: distinct read-only root, owner-computes write)
 is parked unless measurement justifies it. Margin vs onnx-mlir `--parallel`:
 ~1.5× → ~1.6×. Lit: `spmd-memcpy-reshape.mlir`, `spmd-memcpy-fallback.mlir`.
+
+## 11.21 Shard-axis consistency — investigated, MEASURED WORSE, greedy already wins (2026-06-24)
+
+§11.20 left the openai-gpt batch-1 scaling cap at the 302 non-elided barriers.
+Hypothesis (lever #2 of the critical-band panel): the barriers are avoidable
+RESHARDS -- consecutive bands shard different axes because `perBandShard` greedily
+picks each band's OUTERMOST parallel axis with no coordination; a coordinated
+"global dominant axis" choice would align them and elide the barriers.
+
+**Scout (`par-spmd-axes` diagnostic, kept).** Under `par-spmd-diag`,
+`describeBandAxes` emits every band's parallel-axis extents + the extent
+perBandShard chose. On openai-gpt (615 bands):
+- 506 bands chose seq=128 (GEMMs, eltwise, LayerNorm, residual).
+- **108 bands chose head=12 despite having seq=128 available** (attention scores
+  `[12,128,128]`, head reshapes `[12,128,64]`, etc.) -- head is their outermost
+  parallel loop.
+
+This looked like 108 mis-sharded bands forcing needless barriers (and under-using
+16 cores at 12-way). So: auto-detect the dominant extent (128) and make
+perBandShard prefer it via a sound interchange (perfect nests, past
+parallel/degenerate outers; `buildSeqSkip` sinks the interchanged loops;
+`needBarrierForall` still verifies owner-alignment).
+
+**Result: WORSE.** Barriers **302 → 326**, elided 312 → 288. The hypothesis was
+wrong. Multi-head attention is INTRINSICALLY head-parallel: the 108 head-sharded
+bands align WITH EACH OTHER as a head-consistent sub-region (each head is an
+independent attention computation). The greedy outermost choice is therefore
+ALREADY locally axis-consistent -- head inside attention, seq elsewhere. Forcing
+one global axis (seq) shatters the attention sub-region's internal alignment and
+adds reshards, while the head↔seq boundary (a genuine transpose) reshards either
+way. So the 302 barriers are largely GENUINE region-boundary reshards (head↔seq
+at each attention block's entry/exit) + reductions, not greedy mis-coordination.
+
+**Verdict: NO-GO for global-dominant consistency.** The greedy per-band axis is
+near-optimal for the two-region (seq / head) structure. Reverted the preference
+mechanism (no validated benefit, measured regression); kept the `par-spmd-axes`
+diagnostic that produced the finding. The real lever for the boundary reshards is
+`par.redistribute` (§4 REDISTRIBUTE -- a 1-D owner remap / data movement), a
+heavier feature than axis re-selection, with diminishing returns at batch-1.
+Throughput (batch>1, the batch axis is 33/33 ELIDE, §11.5) remains the
+structurally-sound high-value direction.

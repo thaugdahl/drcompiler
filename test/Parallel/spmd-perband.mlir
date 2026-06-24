@@ -6,6 +6,13 @@
 // histogram) -- the serial-floor scout.  @with_critical's band carries B[i]<-B[i-1].
 // RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband par-spmd-diag})' 2>&1 | FileCheck %s --check-prefix=DIAG
 // DIAG: par-spmd-critical: loops[1:64(Cd)] ops{affine.load:1 arith.addf:1 affine.store:1}
+// par-spmd-axes scouts shard-axis CONSISTENCY: each band's parallel-axis extents
+// + the extent perBandShard chose (greedy outermost).  @perlayer band 2 has both
+// 32 and 64 parallel but greedily shards 32.  (A global-dominant-axis preference
+// was measured WORSE on openai-gpt -- §11.21 -- so the greedy choice stands.)
+// RUN: dr-opt %s --pass-pipeline='builtin.module(dr-par-bubbles{par-spmd-perband par-spmd-diag})' 2>&1 | FileCheck %s --check-prefix=AXES
+// AXES-DAG: par-spmd-axes: par=[64,64] chosen=64
+// AXES-DAG: par-spmd-axes: par=[32,64] chosen=32
 
 // S7 batch-1 within-sample: each band shards its OWN outermost parallel loop
 // (extents differ per layer: 64, 32, 32), one par.region.  Layer 2 reads B

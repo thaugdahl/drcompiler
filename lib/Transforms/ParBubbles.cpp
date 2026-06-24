@@ -1144,7 +1144,10 @@ static std::optional<PerBandInfo> perBandShard(affine::AffineForOp root,
   // loops (e.g. the batch axis at batch=1) are skipped -- they nest inside the
   // forall (a trivial interchange, sound because they run once).  A
   // non-degenerate loop that ISN'T the shard axis above it would block the
-  // interchange, so bail then.
+  // interchange, so bail then.  (NOTE §11.21: a global-dominant-axis preference
+  // was tried here and MEASURED WORSE on openai-gpt -- the greedy outermost is
+  // already locally axis-consistent, head-parallel inside attention and
+  // seq-parallel elsewhere; forcing one global axis shatters that.  Reverted.)
   unsigned n = info.nest.size(), d = 0;
   for (; d < n; ++d) {
     affine::AffineForOp l = info.nest[d];
@@ -1350,6 +1353,42 @@ static void describeCriticalBand(affine::AffineForOp band,
   band->emitRemark(os.str());
 }
 
+/// Emit the parallel real-extent axis extents of a band's perfect nest (the
+/// shard-axis candidates), plus the extent perBandShard actually chose.  The
+/// scout for shard-axis CONSISTENCY: an inter-band barrier is "addressable"
+/// (could be elided by a coordinated axis choice) when consecutive bands share
+/// a common parallel-axis extent but perBandShard picked different ones.
+static void describeBandAxes(affine::AffineForOp band,
+                             const ParAliasOracle &oracle) {
+  SmallVector<affine::AffineForOp, 4> nest;
+  affine::getPerfectlyNestedLoops(nest, band);
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "par-spmd-axes: par=[";
+  bool first = true;
+  for (affine::AffineForOp l : nest) {
+    if (classifyLoop(l.getOperation(), oracle) != AxisKind::Parallel)
+      continue;
+    if (!l.hasConstantLowerBound() || !l.hasConstantUpperBound())
+      continue;
+    int64_t ext = l.getConstantUpperBound() - l.getConstantLowerBound();
+    if (ext <= l.getStepAsInt())
+      continue; // degenerate
+    if (!first)
+      os << ",";
+    os << ext;
+    first = false;
+  }
+  os << "]";
+  if (auto info = perBandShard(band, oracle))
+    os << " chosen=" << (info->dynUb || info->dynExpr
+                             ? -1
+                             : info->ubConst - info->lb);
+  else
+    os << " chosen=none";
+  band->emitRemark(os.str());
+}
+
 static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
                                  unsigned &nForall, unsigned &nCritical,
                                  unsigned &nReplicated, unsigned &nMoved,
@@ -1546,6 +1585,8 @@ static bool materializeWholeFunc(func::FuncOp fn, const ParAliasOracle &oracle,
 
   for (size_t i = 0, e = span.size(); i < e; ++i) {
     Operation *op = span[i];
+    if (diag && isa<affine::AffineForOp>(op))
+      describeBandAxes(cast<affine::AffineForOp>(op), oracle);
     switch (disp[i]) {
     case Disp::Move:
       op->moveBefore(regionOp); // keep identity; dominates region + post-span
