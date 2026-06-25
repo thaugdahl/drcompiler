@@ -943,3 +943,51 @@ diagnostic that produced the finding. The real lever for the boundary reshards i
 heavier feature than axis re-selection, with diminishing returns at batch-1.
 Throughput (batch>1, the batch axis is 33/33 ELIDE, §11.5) remains the
 structurally-sound high-value direction.
+
+## 11.22 openai-gpt batch>1 THROUGHPUT SPMD — byte-exact, beats onnx-mlir --parallel 2.8x (2026-06-25)
+
+§11.21 concluded batch-1 latency is structurally sync-bound (the greedy
+materializer is already near-optimal; the floor is ~600 tiny sequential bands).
+The high-value direction is THROUGHPUT: at batch>1 the BATCH axis is the
+universal shard axis -- every band's outermost loop, non-degenerate, fully
+parallel across the whole net -- so perBandShard shards it for all 614 bands,
+each band does N* the work, and the inter-band barriers AMORTIZE.
+
+**Model blocker + fix.** openai-gpt bakes batch=1 into its un-flatten Reshape
+shape constants ([1,128,12,64] etc.); --shapeInformation alone leaves them at 1
+("inferred dim 16 != existing dim 1, use existing").  `scripts/patch-onnx-
+dynamic-batch.py` sets the input/output batch dim symbolic, drops baked
+value_info, and rewrites 97 Reshape leading-1 dims to -1.  Then --shapeInformation
+="0:Nx128,1:Nx128" compiles at batch=N (447 `to 16` loops, output 16x128x768, 0
+warnings).  Recipe = the batch-1 winner (§11.18): register-block{no-cache-tile}
+-> demote/promote -> par-spmd-perband -> par->omp.
+
+**Result (batch=16, 16-core Zen4, median of 7):**
+
+| config | t1 | t16 | scaling | throughput | err |
+|--------|----|----|---------|-----------|-----|
+| our seq (no SPMD) | 4.50s | 4.46s | 1.0x (flat) | 3.6 smp/s | 0 |
+| **our batch SPMD** | 4.76s | **0.448s** | **10.6x** | **35.7 smp/s** | **0.00e+00** |
+| onnx-mlir --parallel | 11.79s | 1.251s | 9.4x | 12.8 smp/s | -- |
+| onnx-mlir --O3 seq | 8.76s | 8.76s | -- | 1.8 smp/s | -- |
+
+**WE BEAT onnx-mlir --parallel 2.8x** (0.448s vs 1.251s; 35.7 vs 12.8 smp/s) and
+the output is **BYTE-IDENTICAL to the sequential reference (err 0.00e+00, 8/8
+repeated 16-thread runs maxabsdiff 0)** -- the multi-D memcpy delinearization
+(§11.20) handles the batch>1 reshapes correctly.  Two composing wins: per-thread
+compute already 1.8x faster than native --O3 (register-block vectorization), x
+near-linear batch parallelism (10.6x = 66% efficiency, vs batch-1's 4.4x/27%).
+
+**Sweet spot = core count.** batch=32 is MEMORY-BANDWIDTH limited: t16 26.5 smp/s
+(< batch=16's 35.7), 8->16 scaling only 1.11x -- the larger working set saturates
+DRAM.  batch=16 (= cores) fits best.  The remaining gap to linear (10.6x vs 16x)
+is the 326 amortized barriers (the B*S=2048 flatten-for-GEMM vs batch=16 axis
+mismatch keeps them non-elided) + the 1 serial embedding-gather band + bandwidth;
+eliding the flatten reshards (relating the flattened B*S axis to the batch
+sub-axis) is the residual lever.
+
+Harness: `scripts/spmd-throughput-openaigpt.sh` (patch -> batch=N front-end ->
+build -> measure) + `scripts/patch-onnx-dynamic-batch.py`.  No compiler change --
+the batch-1 SPMD machinery (multi-D memcpy, perband, elision) handles batch>1 as
+is.  **Headline: SPMD is a throughput lever -- 2.8x over native --parallel,
+byte-exact, near-linear to core count.**
