@@ -1314,7 +1314,114 @@ public:
             continue;
           sizes = {(unsigned)mt.mc, (unsigned)mt.nc, (unsigned)mt.kc};
         }
-        (void)affine::tilePerfectlyNested(in, sizes);
+
+        // The cost model sizes a macro-tile for CAPACITY; it has no reason to
+        // land on a divisor of the extent, and PolyBench's LARGE sizes are
+        // deliberately non-round (gemm 1000x1100x1200 vs a 128x256x256 tile --
+        // none of the three divide).  A non-divisor tile makes
+        // tilePerfectlyNested emit intra-tile loops bounded by `to min`, whose
+        // bound map has two results; getConstantTripCount then returns nullopt,
+        // loopUnrollJamByFactor rejects the band (its `largestDiv % factor`
+        // test), and Stage 3 drops it at the `mrB > 1 && failed(...)` guard --
+        // so the whole GEMM falls back to scalar code.  Measured on gemm LARGE:
+        // 0 vector ops with a cost-model JSON, 98 without one.
+        //
+        // Two steps recover it:
+        //  (A) Align the tile DOWN to the micro-kernel's granularity.  Even a
+        //      full tile is rejected by the vectorizer unless its extent is a
+        //      multiple of VL (Vectorize.cpp's `trip % VL != 0` path then
+        //      demands a constant lower bound, which a `#map(%tileIV)` tile
+        //      bound is not).  Aligning is what makes the full tile vectorize;
+        //      separation (below) is what makes aligning cheap, by turning the
+        //      shaved-off part into remainder work rather than scalarizing
+        //      everything.  Alignment is DOWNWARD ONLY: rounding UP would undo
+        //      the capacity decision macroTile just made and could push a tile
+        //      past its own extent, manufacturing raggedness on a band that
+        //      tiled cleanly.  A tile already below the micro-kernel granularity
+        //      cannot be register-blocked at that size at all, so there is
+        //      nothing for versioning to unlock -- fall back to plain tiling,
+        //      i.e. exactly today's behaviour.
+        //  (B) Version the nest into a full-tile clone (single-result bound
+        //      maps, constant trip == the tile size) and the original ragged
+        //      nest, via the same separateFullTiles the sibling tiler already
+        //      uses (AffineLoopTilingCostModel/LoopTiling.cpp).  The
+        //      register-blocker then crushes the full tile and self-filters the
+        //      remainder (loopUnrollJamByFactor fails on its `min` bound).
+        const unsigned nrA = vl ? ((nr + vl - 1) / vl) * vl : nr;
+        if (!mr || !nrA || !vl || sizes[0] < mr || sizes[1] < nrA ||
+            sizes[2] < vl) {
+          (void)affine::tilePerfectlyNested(in, sizes);
+          continue;
+        }
+        sizes[0] = (sizes[0] / mr) * mr;
+        sizes[1] = (sizes[1] / nrA) * nrA;
+        sizes[2] = (sizes[2] / vl) * vl;
+
+        // Degenerate after alignment: the tile spans the whole band, so tiling
+        // would only add point bounds (same rationale as MachineModel.h's
+        // `tmc >= M && tnc >= N && tkc >= K` skip).
+        if ((int64_t)sizes[0] >= ie && (int64_t)sizes[1] >= je &&
+            (int64_t)sizes[2] >= ke) {
+          (void)affine::tilePerfectlyNested(in, sizes);
+          continue;
+        }
+
+        const unsigned depth = in.size();
+        SmallVector<AffineForOp, 6> tiledNest;
+        if (failed(affine::tilePerfectlyNested(in, sizes, &tiledNest)))
+          continue; // `in` is untouched on failure -- leave the band alone.
+        if (tiledNest.size() != 2 * depth)
+          continue; // unexpected shape -- do not touch it further.
+
+        // Version over the SPATIAL point loops only, NOT the reduction.  The
+        // band is i-j-k with the reduction (k) innermost (the band matcher
+        // collects {iLoop, jLoop, kLoop} that way), and only the two spatial
+        // loops are unroll-jammed by mr x nr downstream -- the reduction stays a
+        // plain accumulation loop that a `to min` bound never blocks.  Versioning
+        // the reduction too would divert its whole remainder k-panel (e.g. the
+        // 176-of-1200 tail of gemm LARGE, ~15% of the FLOPs) into the fully
+        // scalar else branch for no benefit; leaving k unversioned keeps that
+        // tail inside the register-blocked full tile (its k loop simply runs to
+        // min(kk+kc, K)).  So the full-tile fraction is the product over the
+        // SPATIAL dims only.
+        MutableArrayRef<AffineForOp> pointLoops =
+            MutableArrayRef<AffineForOp>(tiledNest).drop_front(depth);
+        MutableArrayRef<AffineForOp> intraTile =
+            depth >= 2 ? pointLoops.take_front(depth - 1) : pointLoops;
+
+        // Version ONLY a nest that tilePerfectlyNested actually made ragged --
+        // i.e. one whose (spatial) intra-tile loops carry a two-result `to min`
+        // upper bound.  Reading it off the built maps (rather than `extent %
+        // size`) is exact: when an aligned size exceeds its extent MLIR folds the
+        // point bound to a single-result constant ub, which `extent % size != 0`
+        // would misreport as ragged and drive separateFullTiles to emit a
+        // tautological `affine.if () : (0 == 0)` with the body cloned into both
+        // regions (Stage 1b runs no canonicalizer to fold it away).
+        bool ragged = false;
+        for (AffineForOp pl : intraTile)
+          ragged |= pl.getUpperBoundMap().getNumResults() > 1;
+        if (!ragged)
+          continue;
+
+        // separateFullTiles asserts contiguous nesting and unit step; both
+        // asserts compile out in this Release build, so check explicitly rather
+        // than risk silent UB.  tilePerfectlyNested builds the point loops
+        // contiguous and unit-step, so neither should ever fire.
+        bool wellFormed = true;
+        for (unsigned d = 0; d < intraTile.size(); ++d) {
+          if (intraTile[d].getStepAsInt() != 1)
+            wellFormed = false;
+          else if (d && intraTile[d]->getParentOp() != intraTile[d - 1])
+            wellFormed = false;
+        }
+        if (!wellFormed)
+          continue;
+
+        // NON-FATAL on failure: createFullTiles erases its speculative loops on
+        // every bail-out path, so the IR is left exactly as tilePerfectlyNested
+        // produced it -- i.e. today's behaviour.  Same policy as upstream
+        // LoopTiling.cpp.
+        (void)affine::separateFullTiles(intraTile);
       }
     }
 
