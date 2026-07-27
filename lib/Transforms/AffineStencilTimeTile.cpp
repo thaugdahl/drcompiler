@@ -212,9 +212,17 @@ private:
     if (!t.hasConstantLowerBound() || !t.hasConstantUpperBound() ||
         t.getStepAsInt() != 1)
       return failure();
+    // The classifier above only guarantees exactly 2 AffineForOp children
+    // among possibly-other memory-effect-free ops in t's body (e.g. a stray
+    // effect-free scalar op) -- re-filter here instead of blindly casting
+    // every op, which crashed on non-stencil kernels (e.g. symm) that
+    // happen to match the "2 nests" shape by coincidence.
     SmallVector<AffineForOp, 2> nestRoots;
     for (Operation &op : t.getBody()->without_terminator())
-      nestRoots.push_back(cast<AffineForOp>(&op));
+      if (auto f = dyn_cast<AffineForOp>(&op))
+        nestRoots.push_back(f);
+    if (nestRoots.size() != 2)
+      return failure();
 
     SpaceNest n1, n2;
     if (!matchSpaceNest(nestRoots[0], n1) || !classifyBody(n1) ||
