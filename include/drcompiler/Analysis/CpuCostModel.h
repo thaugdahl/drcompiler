@@ -48,6 +48,10 @@ struct CpuArchJsonParams {
   // Compute-roofline arm (WP-T2: transformer GEMM kernel-kind dispatch).  FP FMA
   // issue pipes; absence keeps the compute arm inert (BW-only, as today).
   std::optional<unsigned> fmaUnits;
+  // Fraction of the effective LLC the GEMM configurator trusts a working set to
+  // occupy before it tiles (contention/associativity headroom); absence keeps
+  // the MachineModel default.
+  std::optional<double> llcTileLeniency;
 };
 
 /// Optional thread / parallel-execution parameters parsed from a cost-model

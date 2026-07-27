@@ -1,4 +1,4 @@
 {
-  "cache": { "l2_size": 16384 },
-  "arch": { "fma_units": 2 }
+  "cache": { "l2_size": 16384, "l3_size": 32768 },
+  "arch": { "fma_units": 2, "llc_tile_leniency": 0.5 }
 }

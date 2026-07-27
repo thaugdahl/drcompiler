@@ -39,6 +39,20 @@ struct MachineModel {
   // Shared-LLC contention: effective LLC = l3Size / llcSharers.
   unsigned llcSharers = 1;     // dr-llc-sharers / llc-sharers default
 
+  // Leniency for the "does the working set fit the LLC?" tiling decision
+  // (gemmBlocking).  The nominal effective LLC (l3Size / llcSharers) is an
+  // OPTIMISTIC ceiling: set-associativity conflicts, and under sharing the
+  // races with co-tenants for the same sets, evict lines well before a working
+  // set reaches nominal capacity -- so a SNUG fit is reloaded from DRAM in
+  // practice and should be tiled, not trusted to stay resident.  The GEMM
+  // configurator therefore treats the working set as "fitting" only when it is
+  // below `llcTileLeniency * effectiveLLC`.  1.0 == trust the whole share
+  // (no headroom); lower == demand more slack before skipping the tile.  A
+  // machine-specific knob (settable from the cost-model JSON's
+  // arch.llc_tile_leniency); the default leaves comfortable-but-not-snug
+  // sole-occupant working sets untiled while tiling snug ones.
+  double llcTileLeniency = 0.5;
+
   // Page / TLB locality (NEW in v4).  Used by the A2 k-chunk target and any
   // page-locality-sensitive tiling.  Defaults are typical Zen4/SKX: 4 KB
   // pages, ~1.5K-entry L2 TLB.
@@ -398,17 +412,33 @@ struct MachineModel {
     t.nr = 16;
     t.vl = static_cast<unsigned>(preferredVectorElems(elemBytes, t.mr, t.nr));
     t.kind = GemmKernel::Broadcast; // WP-T4 adds tiny-K OuterProduct via the ridge
-    // Deep-K cache-tiling decision (WP-T3/T5): tile so the active B-panel becomes
-    // L2-resident.  The budget is the effective L2, NOT the LLC: on a big-LLC
-    // host (the 7950X3D's 128 MiB V-cache) the openai-gpt FFN working set (~11
-    // MiB) already fits L3, so an LLC-budgeted tile never fires -- yet the
-    // register-block kernel still streams the ~9 MiB B from L3 every i-pass.
-    // Tiling the macro-kernel to L2 (the classic BLIS level) brings the B-panel
-    // resident and is the actual lever for the 36x openai-gpt gap (WP-T0).  Sizes
-    // via macroTile from a 256^3 macro start (the pass's mc/nc/kc default).
-    MacroTile mt =
-        macroTile(M, N, K, 256, 256, 256, t.mr, t.nr, t.vl, elemBytes,
-                  effectiveCache(L2));
+    // Deep-K cache-tiling decision (WP-T3/T5), TIERED on the cache we can
+    // actually COUNT ON: the effective LLC after the co-tenant derate
+    // (l3Size / llcSharers).
+    //   * ws fits the effective LLC  -> DO NOT tile.  As sole occupant
+    //     (llcSharers=1) the whole LLC is ours, so the working set streams fine
+    //     from L3 and the register-block micro-kernel alone wins.  (Measured on
+    //     a 96 MiB-LLC host: a gemm whose 28 MiB working set fits the LLC runs
+    //     2.7x over clang UNTILED but 1.3x SLOWER once tiled -- the strip-mine
+    //     overhead and remainder outweigh an L2-residency the big shared cache
+    //     made unnecessary.)
+    //   * ws does NOT fit the effective LLC -> tile it down onto the PORTION OF
+    //     LLC AVAILABLE (that same l3Size / llcSharers budget), so the macro
+    //     working set stays resident in the cache we can count on.  Under
+    //     contention the effective LLC shrinks and the tile shrinks with it;
+    //     this is the openai-gpt FFN lever (a dozen co-tenants shrink the
+    //     effective LLC below the ~11 MiB FFN footprint, so it tiles) that a
+    //     sole-occupant gemm never triggers.  The decision follows llcSharers.
+    // macroTile does both tiers in one call: it returns skip when the working
+    // set already fits `budgetBytes`, else shrinks a 256^3 macro to fit it.
+    // The budget is the effective LLC derated by the leniency metric, so a snug
+    // fit (which contention would reload anyway) tiles instead of skipping.
+    // (Earlier this budgeted to L2 unconditionally, which silently tiled every
+    // sole-occupant gemm too -- the pessimization above.)
+    int64_t llcBudget =
+        static_cast<int64_t>(effectiveCache(L3) * llcTileLeniency);
+    MacroTile mt = macroTile(M, N, K, 256, 256, 256, t.mr, t.nr, t.vl, elemBytes,
+                             llcBudget);
     if (!mt.skip) {
       t.cacheTile = true;
       t.mc = mt.mc;

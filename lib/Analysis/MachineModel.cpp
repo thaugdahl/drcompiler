@@ -66,6 +66,10 @@ MachineModel MachineModel::fromJson(llvm::StringRef path) {
     mm.fmaUnits = *a.fmaUnits;
     mm.hasExplicitGemmModel = true;
   }
+  // Leniency tunes the gemmBlocking tiling decision but does NOT by itself
+  // enable it (that needs a GEMM-model signal above); map the value if present.
+  if (a.llcTileLeniency)
+    mm.llcTileLeniency = *a.llcTileLeniency;
   // Cross-field sanity: the native datapath cannot be wider than the encodable
   // vector (a partial JSON that sets only vector_bits_native above the default
   // vector_bits_arch, or an outright typo).  Correct + warn so preferredVector-
