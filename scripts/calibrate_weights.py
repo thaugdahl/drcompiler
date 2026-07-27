@@ -106,7 +106,7 @@ def patch_costs_json(base: Optional[Path], alpha: float, beta: float,
 
 def run_polybench(costs_json: Path, configs: str, dataset: str,
                   iters: int, kernel_filter: str,
-                  polybench_dir: Path) -> Dict[str, float]:
+                  polybench_dir: Path, bench_script: Path) -> Dict[str, float]:
     """Run polybench-bench.sh and parse the CSV; return {kernel: median} for
     the *last* config in the list (we calibrate against drcomp-tile-fuse by
     default)."""
@@ -114,7 +114,7 @@ def run_polybench(costs_json: Path, configs: str, dataset: str,
         csv_path = Path(fp.name)
     try:
         cmd = [
-            "bash", str(Path(__file__).parent / "polybench-bench.sh"),
+            "bash", str(bench_script),
             "--polybench-dir", str(polybench_dir),
             "--iters", str(iters),
             "--dataset", dataset,
@@ -163,6 +163,11 @@ def main() -> int:
                    help="base costs.json to patch (defaults to empty)")
     p.add_argument("--polybench-dir", type=Path, required=True,
                    help="root of PolyBench/C source tree")
+    p.add_argument("--bench-script", type=Path,
+                   default=Path(__file__).parent / "polybench-bench.sh",
+                   help="path to polybench-bench.sh (defaults to the copy "
+                        "next to this script; override if using a different "
+                        "harness, e.g. the drcc-benchmarks repo's version)")
     p.add_argument("--configs", default="cgeist-base,drcomp-tile-fuse",
                    help="configs passed to polybench-bench.sh; the LAST one "
                         "is the calibration target")
@@ -179,6 +184,9 @@ def main() -> int:
                    help="max Nelder-Mead iterations")
     p.add_argument("--csv", type=Path, default=None,
                    help="per-iteration log CSV path")
+    p.add_argument("--output", type=Path, default=None,
+                   help="write the final calibrated costs.json (base + best "
+                        "weights) here")
     args = p.parse_args()
 
     if not SCIPY_AVAILABLE:
@@ -200,7 +208,7 @@ def main() -> int:
             patch_costs_json(args.base_costs, alpha, beta, gamma, costs)
             per_kernel = run_polybench(costs, args.configs, args.dataset,
                                         args.iters, args.calibration,
-                                        args.polybench_dir)
+                                        args.polybench_dir, args.bench_script)
         score = objective_geomean(per_kernel)
         iteration[0] += 1
         sys.stderr.write(
@@ -240,6 +248,12 @@ def main() -> int:
     print(f"Calibration geomean: {result.fun:.6f}")
     print("=" * 60)
 
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        patch_costs_json(args.base_costs, best_alpha, best_beta, best_gamma,
+                         args.output)
+        print(f"Calibrated cost model written: {args.output}")
+
     if args.holdout:
         print()
         print(f"# Held-out evaluation set (filter={args.holdout!r}):")
@@ -249,7 +263,7 @@ def main() -> int:
                              best_gamma, costs)
             holdout_results = run_polybench(costs, args.configs, args.dataset,
                                              args.iters, args.holdout,
-                                             args.polybench_dir)
+                                             args.polybench_dir, args.bench_script)
         if holdout_results:
             print(f"{'kernel':24s} {'median (s)':>12s}")
             for k, v in sorted(holdout_results.items()):
