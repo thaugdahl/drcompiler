@@ -205,6 +205,59 @@ def DrAffineLoopDistributePass
   let constructor = "mlir::createDrAffineLoopDistributePass()";
 }
 
+def DrRaiseSCFToAffinePass
+    : Pass<"dr-raise-scf-to-affine", "mlir::func::FuncOp">
+{
+  let summary = "Raise syntactically-affine scf.for loops back to affine.for";
+
+  let description = [{
+    Front-end normalisation, the same role `raise-malloc-to-memref` plays for
+    Polygeist output.
+
+    MARCO lowers every Modelica equation to an `scf.for` nest that is already
+    rectangular, unit-step and bounded by constants or by the equation
+    function's own `index` block arguments -- syntactically affine, merely
+    spelled in `scf`.  Because an `scf.for` induction variable is not a valid
+    affine dimension, every DRCC locality transform (fusion, tiling,
+    distribution, register blocking) is blind to it: measured affine coverage
+    of a lowered MARCO model is ~2 %.
+
+    This pass rewrites the loops and nothing else.  Memory accesses need no
+    work here -- upstream already handles them once the enclosing loops are
+    affine, which is why those passes must run *after* this one:
+
+      * `--fold-memref-alias-ops` folds MARCO's rank-0 `memref.subview` +
+        `memref.store` back into an indexed store;
+      * `--affine-raise-from-memref` folds `arith.addi %iv, %c` index
+        arithmetic into the map of an `affine.load` / `affine.store`.
+
+    So the full bridge is
+
+    ```
+    inline, canonicalize, symbol-dce, fold-memref-alias-ops,
+    func.func(dr-raise-scf-to-affine, affine-raise-from-memref), canonicalize
+    ```
+
+    Legality is syntactic and per loop: no iteration-carried values, constant
+    positive step, and both bounds either constant or a valid affine symbol.
+    Anything else is left as `scf.for`.  Raising only part of a nest is safe --
+    `affine.for` inside `scf.for` is valid IR and the analyses treat the `scf`
+    parent conservatively.
+
+    Bounds that are affine functions of enclosing induction variables
+    (triangular nests) are not handled; MARCO's equation nests are rectangular.
+  }];
+
+  let options = [
+    Option<"emitRationale", "emit-rationale", "bool", /*default=*/"false",
+           "Emit a remark for every loop left as scf.for, naming the legality "
+           "check that rejected it, plus a per-function raised/skipped tally">,
+  ];
+
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+  let constructor = "mlir::createDrRaiseSCFToAffinePass()";
+}
+
 def DrScalarReductionDemotePass
     : Pass<"dr-scalar-reduction-demote", "mlir::func::FuncOp">
 {

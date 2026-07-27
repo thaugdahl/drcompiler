@@ -16,6 +16,7 @@
 #include "drcompiler/Transforms/ParBubbles.h"
 #include "drcompiler/Transforms/PrintArchHandler.h"
 #include "drcompiler/Transforms/PrintRegisterPressure.h"
+#include "drcompiler/Transforms/RaiseSCFToAffine.h"
 #include "drcompiler/Transforms/RaiseMallocToMemRef.h"
 #include "drcompiler/Transforms/ScalarReductionDemote.h"
 #include "drcompiler/Transforms/ScalarReductionPromote.h"
