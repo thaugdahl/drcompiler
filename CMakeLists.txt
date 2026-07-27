@@ -163,6 +163,7 @@ if(NOT LLVM_EXTERNAL_LIT)
 endif()
 
 add_subdirectory(test)
+add_subdirectory(bench)
 
 #===----------------------------------------------------------------------===//
 # drcc wrapper script generation

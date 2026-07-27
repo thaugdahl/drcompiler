@@ -1,0 +1,16 @@
+{
+  "default_cost": 5,
+  "ops": {
+    "arith.addi": 50,
+    "arith.addf": 50
+  },
+  "cache": {
+    "l1_size": 65536,
+    "l2_size": 524288,
+    "l3_size": 0,
+    "l1_latency": 2,
+    "l2_latency": 6,
+    "l3_latency": 20,
+    "mem_latency": 100
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "default_cost": 5,
+  "ops": {
+    "arith.constant": 0,
+    "arith.addf": 1,
+    "arith.mulf": 3,
+    "arith.divf": 30,
+    "math.sqrt": 40,
+    "arith.cmpf": 1,
+    "arith.select": 1
+  },
+  "cache": {
+    "l1_latency": 4
+  }
+}
