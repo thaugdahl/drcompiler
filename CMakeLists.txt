@@ -78,11 +78,10 @@ endif()
 # Sub-directories
 #===----------------------------------------------------------------------===//
 
-add_subdirectory(include/drcompiler/Transforms)
-add_subdirectory(include/drcompiler/Dialect)
-add_subdirectory(lib/Analysis)
-add_subdirectory(lib/Dialect)
-add_subdirectory(lib/Transforms)
+# Each directory adds its own children; include/ before lib/ so the tablegen
+# targets exist by the time a library DEPENDS on one.
+add_subdirectory(include)
+add_subdirectory(lib)
 add_subdirectory(tools)
 
 #===----------------------------------------------------------------------===//
