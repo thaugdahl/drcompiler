@@ -157,6 +157,53 @@ def _cpu_flags():
     return set()
 
 
+def _cpu_vendor_family():
+    """(vendor_id, family_int) from /proc/cpuinfo; ('', 0) if unavailable."""
+    vendor, family = "", 0
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("vendor_id") and not vendor:
+                    vendor = line.split(":", 1)[1].strip()
+                elif line.startswith("cpu family") and not family:
+                    try:
+                        family = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                if vendor and family:
+                    break
+    except OSError:
+        pass
+    return vendor, family
+
+
+def native_vector_bits(arch_bits):
+    """Throughput-effective FP datapath width, which can be NARROWER than the
+    ISA-encodable width (`arch_bits`) when a part double-pumps wide vectors over
+    narrower FP pipes.  This is exactly the vector_bits_native the MachineModel
+    consumes for register-block VL selection (MachineModel.h): a wider-than-native
+    op is cracked at the same FLOP rate, so the model should prefer the native
+    width unless the accumulator tile forces it wider.
+
+    * <=256-bit ISA (AVX2/NEON/generic): native == arch (no double-pump).
+    * AVX-512 (arch 512):
+        - AMD family <= 0x19 (Zen4 and earlier AVX-512): 2x256-bit FP pipes
+          execute AVX-512 double-pumped -> native 256.
+        - AMD family >= 0x1a (Zen5+): native 512.
+        - Intel with AVX-512 (SKX/CLX/ICX/SPR ...): native 512-bit FMA.
+        - Unknown AVX-512 vendor: assume native == arch (conservative: no
+          double-pump modelled).
+    """
+    if arch_bits <= 256:
+        return arch_bits
+    vendor, family = _cpu_vendor_family()
+    if vendor == "AuthenticAMD":
+        return 256 if family <= 0x19 else 512
+    if vendor == "GenuineIntel":
+        return 512
+    return arch_bits
+
+
 def detect_handler(cc="cc"):
     """Pick the finest ArchHandler the host supports → (triplet, handler).
 
@@ -186,6 +233,13 @@ def arch_registers_for(handler, triplet):
         "triplet": triplet,
         "handler": handler,
         "vector_width_bits": vw,
+        # vector_bits_arch = widest ISA-encodable vector; vector_bits_native =
+        # throughput-effective FP datapath (narrower on double-pumping parts like
+        # Zen4).  MachineModel reads THESE (not vector_width_bits) to drive
+        # register-block VL and to set hasExplicitVectorModel; emitting them is
+        # what makes the probed machine's vector model actually take effect.
+        "vector_bits_arch": vw,
+        "vector_bits_native": native_vector_bits(vw),
         "spill_strategy": DEFAULT_SPILL_STRATEGY,
         "weights": dict(DEFAULT_WEIGHTS),
     }
