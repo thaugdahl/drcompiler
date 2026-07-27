@@ -1252,9 +1252,12 @@ public:
         AffineForOp kLoop = onlyChildFor(jLoop);
         if (!kLoop || !isInnermost(kLoop) || collectAccumulators(kLoop).empty())
           return;
-        if (!iLoop.hasConstantUpperBound() || !jLoop.hasConstantUpperBound() ||
-            !kLoop.hasConstantUpperBound())
-          return;
+        if (!iLoop.hasConstantLowerBound() || !iLoop.hasConstantUpperBound() ||
+            !jLoop.hasConstantLowerBound() || !jLoop.hasConstantUpperBound() ||
+            !kLoop.hasConstantLowerBound() || !kLoop.hasConstantUpperBound())
+          return; // a still-triangular band (e.g. trmm's k = i..N) reaching
+                  // here means earlier peeling declined it -- REJECT rather
+                  // than crash on getConstantLowerBound()'s non-constant map.
         bands.push_back({iLoop, jLoop, kLoop});
       });
       for (auto &band : bands) {
