@@ -19,9 +19,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "drcompiler/Analysis/MachineModel.h"
 #include "drcompiler/Transforms/AffineRegisterBlock.h"
 #include "RegisterBlock/Internal.h"
+#include "drcompiler/Analysis/MachineModel.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -78,7 +78,7 @@ AffineForOp onlyChildFor(AffineForOp forOp) {
 /// outer induction variables; clone that computation in front of the loop so
 /// the hoisted init-load and the sunk final-store can reference it.
 Value hoistOperand(Value v, AffineForOp loop, IRRewriter &rewriter,
-                          IRMapping &map) {
+                   IRMapping &map) {
   if (Value m = map.lookupOrNull(v))
     return m;
   Operation *def = v.getDefiningOp();
@@ -125,15 +125,15 @@ static bool sameAccess(Value memA, AffineMap mapA, ValueRange opsA, Value memB,
 /// itself stored back in `body` -- i.e. a read-only cross-element access to the
 /// accumulator array, so the "reduction" is not independent and reblocking is
 /// illegal.  Catches in-place factorizations like LU's `A[i][j] -=
-/// A[i][k]*A[k][j]`: `A[i][k]`/`A[k][j]` read the `A` array but are never stored
-/// here, so they overlap the `A[i][j]` accumulator across iterations.
+/// A[i][k]*A[k][j]`: `A[i][k]`/`A[k][j]` read the `A` array but are never
+/// stored here, so they overlap the `A[i][j]` accumulator across iterations.
 ///
-/// Crucially, a load from the accumulator memref that DOES have a matching store
-/// (same address) is a *sibling accumulator*, not an alias -- this is exactly
-/// what unroll-and-jam produces (C[i][j], C[i+1][j], ... all in memref C), and
-/// must be allowed.  A matmul's A/B are distinct memrefs from C, so they are
-/// never even considered; the standard BLAS no-alias assumption stands for
-/// distinct memref SSA values.
+/// Crucially, a load from the accumulator memref that DOES have a matching
+/// store (same address) is a *sibling accumulator*, not an alias -- this is
+/// exactly what unroll-and-jam produces (C[i][j], C[i+1][j], ... all in memref
+/// C), and must be allowed.  A matmul's A/B are distinct memrefs from C, so
+/// they are never even considered; the standard BLAS no-alias assumption stands
+/// for distinct memref SSA values.
 bool accumulatorAliasesInput(Block *body, Value accMemref) {
   SmallVector<AffineStoreOp> stores;
   for (Operation &op : body->without_terminator())
@@ -219,7 +219,8 @@ SmallVector<Acc> collectAccumulators(AffineForOp kLoop) {
 
 /// Promote every accumulator in `kLoop` to an iter_args SSA value.  Returns
 /// success if at least one accumulator was promoted.
-static LogicalResult promoteReductions(AffineForOp kLoop, IRRewriter &rewriter) {
+static LogicalResult promoteReductions(AffineForOp kLoop,
+                                       IRRewriter &rewriter) {
   SmallVector<Acc> accs = collectAccumulators(kLoop);
   if (accs.empty())
     return failure();
@@ -302,7 +303,7 @@ bool addrDependsOnIV(AffineStoreOp store, Value iv) {
 /// No invariance filter -- used for canonicalization where the reduction may
 /// be carried by an enclosing loop.
 bool findAccPair(AffineForOp loop, AffineStoreOp &outStore,
-                        AffineLoadOp &outLoad) {
+                 AffineLoadOp &outLoad) {
   Block *body = loop.getBody();
   for (Operation &op : body->without_terminator()) {
     auto store = dyn_cast<AffineStoreOp>(&op);
@@ -350,7 +351,8 @@ bool isInnermost(AffineForOp loop) {
 /// is non-null, only a reduction whose accumulator is exactly that memref
 /// matches -- used by Stage 3 to re-find THIS band's reduction after the jam
 /// (the accumulator alloc uniquely identifies a band and survives the jam),
-/// instead of the global-first reduction, which mispairs across repeated shapes.
+/// instead of the global-first reduction, which mispairs across repeated
+/// shapes.
 static AffineForOp findReductionLoopUnder(Operation *root,
                                           Value accFilter = nullptr) {
   AffineForOp found;
@@ -373,11 +375,12 @@ static AffineForOp findReductionLoopUnder(Operation *root,
           return cast<MemRefType>(a.memref.getType()).getRank() == 0;
         }))
       return;
-    // Skip a conv-band inner reduction: a multi-loop contraction band (ic/kh/kw)
-    // whose innermost loop's PARENT is itself a reduction loop (its IV does not
-    // index the accumulator).  These are owned by the direct-conv Stage 1d, not
-    // the GEMM stages; without this guard Stage 3's re-find returns a conv kw
-    // loop and derails the 1x1 GEMM processing that coexists in the same fn.
+    // Skip a conv-band inner reduction: a multi-loop contraction band
+    // (ic/kh/kw) whose innermost loop's PARENT is itself a reduction loop (its
+    // IV does not index the accumulator).  These are owned by the direct-conv
+    // Stage 1d, not the GEMM stages; without this guard Stage 3's re-find
+    // returns a conv kw loop and derails the 1x1 GEMM processing that coexists
+    // in the same fn.
     if (auto parent = loop->getParentOfType<AffineForOp>()) {
       AffineStoreOp st;
       AffineLoadOp ld;
@@ -442,8 +445,8 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
     // feeding another needed stray op is itself marked needed.
     llvm::SmallPtrSet<Operation *, 8> needed;
     Block *body = iLoop.getBody();
-    for (Operation &opR :
-         llvm::reverse(llvm::make_range(body->begin(), std::prev(body->end())))) {
+    for (Operation &opR : llvm::reverse(
+             llvm::make_range(body->begin(), std::prev(body->end())))) {
       Operation *o = &opR;
       if (isa<AffineForOp>(o))
         continue;
@@ -485,8 +488,8 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
 ///     for k = 0 .. i {                           // triangular ub = i
 ///       M[k][j] = M[k][j] + s(i,j,k)             // SCATTER (addr varies in k,
 ///       t       = t       + r(i,j,k)             //          invariant in i)
-///     }                                          // t: rank-0 reduction (scalar)
-///     <epilogue ops, incl. M[i][j] = f(t, M[i][j], ...)>
+///     }                                          // t: rank-0 reduction
+///     (scalar) <epilogue ops, incl. M[i][j] = f(t, M[i][j], ...)>
 ///   } }
 /// splitting it IN PLACE into:
 ///   (A) the original nest with the scatter store + its exclusive feeders
@@ -500,10 +503,10 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
 /// i>r, which in the original outer-i order all run AFTER row r's epilogue (the
 /// epilogue at i=r reads M[r][j] before any i>r scatter touches row r); so
 /// emitting branch A (all epilogues) before branch B (all scatters) preserves
-/// every M dependence.  temp2 reads only inputs (B,A), so fissioning it from the
-/// scatter is trivially legal.
-/// WP-T5c: canonicalize onnx-mlir's scalar-alloca-accumulator GEMM into perfect
-/// register-blockable bands.  onnx-mlir lowers each Gemm to
+/// every M dependence.  temp2 reads only inputs (B,A), so fissioning it from
+/// the scatter is trivially legal. WP-T5c: canonicalize onnx-mlir's
+/// scalar-alloca-accumulator GEMM into perfect register-blockable bands.
+/// onnx-mlir lowers each Gemm to
 ///   for i { for j { %a=alloca; store 0,%a; for k {%a+=A[i,k]*B[k,j]}; <epi>;
 ///                   store r, C[i,j] } }
 /// whose imperfect j-body (alloca init + bias epilogue) and rank-0 (scalar)
@@ -513,8 +516,8 @@ static SmallVector<AffineForOp> distributeLoop(AffineForOp iLoop,
 /// no-op).  Promote the scalar alloca to the spatial output C[i,j] and fission
 /// the init / k-reduction / epilogue into separate PERFECT nests -- the exact
 /// form Stage 1b/2 already vectorize (proven: 16 broadcasts) + cache-tile.
-/// Legal because, post-promotion, each segment touches only C[i,j] (A/B/bias are
-/// read-only) and i,j are independent, so init-all then accumulate-all then
+/// Legal because, post-promotion, each segment touches only C[i,j] (A/B/bias
+/// are read-only) and i,j are independent, so init-all then accumulate-all then
 /// epilogue-all preserves every C dependence (the distributeLoop legality, here
 /// extended to the side-effecting init/epilogue STORES that distributeLoop
 /// refuses).  Gated on a GEMM model so the default machine is byte-identical.
@@ -529,8 +532,8 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
     if (!jLoop || !iLoop.hasConstantUpperBound() ||
         !jLoop.hasConstantUpperBound())
       continue;
-    // A single innermost reduction in j's body, NOT already a perfect i-j-k band
-    // (those are handled by the existing stages).
+    // A single innermost reduction in j's body, NOT already a perfect i-j-k
+    // band (those are handled by the existing stages).
     AffineForOp kLoop;
     int nred = 0;
     jLoop.walk([&](AffineForOp r) {
@@ -563,8 +566,9 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
     if (!llvm::all_of(acc.getUsers(),
                       [&](Operation *u) { return jLoop->isAncestor(u); }))
       continue;
-    // EXACTLY ONE >=1D output store in j's body (the C store) -- multiple outputs
-    // would make the "which memref is the accumulator's home" choice ambiguous.
+    // EXACTLY ONE >=1D output store in j's body (the C store) -- multiple
+    // outputs would make the "which memref is the accumulator's home" choice
+    // ambiguous.
     AffineStoreOp cStore;
     {
       unsigned n = 0;
@@ -587,12 +591,13 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
       continue; // exotic index -> leave it (conservative)
     Value cMemref = cStore.getMemRef();
     AffineMap cMap = cStore.getAffineMap();
-    // The output C must be WRITE-ONLY in this nest.  A legit GEMM never reads its
-    // own output; ANY load of cMemref in jLoop means C aliases an input (in-place
-    // C==A / C==B), a beta/residual accumulate (C = acc + C), or a fused C-reuse
+    // The output C must be WRITE-ONLY in this nest.  A legit GEMM never reads
+    // its own output; ANY load of cMemref in jLoop means C aliases an input
+    // (in-place C==A / C==B), a beta/residual accumulate (C = acc + C), or a
+    // fused C-reuse
     // -- all of which the init/k-reduction/epilogue fission would miscompile
-    // (the INIT nest zeros C before the GEMM/epilogue nest reads it).  One guard,
-    // four bug classes (WP-T5c legality review).
+    // (the INIT nest zeros C before the GEMM/epilogue nest reads it).  One
+    // guard, four bug classes (WP-T5c legality review).
     {
       bool readsOutput = false;
       jLoop.walk([&](AffineLoadOp ld) {
@@ -602,9 +607,9 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
       if (readsOutput)
         continue;
     }
-    // The final store's value must DERIVE from the accumulator, so promoting the
-    // acc to C is the GEMM's output (not an unrelated store that merely happens to
-    // be the last >=1D store).
+    // The final store's value must DERIVE from the accumulator, so promoting
+    // the acc to C is the GEMM's output (not an unrelated store that merely
+    // happens to be the last >=1D store).
     {
       bool fromAcc = false;
       SmallVector<Value> wl{cStore.getValueToStore()};
@@ -627,8 +632,8 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
         continue;
     }
     // The pre-k segment must be exactly {alloca, init-store-to-acc} with a
-    // loop-invariant init value, so it cleanly clones into a standalone INIT nest
-    // (anything else before k -- e.g. another reduction or a non-hoistable
+    // loop-invariant init value, so it cleanly clones into a standalone INIT
+    // nest (anything else before k -- e.g. another reduction or a non-hoistable
     // computation -- would be wrongly replicated/ordered by the fission).
     {
       AffineStoreOp initStore;
@@ -650,7 +655,8 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
         continue;
       if (Operation *d = initStore.getValueToStore().getDefiningOp())
         if (iLoop->isAncestor(d))
-          continue; // init computed inside the nest -> not hoistable to INIT loop
+          continue; // init computed inside the nest -> not hoistable to INIT
+                    // loop
     }
     // No-bias copy epilogue: the final store stores exactly the loaded acc.
     bool copyEpi = false;
@@ -658,8 +664,8 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
       if (auto ld = dyn_cast<AffineLoadOp>(d))
         copyEpi = (ld.getMemRef() == acc);
 
-    // Promote every scalar-alloca access to C[cOps] (clone IVs are remapped when
-    // the loop is cloned below; here we use the original i/j IVs).
+    // Promote every scalar-alloca access to C[cOps] (clone IVs are remapped
+    // when the loop is cloned below; here we use the original i/j IVs).
     SmallVector<AffineLoadOp> lds;
     SmallVector<AffineStoreOp> sts;
     jLoop.walk([&](Operation *op) {
@@ -703,7 +709,7 @@ static void canonicalizeAllocaGemm(func::FuncOp func, IRRewriter &rewriter) {
       bool afterK = false;
       for (Operation &op : nj.getBody()->without_terminator()) {
         bool isK = (&op == ck.getOperation());
-        bool keep = (seg == INIT) ? (!isK && !afterK)
+        bool keep = (seg == INIT)   ? (!isK && !afterK)
                     : (seg == GEMM) ? isK
                                     : afterK;
         if (isK)
@@ -787,8 +793,8 @@ static bool raiseSymmScatter(func::FuncOp func, IRRewriter &rewriter) {
             break;
           }
         }
-      if (!matchLoad || !dependsOn(st.getValueToStore(), matchLoad.getResult(),
-                                   kBody))
+      if (!matchLoad ||
+          !dependsOn(st.getValueToStore(), matchLoad.getResult(), kBody))
         continue;
       if (scatter)
         twoScatters = true;
@@ -851,8 +857,8 @@ static bool raiseSymmScatter(func::FuncOp func, IRRewriter &rewriter) {
     bool erased = true;
     while (erased) {
       erased = false;
-      for (Operation &op : llvm::make_early_inc_range(
-               kBody->without_terminator()))
+      for (Operation &op :
+           llvm::make_early_inc_range(kBody->without_terminator()))
         if (cone.count(&op) && op.use_empty()) {
           rewriter.eraseOp(&op);
           erased = true;
@@ -891,9 +897,10 @@ static bool interchangeBlas2RowMajor(func::FuncOp func) {
     if (!sweep || affine::isLoopParallel(sweep))
       return; // a parallel enclosing sweep => BLAS-3 tile; leave for reg-block
     // The inner (streamed) loop must be rectangular.  A TRIANGULAR inner loop
-    // (bound depends on an outer IV, e.g. trmm/lu's `k = i+1..N`) is an in-place
-    // triangular reduction the peel register-blocks -- interchanging it would
-    // break that 16x path.  gramschmidt's streamed loop is a plain `0..M`.
+    // (bound depends on an outer IV, e.g. trmm/lu's `k = i+1..N`) is an
+    // in-place triangular reduction the peel register-blocks -- interchanging
+    // it would break that 16x path.  gramschmidt's streamed loop is a plain
+    // `0..M`.
     if (!inner.hasConstantLowerBound() || !inner.hasConstantUpperBound())
       return;
     Value iIV = inner.getInductionVar(), oIV = outer.getInductionVar();
@@ -952,18 +959,19 @@ static bool canonicalizeOnce(func::FuncOp func) {
       continue; // need a single spatial loop between red and inner
     // Only interchange a reduction we can actually register-block afterwards.
     // If the reduction trip count depends on an outer IV (a triangular
-    // reduction, e.g. trmm's `k = i..N`), unroll-jamming the spatial loops would
-    // give the mr rows different reduction ranges -- we have no reduction-peel
-    // for that.  Interchanging without blocking would just leave a cache-hostile
-    // order, so leave such nests untouched (clang vectorizes the original).
-    // NOTE: this also requires CONSTANT bounds because the spatial unroll-jam /
-    // peel micro-kernel downstream is constant-bound; relaxing only this guard
-    // to loop-invariant symbolic bounds (PolyBench `nk`) lets the interchange
-    // fire but the micro-kernel still can't peel a symbolic spatial extent, so
-    // it half-transforms (unroll-jams the wrong nest) without vectorizing.
-    // Symbolic-bound register-blocking (dynamic remainder loops) is future work;
-    // until then PolyBench must be size-specialized (constant bounds) to compose
-    // register-block with the parallel path (see POLYBENCH_PARALLEL_FINDINGS.md).
+    // reduction, e.g. trmm's `k = i..N`), unroll-jamming the spatial loops
+    // would give the mr rows different reduction ranges -- we have no
+    // reduction-peel for that.  Interchanging without blocking would just leave
+    // a cache-hostile order, so leave such nests untouched (clang vectorizes
+    // the original). NOTE: this also requires CONSTANT bounds because the
+    // spatial unroll-jam / peel micro-kernel downstream is constant-bound;
+    // relaxing only this guard to loop-invariant symbolic bounds (PolyBench
+    // `nk`) lets the interchange fire but the micro-kernel still can't peel a
+    // symbolic spatial extent, so it half-transforms (unroll-jams the wrong
+    // nest) without vectorizing. Symbolic-bound register-blocking (dynamic
+    // remainder loops) is future work; until then PolyBench must be
+    // size-specialized (constant bounds) to compose register-block with the
+    // parallel path (see POLYBENCH_PARALLEL_FINDINGS.md).
     if (!red.hasConstantLowerBound() || !red.hasConstantUpperBound())
       continue;
     SmallVector<AffineForOp, 2> band{red, inner};
@@ -993,8 +1001,8 @@ public:
 
     // Cache hierarchy from the single source of truth (MachineModel,
     // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
-    // `mm` is function-scoped so the GEMM configurator (gemmBlocking) is reachable
-    // from the cache-tiling stage below (WP-T3).
+    // `mm` is function-scoped so the GEMM configurator (gemmBlocking) is
+    // reachable from the cache-tiling stage below (WP-T3).
     drcompiler::MachineModel mm =
         drcompiler::MachineModel::fromJson(cpuCostModelFile);
     {
@@ -1023,17 +1031,20 @@ public:
             return;
           Type et = cast<MemRefType>(accs[0].memref.getType()).getElementType();
           if (isa<FloatType>(et))
-            elemBytes = std::max<int64_t>(elemBytes, et.getIntOrFloatBitWidth() / 8);
+            elemBytes =
+                std::max<int64_t>(elemBytes, et.getIntOrFloatBitWidth() / 8);
         });
         if (elemBytes > 0)
-          vl = static_cast<unsigned>(mm.preferredVectorElems(elemBytes, mr, nr));
+          vl =
+              static_cast<unsigned>(mm.preferredVectorElems(elemBytes, mr, nr));
       }
     }
 
     // Stage 0 (WP4): raise the symm scatter into a register-blockable
     // triangular reduction (fission temp2/epilogue from the scatter + emit the
     // scatter already interchanged to i-innermost).  No-op on every other
-    // kernel (gated on a rank-0 reduction co-resident with a k-scattered store).
+    // kernel (gated on a rank-0 reduction co-resident with a k-scattered
+    // store).
     raiseSymmScatter(func, rewriter);
 
     // Stage 1: canonicalize reduction nests so the reduction loop is innermost
@@ -1060,7 +1071,8 @@ public:
     // strategy wins -- and therefore the tile shape and whether the FP
     // reduction may be reassociated.  See OPERAND_PACKING_FINDINGS.md:
     //   broadcast (C=A*B): wide tile (mr x nr), no reassoc -> SLP over j-lanes.
-    //   dot (rank-k):      small square tile, reassoc       -> reduction over k.
+    //   dot (rank-k):      small square tile, reassoc       -> reduction over
+    //   k.
     // A fixed wide tile + reassoc would spill the dot grid AND flip gemm to the
     // wrong (horizontal-sum) strategy; hence per-layout selection.
     unsigned mrEff = mr, nrEff = nr;
@@ -1108,7 +1120,8 @@ public:
         if (r && isInnermost(r))
           cands.push_back(s);
       });
-      int64_t effLLC = drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
+      int64_t effLLC =
+          drcompiler::MachineModel::effectiveLLC(l3Size, llcSharers);
       for (AffineForOp s : cands)
         if (peelTriangularNest(s, mrEff, peelKTile, effLLC, rewriter)) {
           peeled = true;
@@ -1185,7 +1198,6 @@ public:
         }
     }
 
-
     // Stage 1b: cache blocking.  Register blocking alone is DRAM-bound once the
     // matrices exceed the last-level cache (the full B is re-streamed per
     // i-block).  Tile each perfectly-nested GEMM band by mc x nc x kc so the
@@ -1195,10 +1207,10 @@ public:
     // WP-T3: run when the legacy global `cache-tile` option is set (tiles every
     // band, unchanged) OR when a cost-model JSON describes a GEMM model
     // (hasExplicitGemmModel) -- then the per-band decision comes from
-    // gemmBlocking, so deep-K GEMMs auto-cache-tile WITHOUT the global flag (the
-    // openai-gpt FFN lever) while cache-resident bands are left register-blocked.
-    // Default (no JSON) keeps hasExplicitGemmModel=false => the gate is the
-    // original `if (cacheTile)` => byte-identical.
+    // gemmBlocking, so deep-K GEMMs auto-cache-tile WITHOUT the global flag
+    // (the openai-gpt FFN lever) while cache-resident bands are left
+    // register-blocked. Default (no JSON) keeps hasExplicitGemmModel=false =>
+    // the gate is the original `if (cacheTile)` => byte-identical.
     if (cacheTile || mm.hasExplicitGemmModel) {
       // Distribute any imperfect matmul outer loop (e.g. PolyBench's i-loop
       // carrying a beta-scaling sibling) so the matmul becomes a perfect band.
@@ -1238,8 +1250,7 @@ public:
         if (!jLoop)
           return;
         AffineForOp kLoop = onlyChildFor(jLoop);
-        if (!kLoop || !isInnermost(kLoop) ||
-            collectAccumulators(kLoop).empty())
+        if (!kLoop || !isInnermost(kLoop) || collectAccumulators(kLoop).empty())
           return;
         if (!iLoop.hasConstantUpperBound() || !jLoop.hasConstantUpperBound() ||
             !kLoop.hasConstantUpperBound())
@@ -1248,9 +1259,12 @@ public:
       });
       for (auto &band : bands) {
         SmallVector<AffineForOp, 3> in(band.begin(), band.end());
-        int64_t ie = in[0].getConstantUpperBound() - in[0].getConstantLowerBound();
-        int64_t je = in[1].getConstantUpperBound() - in[1].getConstantLowerBound();
-        int64_t ke = in[2].getConstantUpperBound() - in[2].getConstantLowerBound();
+        int64_t ie =
+            in[0].getConstantUpperBound() - in[0].getConstantLowerBound();
+        int64_t je =
+            in[1].getConstantUpperBound() - in[1].getConstantLowerBound();
+        int64_t ke =
+            in[2].getConstantUpperBound() - in[2].getConstantLowerBound();
         // Element bytes from the accumulator memref.
         int64_t eb = 8;
         if (SmallVector<Acc> a = collectAccumulators(in[2]); !a.empty()) {
@@ -1259,30 +1273,35 @@ public:
             eb = std::max<int64_t>(1, (int64_t)et.getIntOrFloatBitWidth() / 8);
         }
         // The per-band macro-tile.  Two paths:
-        //  * GEMM model (WP-T3/T5): gemmBlocking owns the decision AND the sizes,
-        //    budgeted to the effective L2 so the B-panel becomes L2-resident (the
-        //    openai-gpt FFN lever; an LLC-budgeted tile never fires on a big-LLC
-        //    host where the working set already fits L3).
-        //  * Legacy global `cache-tile` option (no GEMM model): size against the
-        //    effective LLC exactly as before -- byte-identical, the short-circuit
-        //    keeps the default path untouched.
-        // Both routes share the ONE shrink definition in MachineModel::macroTile.
+        //  * GEMM model (WP-T3/T5): gemmBlocking owns the decision AND the
+        //  sizes,
+        //    budgeted to the effective L2 so the B-panel becomes L2-resident
+        //    (the openai-gpt FFN lever; an LLC-budgeted tile never fires on a
+        //    big-LLC host where the working set already fits L3).
+        //  * Legacy global `cache-tile` option (no GEMM model): size against
+        //  the
+        //    effective LLC exactly as before -- byte-identical, the
+        //    short-circuit keeps the default path untouched.
+        // Both routes share the ONE shrink definition in
+        // MachineModel::macroTile.
         SmallVector<unsigned, 3> sizes;
         if (mm.hasExplicitGemmModel) {
           if (noCacheTile)
             continue; // SPMD compose: keep canonicalizeAllocaGemm + Stage 2
                       // vectorization, but skip the cache-tile loops whose
                       // carried deps make par-spmd-perband serialize the GEMM.
-          drcompiler::MachineModel::GemmTiling gt = mm.gemmBlocking(ie, je, ke, eb);
+          drcompiler::MachineModel::GemmTiling gt =
+              mm.gemmBlocking(ie, je, ke, eb);
           if (!gt.cacheTile)
             continue; // band fits L2 / not worth tiling
           sizes = {(unsigned)gt.mc, (unsigned)gt.nc, (unsigned)gt.kc};
         } else {
-          // The cache we can COUNT ON under contention: a co-tenant can evict the
-          // shared L3, so only l3Size/llcSharers is guaranteed.  Tile ONLY when
-          // the band's working set (A + B + C) does not fit it -- otherwise the
-          // register-blocked micro-kernel already runs cache-resident and tiling
-          // just adds point-bound overhead that scalarizes the kernel.
+          // The cache we can COUNT ON under contention: a co-tenant can evict
+          // the shared L3, so only l3Size/llcSharers is guaranteed.  Tile ONLY
+          // when the band's working set (A + B + C) does not fit it --
+          // otherwise the register-blocked micro-kernel already runs
+          // cache-resident and tiling just adds point-bound overhead that
+          // scalarizes the kernel.
           unsigned sharers = llcSharers ? llcSharers : 1u;
           int64_t effLLC =
               drcompiler::MachineModel::effectiveLLC(l3Size, sharers);
@@ -1297,12 +1316,14 @@ public:
     }
 
     // Stage 1d (WP-O2): direct-conv reduction BANDS.  A de-promoted 3x3 conv is
-    // `for oc,oh,ow { for ic,kh,kw { Y[oc,oh,ow] += in[ic,oh+kh,ow+kw]*w[...] }}`
+    // `for oc,oh,ow { for ic,kh,kw { Y[oc,oh,ow] += in[ic,oh+kh,ow+kw]*w[...]
+    // }}`
     // -- a MULTI-loop reduction band (ic/kh/kw) under the spatial loop ow.  The
     // GEMM stages below need the spatial loop to DIRECTLY enclose a single
-    // reduction loop, so they never fire on conv.  Here we vectorize ow (stride-1
-    // in both Y and `in`) directly, carrying a vector accumulator through the
-    // whole band.  Detected before Stage 2 so the GEMM matcher never sees these.
+    // reduction loop, so they never fire on conv.  Here we vectorize ow
+    // (stride-1 in both Y and `in`) directly, carrying a vector accumulator
+    // through the whole band.  Detected before Stage 2 so the GEMM matcher
+    // never sees these.
     if (vectorize) {
       SmallVector<std::pair<AffineForOp, SmallVector<AffineForOp>>> convBands;
       func.walk([&](AffineForOp inner) {
@@ -1356,8 +1377,8 @@ public:
       // carries a dependence reorders dependent iterations and is illegal.
       // gemm/syrk spatial loops are parallel; a factorization's carried sweep
       // (e.g. gramschmidt's outer k, which updates A in place) is not -> skip,
-      // leaving it untouched.  (The alias guard already rejects LU earlier; this
-      // is the general safety net.)
+      // leaving it untouched.  (The alias guard already rejects LU earlier;
+      // this is the general safety net.)
       if (!affine::isLoopParallel(sOut) || !affine::isLoopParallel(sIn))
         return;
       if (!llvm::is_contained(sOuts, sOut))
@@ -1371,9 +1392,10 @@ public:
     // After unroll-jam, `sOut` may be a dangling handle: when its trip count
     // equals mr (a peeled triangular head), loopUnrollJamByFactor promotes it
     // to a single iteration and erases it.  So the reduction is re-found by
-    // walking the stable `func` -- findReductionLoopUnder skips already-promoted
-    // reductions (their accumulator load/store are gone), so it keeps advancing
-    // to the next unprocessed one across multi-matmul kernels.
+    // walking the stable `func` -- findReductionLoopUnder skips
+    // already-promoted reductions (their accumulator load/store are gone), so
+    // it keeps advancing to the next unprocessed one across multi-matmul
+    // kernels.
     for (AffineForOp sOut : sOuts) {
       // Skip a diagonal remainder: its inner spatial bound depends on sOut's IV
       // (the ragged tail), so unroll-and-jam cannot fuse the inner loops.
@@ -1385,9 +1407,9 @@ public:
           continue;
       }
       // PER-BAND family selection.  The global familySelect above sets a single
-      // function-wide mode (one PolyBench kernel = one family).  onnx-mlir emits
-      // MANY contractions per function -- a 1x1 conv GEMM (broadcast) and a
-      // genuine rank-k (dot) can coexist, and the global `anyDot` flag would
+      // function-wide mode (one PolyBench kernel = one family).  onnx-mlir
+      // emits MANY contractions per function -- a 1x1 conv GEMM (broadcast) and
+      // a genuine rank-k (dot) can coexist, and the global `anyDot` flag would
       // force every band into dot mode, disabling the broadcast vector kernel
       // for ALL of them (measured: resnet50's 33 demoted GEMMs all fell to the
       // scalar 4x4 dot tile -> 0 vector ops).  Detect the family of THIS band's
@@ -1433,10 +1455,11 @@ public:
       if (!sIn)
         continue;
       // Broadcast family: emit an EXPLICIT vector micro-kernel along the inner
-      // spatial loop (vector dialect), for all ranks -- no reliance on LLVM-SLP.
-      // Tile width (vector columns): a >=3D accumulator (tensor contraction) is
-      // best as mr mr-only vectors (measured: a wider tile over-subscribes and
-      // regresses bmm/ttm), so nrVec=1; a 2D accumulator uses the nr-wide tile.
+      // spatial loop (vector dialect), for all ranks -- no reliance on
+      // LLVM-SLP. Tile width (vector columns): a >=3D accumulator (tensor
+      // contraction) is best as mr mr-only vectors (measured: a wider tile
+      // over-subscribes and regresses bmm/ttm), so nrVec=1; a 2D accumulator
+      // uses the nr-wide tile.
       SmallVector<Acc> accsForRank = collectAccumulators(red);
       unsigned accRank =
           accsForRank.empty()
@@ -1452,12 +1475,13 @@ public:
           (void)affine::loopUnrollJamByFactor(sIn, nrVec);
         continue;
       }
-      // Guarded fallback: the band was not explicitly vectorizable (non-constant
-      // bounds, gather, unsupported DAG).  Fall back to scalar promotion + LLVM
-      // SLP and record it -- SLP is never the silent default.
-      LLVM_DEBUG(llvm::dbgs() << "affine-register-block: explicit vectorization "
-                                 "declined; SLP fallback for band at "
-                              << sIn.getLoc() << "\n");
+      // Guarded fallback: the band was not explicitly vectorizable
+      // (non-constant bounds, gather, unsupported DAG).  Fall back to scalar
+      // promotion + LLVM SLP and record it -- SLP is never the silent default.
+      LLVM_DEBUG(llvm::dbgs()
+                 << "affine-register-block: explicit vectorization "
+                    "declined; SLP fallback for band at "
+                 << sIn.getLoc() << "\n");
       if (nrB > 1 && failed(affine::loopUnrollJamByFactor(sIn, nrB)))
         continue;
       red = findReductionLoopUnder(func, bandAcc);
@@ -1506,19 +1530,20 @@ public:
     }
 
     // Stage 4: set fast-math on the kernel's FP ops.  MLIR lowering emits
-    // flagless FP ops and `clang -ffast-math` does NOT retroactively flag a .ll,
-    // so without this the backend never forms FMAs (it emits separate mulpd +
-    // addpd, ~half FP throughput) -- measured: vfmadd=0 on the broadcast kernel.
+    // flagless FP ops and `clang -ffast-math` does NOT retroactively flag a
+    // .ll, so without this the backend never forms FMAs (it emits separate
+    // mulpd + addpd, ~half FP throughput) -- measured: vfmadd=0 on the
+    // broadcast kernel.
     //   - Broadcast family: `contract` only.  This lets the backend fuse
     //     mul+add into FMA *without* reassociating, so the accumulation order
     //     (and the SLP/vector strategy) is unchanged -- pure throughput win.
     //   - Dot family: `fast` (contract + reassoc).  The k-reduction can only be
     //     vectorized by LLVM with reassociation (the rank-k "loss" was this);
-    //     reassoc would flip gemm to the wrong horizontal-sum strategy, hence it
-    //     is reserved for the dot family.
+    //     reassoc would flip gemm to the wrong horizontal-sum strategy, hence
+    //     it is reserved for the dot family.
     {
-      auto flags = reassoc ? arith::FastMathFlags::fast
-                           : arith::FastMathFlags::contract;
+      auto flags =
+          reassoc ? arith::FastMathFlags::fast : arith::FastMathFlags::contract;
       auto fma = arith::FastMathFlagsAttr::get(&getContext(), flags);
       func.walk([&](Operation *op) {
         if (isa<arith::MulFOp, arith::AddFOp, arith::SubFOp, arith::DivFOp,
