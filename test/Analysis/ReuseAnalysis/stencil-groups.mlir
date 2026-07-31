@@ -12,26 +12,26 @@
 // with < 2 members are not recorded).
 func.func @jacobi2d_step(%A: memref<1300x1300xf64>, %B: memref<1300x1300xf64>) {
   %c = arith.constant 2.000000e-01 : f64
-  // expected-remark @below {{reuse-analysis: band depth=2 trips=[1298, 1298] footprint=80870592 evictedReuse=[0,0] anyTemporal=0}}
+  // expected-remark @below {{reuse-analysis: band depth=2 trips=[1298, 1298] footprint=27102336 evictedReuse=[0,0] anyTemporal=0}}
   affine.for %i = 1 to 1299 {
     affine.for %j = 1 to 1299 {
       // expected-remark @below {{reuse-analysis: group members=5 span=[2, 2] carries=[1,1]}}
-      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10432,64]}}
       %0 = affine.load %A[%i, %j] : memref<1300x1300xf64>
-      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10432,64]}}
       %1 = affine.load %A[%i, %j - 1] : memref<1300x1300xf64>
-      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10432,64]}}
       %2 = affine.load %A[%i, %j + 1] : memref<1300x1300xf64>
-      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10432,64]}}
       %3 = affine.load %A[%i + 1, %j] : memref<1300x1300xf64>
-      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,spat] iterFP=[10432,64]}}
       %4 = affine.load %A[%i - 1, %j] : memref<1300x1300xf64>
       %s1 = arith.addf %0, %1 : f64
       %s2 = arith.addf %s1, %2 : f64
       %s3 = arith.addf %s2, %3 : f64
       %s4 = arith.addf %s3, %4 : f64
       %r = arith.mulf %s4, %c : f64
-      // expected-remark @below {{reuse-analysis: ref store x1 kinds=[stream,spat] iterFP=[10384,8]}}
+      // expected-remark @below {{reuse-analysis: ref store x1 kinds=[stream,spat] iterFP=[10432,64]}}
       affine.store %r, %B[%i, %j] : memref<1300x1300xf64>
     }
   }
@@ -43,24 +43,24 @@ func.func @jacobi2d_step(%A: memref<1300x1300xf64>, %B: memref<1300x1300xf64>) {
 // coefficient matrix.)
 func.func @heat3d_step(%A: memref<120x120x120xf64>, %B: memref<120x120x120xf64>) {
   %c = arith.constant 1.250000e-01 : f64
-  // expected-remark @below {{reuse-analysis: band depth=3 trips=[118, 118, 118] footprint=105154048 evictedReuse=[0,0,0] anyTemporal=0}}
+  // expected-remark @below {{reuse-analysis: band depth=3 trips=[118, 118, 118] footprint=27191040 evictedReuse=[0,0,0] anyTemporal=0}}
   affine.for %i = 1 to 119 {
     affine.for %j = 1 to 119 {
       affine.for %k = 1 to 119 {
         // expected-remark @below {{reuse-analysis: group members=7 span=[2, 2, 2] carries=[1,1,1]}}
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %0 = affine.load %A[%i, %j, %k] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %1 = affine.load %A[%i - 1, %j, %k] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %2 = affine.load %A[%i + 1, %j, %k] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %3 = affine.load %A[%i, %j - 1, %k] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %4 = affine.load %A[%i, %j + 1, %k] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %5 = affine.load %A[%i, %j, %k - 1] : memref<120x120x120xf64>
-        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref load x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         %6 = affine.load %A[%i, %j, %k + 1] : memref<120x120x120xf64>
         %s1 = arith.addf %0, %1 : f64
         %s2 = arith.addf %s1, %2 : f64
@@ -69,7 +69,7 @@ func.func @heat3d_step(%A: memref<120x120x120xf64>, %B: memref<120x120x120xf64>)
         %s5 = arith.addf %s4, %5 : f64
         %s6 = arith.addf %s5, %6 : f64
         %r = arith.mulf %s6, %c : f64
-        // expected-remark @below {{reuse-analysis: ref store x1 kinds=[stream,stream,spat] iterFP=[111392,944,8]}}
+        // expected-remark @below {{reuse-analysis: ref store x1 kinds=[stream,stream,spat] iterFP=[113280,960,64]}}
         affine.store %r, %B[%i, %j, %k] : memref<120x120x120xf64>
       }
     }

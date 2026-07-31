@@ -8,7 +8,7 @@
 // on 16x16x16 (footprint exactly 4096 B for three f32 tiles).
 
 func.func @matmul(%A: memref<256x256xf32>, %B: memref<256x256xf32>, %C: memref<256x256xf32>) {
-  // expected-remark @below {{tile-rationale: TILE sizes=[16, 16, 16] footprint=4096 target=4096 traffic=14417920}}
+  // expected-remark @below {{tile-rationale: TILE sizes=[16, 16, 16] footprint=4096 target=4096 traffic=15859712}}
   affine.for %i = 0 to 256 {
     affine.for %j = 0 to 256 {
       affine.for %k = 0 to 256 {

@@ -42,13 +42,27 @@ struct DrTestReuseAnalysisPass
     : public impl::DrTestReuseAnalysisPassBase<DrTestReuseAnalysisPass> {
   void runOnOperation() override {
     func::FuncOp fn = getOperation();
-    for (auto forOp : fn.getOps<AffineForOp>()) {
-      SmallVector<AffineForOp, 6> band;
-      getPerfectlyNestedLoops(band, forOp);
+    SmallVector<SmallVector<AffineForOp, 6>, 4> bands;
+    if (allBands) {
+      collectMaximalPerfectBands(fn, bands);
+    } else {
+      for (auto forOp : fn.getOps<AffineForOp>()) {
+        SmallVector<AffineForOp, 6> band;
+        getPerfectlyNestedLoops(band, forOp);
+        bands.push_back(std::move(band));
+      }
+    }
+    for (auto &band : bands) {
+      if (band.empty())
+        continue;
+      AffineForOp forOp = band.front();
 
-      auto infoOr = analyzeBandReuse(band);
+      ReuseReject why = ReuseReject::None;
+      auto infoOr = analyzeBandReuse(band, /*walkRoot=*/nullptr,
+                                     acceptTripUpperBounds, &why);
       if (failed(infoOr)) {
-        forOp->emitRemark("reuse-analysis: band UNANALYZABLE");
+        forOp->emitRemark("reuse-analysis: band UNANALYZABLE reason=" +
+                          toString(why).str());
         continue;
       }
       BandReuseInfo &info = *infoOr;
@@ -63,6 +77,14 @@ struct DrTestReuseAnalysisPass
         os << (l ? "," : "")
            << (info.loopCarriesEvictedReuse(l, cacheBytes) ? 1 : 0);
       os << "] anyTemporal=" << (info.anyTemporalReuse() ? 1 : 0);
+      // Only emitted for bands carrying an upper-bound (triangular) trip
+      // count, so exact bands keep the historical remark string.
+      if (llvm::is_contained(info.tripIsExact, false)) {
+        os << " tripExact=[";
+        for (unsigned l = 0, e = info.tripIsExact.size(); l < e; ++l)
+          os << (l ? "," : "") << (info.tripIsExact[l] ? 1 : 0);
+        os << "]";
+      }
       forOp->emitRemark(buf);
 
       for (const RefGroup &g : info.groups) {

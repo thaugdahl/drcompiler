@@ -337,6 +337,14 @@ def DrTestReuseAnalysisPass
   let options = [
     Option<"cacheBytes", "cache-bytes", "int64_t", /*default=*/"32768",
            "Cache capacity used for the evicted-reuse verdicts">,
+    Option<"acceptTripUpperBounds", "accept-trip-upper-bounds", "bool",
+           /*default=*/"false",
+           "Accept constant trip-count upper bounds on triangular bands "
+           "instead of failing (what the tiler passes)">,
+    Option<"allBands", "all-bands", "bool", /*default=*/"false",
+           "Report every maximal perfect band, including bands nested inside "
+           "an imperfect enclosing loop, instead of only bands rooted at a "
+           "top-level affine.for">,
   ];
 
   let dependentDialects = ["mlir::affine::AffineDialect"];
@@ -536,6 +544,10 @@ def DrAffineLoopTilePass
            "gate in the SPMD tile->shard pipeline. Overrides llc-gate when set.">,
     Option<"separate", "separate", "bool", /*default=*/"false",
            "Separate full and partial tiles (default: false)">,
+    Option<"allBands", "all-bands", "bool", /*default=*/"false",
+           "Consider every maximal perfect band, including bands nested "
+           "inside an imperfect enclosing loop (ping-pong stencils), instead "
+           "of only bands rooted at a top-level affine.for">,
     Option<"tileSize", "tile-size", "unsigned", /*default=*/"",
            "Use this tile size for all loops">,
     ListOption<"tileSizes", "tile-sizes", "unsigned",
@@ -640,6 +652,13 @@ def MemoryFissionPass
            "L2 cache hit latency in cycles">,
     Option<"l3Latency", "l3-latency", "unsigned", "40",
            "L3 cache hit latency in cycles">,
+    Option<"memLatency", "mem-latency", "unsigned", "200",
+           "Main-memory access latency in cycles. Like the sizes/latencies "
+           "above this is an OVERRIDE: unset, the value comes from the "
+           "MachineModel (cost-model JSON, else built-in default).">,
+    Option<"cacheLineSize", "cache-line-size", "unsigned", "64",
+           "Cache line size in bytes (128 on Apple M-series). Override; unset, "
+           "it comes from the MachineModel.">,
     Option<"testDiagnostics", "test-diagnostics", "bool", "false",
            "Emit remarks for test diagnostics">,
     Option<"cpuCostModelFile", "cpu-cost-model-file", "std::string", /*default=*/"",
