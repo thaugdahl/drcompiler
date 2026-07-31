@@ -1,0 +1,5 @@
+kernel,verdict,misses_base,missesL1_base,missesL2_base,misses_tiled,missesL1_tiled,missesL2_tiled,rationale
+seidel-2d,TILE,999250000,749250000,250000000,1110500,610500,500000,"TILE sizes=[500, 9, 9] footprint=2592 target=262144 traffic=320000000"
+2mm,TILE,2071901600,1864050400,207851200,221704000,215166400,6537600,"REJECT reason=no-evicted-reuse footprint=5760000 target=262144|TILE sizes=[50, 100, 110] footprint=262144 target=262144 traffic=306708480|REJECT reason=no-evicted-reuse footprint=7680000 target=262144|TILE sizes=[50, 120, 100] footprint=262144 target=262144 traffic=340787200"
+gemm,TILE,331776000,165888000,165888000,193680800,190688000,2992800,"REJECT reason=no-evicted-reuse footprint=8800000 target=262144|TILE sizes=[125, 120, 55] footprint=262144 target=262144 traffic=471859200"
+floyd-warshall,TILE,2743983968,1371999650,1371984318,1595377121,1571373675,24003446,"TILE sizes=[112, 112, 112] footprint=65536 target=262144 traffic=2791309312"

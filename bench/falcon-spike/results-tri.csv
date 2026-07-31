@@ -1,0 +1,11 @@
+kernel,verdict,misses_base,missesL1_base,missesL2_base,misses_tiled,missesL1_tiled,missesL2_tiled,rationale
+cholesky,REJECT,334587826,167778426,166809400,334587826,167778426,166809400,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+durbin,REJECT,269381,268631,750,269381,268631,750,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+gramschmidt,REJECT,2971913015,2881290600,90622415,3062489952,2881470293,181019659,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+lu,REJECT,2982274463,2647699348,334575115,2982274463,2647699348,334575115,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+ludcmp,REJECT,2985665551,2650587758,335077793,2985665551,2650587758,335077793,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)|REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)|REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+nussinov,REJECT,2682316608,2516824098,165492510,2682316608,2516824098,165492510,""
+symm,REJECT,1360626125,1210520699,150105426,1360626125,1210520699,150105426,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"
+syr2k,TILE,1655759480,1475648707,180110773,1655879352,1475677979,180201373,"REJECT reason=no-evicted-reuse footprint=11520000 target=262144|TILE sizes=[120, 50, 64] footprint=262144 target=262144 traffic=996147200"
+syrk,TILE,796228019,706325604,89902415,796370027,706377012,89993015,"REJECT reason=no-evicted-reuse footprint=11520000 target=262144|TILE sizes=[120, 125, 64] footprint=262144 target=262144 traffic=498073600"
+trisolv,REJECT,503000,251500,251500,503000,251500,251500,"REJECT reason=out-of-model (non-constant trips, imperfect below band, or non-affine references)"

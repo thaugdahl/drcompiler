@@ -1,0 +1,6 @@
+# Oracle run artifacts: per-kernel MLIR dumps, lazystack JSON and logs.
+# Regenerate with oracle-vs-model.sh / forced-tile.sh / tile-shape-sweep.sh.
+# The CSV summaries they roll up to are checked in where they are cited.
+results/
+results-*/
+results*.log
