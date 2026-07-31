@@ -73,7 +73,7 @@ cgeist (LLVM 18) and dr-opt (LLVM 22) are decoupled via textual `.mlir` files �
    - `dr-dot-file=<path>`: emit GraphViz provenance graph
    - Cache params: `dr-l1-size`, `dr-l2-size`, `dr-l1-latency`, `dr-l2-latency`, `dr-l3-latency`, `dr-mem-latency`, `dr-cache-line-size` (default 64 bytes — used for stride-aware partial-remat leaf cost: `effBytes = min(cacheLineSize, stride*elemSize+1)`, `cost = ceil(missLat * effBytes / cacheLineSize)`)
 
-3. **`memory-fission`** (`lib/Transforms/MemoryFission.cpp`) — Inverse of loop fusion. Splits fused loops when materializing to buffers is cheaper (cache-aware cost model). Supports nested loop fission.
+3. **`memory-fission`** (`lib/Transforms/MemoryFission.cpp`) — Inverse of loop fusion. Splits fused loops when materializing to buffers is cheaper (cache-aware cost model). Supports nested loop fission. Cache geometry options — `l1/l2/l3-size`, `l1/l2/l3-latency`, `mem-latency`, `cache-line-size`, `llc-sharers`, `l2-occupancy-pct` — are OVERRIDES: unset, each value comes from the `MachineModel` (`cpu-cost-model-file` JSON, else built-in default).
 
 ### Key headers
 

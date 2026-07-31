@@ -1,0 +1,8 @@
+{
+  "default_cost": 5,
+  "cache": {
+    "l3_size": 4194304,
+    "mem_latency": 20,
+    "cache_line": 128
+  }
+}

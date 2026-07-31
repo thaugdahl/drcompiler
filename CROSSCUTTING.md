@@ -238,6 +238,25 @@ are NOT byte-identical and belong in the implementation phases.
   default 64); the tiler passes the JSON-resolved line.
 - ✅ `costmodel_p0f` — the LoopFusion fork's JSON merge now folds `cacheLineSize`
   and `llcSharers` (was line-non-portable + contention-blind, sharers pinned 1).
+- ✅ `costmodel_p0g` — `kIssueWidth = 4` (the last hardcoded core-µarch constant
+  on the DR decision path, `CacheCostModel.cpp`) becomes
+  `ArchParams::issueWidth`: per-handler default, JSON `arch.issue_width`,
+  threaded to all three `estimateComputeCost` call sites from ArchParams already
+  in scope. Byte-identical — every validated handler (generic / avx2 / avx512 /
+  neon) defaults to 4. Pinned by
+  `test/DataRecomputation/issue-width-throughput-floor.mlir` (one wide-shallow
+  cone priced 167 / 42 / 23 at width 1 / 4 / 8).
+- ✅ `costmodel_p0h` — fission gains the `mem-latency` / `cache-line-size` CLI
+  overrides it lacked, so its geometry follows the full CLI > JSON > default
+  contract rather than JSON > default. Pinned by
+  `test/MemoryFission/fission-mem-latency-resolution.mlir` (all four tiers,
+  including CLI-beats-JSON).
+- ✅ `costmodel_p0i` — two handlers behind the existing `ArchHandler` interface:
+  `apple-m-series` (NEON 128 b, 31/32/32/0, **issue 8** — the first non-4 part)
+  and `arm-sve` (VL floor 128 b, pred budget 16). `pickHandlerForTriple` routes
+  aarch64-darwin to apple-m-series; SVE is name-only (a triple never implies the
+  feature). Apple's 128 B line stays *memory* geometry — supply it as
+  `cache.cache_line: 128` in a probed JSON, not from the handler.
 
 **Deferred — NOT byte-identical; these are design changes, do in P1/P2:**
 - **Register-budget merge** (`vecRegBudget=24` vs `RegisterParams.vecBudget=16/32`)
@@ -422,7 +441,7 @@ becomes: measure the all-core 512-bit downclock, set `avx512_freq_throttle` +
 **Phasing** (each phase byte-identical at `nThreads=1`, gated on
 `hasExplicitThreadModel`):
 - ✅ **P0** — the III.1 single-thread unification cleanups (no behavior change).
-  Landed: `costmodel_p0a/d/e/f`.
+  Landed: `costmodel_p0a/d/e/f/g/h/i`.
 - ✅ **P1** — `ThreadModel` fields + `effectiveCache()` + `streamCycles()`
   bandwidth term, wired into fission (`costmodel_p1a`) and DR (`costmodel_p1b`),
   the memory-bound consumers. Gated, byte-identical at default. Validated at the

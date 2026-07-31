@@ -249,10 +249,10 @@ void MemoryFissionPass::runOnOperation() {
 
   // Cache hierarchy from the single source of truth (MachineModel,
   // COSTMODEL_V4_SPEC §2): JSON file unless a CLI option was set explicitly.
-  // memLatency / cacheLineSize have no CLI option here (fission never needed to
-  // override them), so they come straight from the machine model instead of the
-  // old hardcoded 200/64 literals (CROSSCUTTING.md P0 drift fix).
-  unsigned memLatency = 200, cacheLineSize = 64;
+  // memLatency / cacheLineSize used to be function-local literals (200/64);
+  // they now follow the same three-tier contract as every other geometry field
+  // (CLI > JSON > built-in default), so a non-64 B line — Apple M-series — is
+  // reachable here without editing the pass.
   // Hoisted to function scope so the thread model (roofline term below) is
   // reachable at the materialize-vs-recompute decision.
   drcompiler::MachineModel mm =
@@ -272,8 +272,10 @@ void MemoryFissionPass::runOnOperation() {
       l3Latency = mm.l3Lat;
     if (!llcSharers.hasValue())
       llcSharers = mm.llcSharers;
-    memLatency = mm.memLat;
-    cacheLineSize = static_cast<unsigned>(mm.cacheLine);
+    if (!memLatency.hasValue())
+      memLatency = mm.memLat;
+    if (!cacheLineSize.hasValue())
+      cacheLineSize = static_cast<unsigned>(mm.cacheLine);
   }
 
   moduleOp.walk([&](mlir::FunctionOpInterface funcOp) {
