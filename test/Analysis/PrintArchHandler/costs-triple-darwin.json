@@ -1,0 +1,6 @@
+{
+  "default_cost": 5,
+  "arch": {
+    "triplet": "arm64-apple-macosx"
+  }
+}

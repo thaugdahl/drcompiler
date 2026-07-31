@@ -33,6 +33,20 @@ struct ArchParams {
   llvm::Triple triple;
   unsigned vectorWidthBits = 128;
 
+  // Sustained superscalar issue width, in ops/cycle: the divisor of the
+  // THROUGHPUT floor in `estimateComputeCost` (a recompute cone costs at least
+  // its op count spread over this many issue slots, and at least its dependency
+  // critical path).  Was a file-local `kIssueWidth = 4` in CacheCostModel.cpp —
+  // the last hardcoded core-microarchitecture constant on the recomputation
+  // decision path (COSTMODEL_PORTABILITY_FINDINGS.md gap #4).  Only wide
+  // INDEPENDENT expressions are sensitive to it; dependent chains are
+  // critical-path-bound and see no effect.
+  //
+  // Every handler validated in the paper (generic / avx2 / avx512 / neon) keeps
+  // 4, so this refactor is byte-identical on those targets; the wide-issue
+  // Apple-M handler is the first to differ.  JSON key: `arch.issue_width`.
+  unsigned issueWidth = 4;
+
   // Weights for the unified cost combiner.
   double alphaMem = 1.0;
   double betaReg = 1.0;

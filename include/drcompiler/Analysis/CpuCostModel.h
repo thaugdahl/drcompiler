@@ -34,6 +34,10 @@ struct CpuArchJsonParams {
   std::optional<std::string> triplet;
   std::optional<std::string> handler;
   std::optional<unsigned> vectorWidthBits;
+  // Sustained superscalar issue width (ArchParams::issueWidth): the divisor of
+  // the recompute-cone throughput floor.  Absence keeps the handler default
+  // (4 on every x86/NEON handler, 8 on apple-m-series).
+  std::optional<unsigned> issueWidth;
   std::optional<std::string> spillStrategy;
   std::optional<double> alphaMem;
   std::optional<double> betaReg;

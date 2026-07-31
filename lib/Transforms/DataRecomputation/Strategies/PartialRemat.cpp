@@ -80,7 +80,8 @@ Outcome PartialRemat::tryApply(LoadCandidate &c, StrategyEnv &env) {
   }
 
   // Cost gating differs between modes.
-  unsigned alu = estimateComputeCost(c.storedValue, env.costModel);
+  unsigned alu = estimateComputeCost(c.storedValue, env.costModel,
+                                     env.archParams.issueWidth);
   unsigned leaf = estimateLeafLoadsCost(partialLeaves, c.loadOp, env.cache,
                                         env.allocRootFor);
   mlir::Value loadMemref = drcompiler::getLoadStoreMemref(c.loadOp);

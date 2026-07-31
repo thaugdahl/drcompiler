@@ -67,6 +67,8 @@ struct PrintArchHandlerPass
       params.triple = llvm::Triple(*archJson.triplet);
     if (archJson.vectorWidthBits)
       params.vectorWidthBits = *archJson.vectorWidthBits;
+    if (archJson.issueWidth)
+      params.issueWidth = *archJson.issueWidth;
     if (archJson.alphaMem)
       params.alphaMem = *archJson.alphaMem;
     if (archJson.betaReg)
@@ -92,6 +94,7 @@ struct PrintArchHandlerPass
     llvm::raw_string_ostream os(buf);
     os << "arch-handler: " << handler->name()
        << " vec_width=" << params.vectorWidthBits
+       << " issue=" << params.issueWidth
        << " gp=" << regs.gpBudget << " fp=" << regs.fpBudget
        << " vec=" << regs.vecBudget << " pred=" << regs.predBudget
        << " spill_reload=" << regs.spillReloadCycles

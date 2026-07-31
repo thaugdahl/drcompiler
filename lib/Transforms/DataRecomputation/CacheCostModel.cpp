@@ -26,12 +26,6 @@ namespace dr {
 
 namespace {
 
-/// Generic superscalar issue width used for the throughput floor below. The
-/// critical path dominates for dependent chains, so this only matters for wide
-/// independent expressions. Kept conservative; could be sourced per-arch from
-/// ArchParams in a follow-up.
-constexpr unsigned kIssueWidth = 4;
-
 /// An SSA value is a compute "leaf" (cost 0, depth 0) when it is a load: the
 /// value is already resident in a register or memory and is not recomputed.
 bool isComputeLeaf(mlir::Operation *defOp) {
@@ -76,7 +70,8 @@ unsigned computeCostWalk(mlir::Value val,
 } // namespace
 
 unsigned estimateComputeCost(mlir::Value val,
-                             const drcompiler::CpuCostModel &costModel) {
+                             const drcompiler::CpuCostModel &costModel,
+                             unsigned issueWidth) {
   llvm::DenseMap<mlir::Value, unsigned> depthMemo;
   llvm::SmallDenseSet<mlir::Operation *> countedOps;
   unsigned totalCost = 0;
@@ -86,13 +81,19 @@ unsigned estimateComputeCost(mlir::Value val,
   // The realized cost of recomputing an expression on an out-of-order,
   // superscalar core is bounded below by (a) its dependency critical path —
   // you cannot finish before the longest dependent chain — and (b) its
-  // throughput, i.e. total work spread across kIssueWidth issue ports. The
+  // throughput, i.e. total work spread across the target's issue ports. The
   // previous model returned `totalCost` (sum of all ops), which over-priced
   // wide/independent expressions and biased every keep-vs-recompute decision
   // toward buffering. For a purely linear dependent chain criticalPath ==
   // totalCost, so this is a no-op there and changes only wide expressions.
   // See COSTMODEL_FINDINGS_CLAUDE.md §2.4 (A1).
-  unsigned throughput = (totalCost + kIssueWidth - 1) / kIssueWidth;
+  //
+  // The width is the target's, from ArchParams::issueWidth (handler default,
+  // JSON-overridable via `arch.issue_width`) — it was a hardcoded 4 until the
+  // portability cleanup. Clamped to >= 1: a malformed `issue_width: 0` must not
+  // divide by zero, and 1 is the honest reading of "no superscalar overlap".
+  unsigned width = std::max(issueWidth, 1u);
+  unsigned throughput = (totalCost + width - 1) / width;
   return std::max(criticalPath, throughput);
 }
 

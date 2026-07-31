@@ -7,6 +7,8 @@ add_mlir_library(DRCompAnalysis
   ArchHandlers/X86_64_AVX2.cpp
   ArchHandlers/X86_64_AVX512.cpp
   ArchHandlers/ARM_Neon.cpp
+  ArchHandlers/ARM_SVE.cpp
+  ArchHandlers/AppleMSeries.cpp
   RegisterPressureAnalysis.cpp
   ReuseAnalysis.cpp
   SpillStrategy.cpp

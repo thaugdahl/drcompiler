@@ -30,6 +30,10 @@ public:
   ArchParams defaultParams() const override {
     ArchParams p;
     p.vectorWidthBits = 128;
+    // Conservative generic-superscalar issue width — the value the throughput
+    // floor in estimateComputeCost used unconditionally before it became a
+    // per-handler field.
+    p.issueWidth = 4;
     return p;
   }
 

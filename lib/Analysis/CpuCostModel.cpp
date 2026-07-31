@@ -186,6 +186,7 @@ CpuCostModel CpuCostModel::loadFromFile(llvm::StringRef path) {
     readString("triplet", m.arch.triplet);
     readString("handler", m.arch.handler);
     readUnsigned("vector_width_bits", m.arch.vectorWidthBits);
+    readUnsigned("issue_width", m.arch.issueWidth);
     readString("spill_strategy", m.arch.spillStrategy);
     // Vector-execution model (WP-G1).
     readUnsigned("vector_bits_native", m.arch.vectorBitsNative);

@@ -195,7 +195,9 @@ computeBufferElimCost(mlir::Operation *allocRoot,
   unsigned maxTreeSize = 0;
   llvm::SmallDenseSet<llvm::hash_code> hashes;
   for (mlir::Value sv : storedVals) {
-    perElemCost = std::max(perElemCost, estimateComputeCost(sv, cpu));
+    perElemCost = std::max(
+        perElemCost,
+        estimateComputeCost(sv, cpu, tuning.archParams.issueWidth));
     maxTreeSize = std::max(maxTreeSize, treeSize(sv));
     hashes.insert(structuralHash(sv));
   }

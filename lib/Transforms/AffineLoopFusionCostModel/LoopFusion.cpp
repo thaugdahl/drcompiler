@@ -2201,6 +2201,8 @@ void DrAffineLoopFusionPass::runOnOperation() {
     config.archParams.triple = llvm::Triple(*archJson.triplet);
   if (archJson.vectorWidthBits)
     config.archParams.vectorWidthBits = *archJson.vectorWidthBits;
+  if (archJson.issueWidth)
+    config.archParams.issueWidth = *archJson.issueWidth;
   if (archJson.alphaMem)
     config.archParams.alphaMem = *archJson.alphaMem;
   if (archJson.betaReg)

@@ -22,6 +22,8 @@ public:
     ArchParams p;
     p.triple = llvm::Triple("aarch64-unknown-linux-gnu");
     p.vectorWidthBits = 128;
+    // Neoverse N1/N2-class front end: 4-wide decode/rename.
+    p.issueWidth = 4;
     return p;
   }
 

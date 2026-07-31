@@ -23,6 +23,9 @@ public:
     ArchParams p;
     p.triple = llvm::Triple("x86_64-unknown-linux-gnu");
     p.vectorWidthBits = 512;
+    // 4 ops/cycle — see X86_64_AVX2.cpp: the validated x86 value, kept so this
+    // parameterization is byte-identical on every machine the paper reports.
+    p.issueWidth = 4;
     return p;
   }
 

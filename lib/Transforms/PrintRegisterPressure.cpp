@@ -60,6 +60,8 @@ ResolvedConfig resolveConfig(llvm::StringRef jsonPath,
     cfg.archParams.triple = llvm::Triple(*archJson.triplet);
   if (archJson.vectorWidthBits)
     cfg.archParams.vectorWidthBits = *archJson.vectorWidthBits;
+  if (archJson.issueWidth)
+    cfg.archParams.issueWidth = *archJson.issueWidth;
   if (archJson.alphaMem)
     cfg.archParams.alphaMem = *archJson.alphaMem;
   if (archJson.betaReg)

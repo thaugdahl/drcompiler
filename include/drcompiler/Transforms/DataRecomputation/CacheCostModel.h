@@ -59,8 +59,17 @@ struct CacheParams {
 /// Estimate the ALU cost of recomputing a value by walking its SSA operand
 /// tree. Each operation is weighted via the CpuCostModel. Loads and block
 /// arguments are free (they are inputs, not recomputed).
+///
+/// `issueWidth` is the target's sustained superscalar issue width
+/// (ArchParams::issueWidth): the result is the max of the dependency critical
+/// path and the op count spread over that many issue slots, so a wide
+/// INDEPENDENT cone is cheaper on a wide machine and a dependent chain is
+/// insensitive to it. Callers that have already resolved an ArchHandler pass
+/// `archParams.issueWidth`; the default matches the generic handler (and the
+/// `kIssueWidth = 4` literal this parameter replaced).
 unsigned estimateComputeCost(mlir::Value val,
-                             const drcompiler::CpuCostModel &costModel);
+                             const drcompiler::CpuCostModel &costModel,
+                             unsigned issueWidth = 4);
 
 /// Estimate the size of an allocation in bytes. Returns nullopt when the
 /// size cannot be determined statically (non-alloc op, dynamic shape,

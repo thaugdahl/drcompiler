@@ -24,6 +24,11 @@ public:
     ArchParams p;
     p.triple = llvm::Triple("x86_64-unknown-linux-gnu");
     p.vectorWidthBits = 256;
+    // 4 ops/cycle: the value every reported x86 result was produced with.
+    // Wider dispatch is plausible (Zen4 dispatches 6 macro-ops) but unmeasured
+    // here, and raising it re-prices every keep-vs-recompute decision — that
+    // needs its own validation run, not a silent default bump.
+    p.issueWidth = 4;
     return p;
   }
 

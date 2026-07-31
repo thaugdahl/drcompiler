@@ -1450,6 +1450,8 @@ void DataRecomputationPass::runOnOperation() {
       archParams.triple = llvm::Triple(*archJson.triplet);
     if (archJson.vectorWidthBits)
       archParams.vectorWidthBits = *archJson.vectorWidthBits;
+    if (archJson.issueWidth)
+      archParams.issueWidth = *archJson.issueWidth;
     if (archJson.alphaMem)
       archParams.alphaMem = *archJson.alphaMem;
     if (archJson.betaReg)
@@ -2058,7 +2060,8 @@ void DataRecomputationPass::runOnOperation() {
         bufferConsumerCount[allocRoot]++;
 
         // Track the max compute cost across stores to this buffer.
-        unsigned cost = estimateComputeCost(storedVal, costModel);
+        unsigned cost =
+            estimateComputeCost(storedVal, costModel, archParams.issueWidth);
         auto &existing = bufferComputeCost[allocRoot];
         existing = std::max(existing, cost);
       }

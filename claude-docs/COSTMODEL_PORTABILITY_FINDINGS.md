@@ -2,6 +2,80 @@
 
 ---
 
+## Portability cleanup (2026-07-27): gaps #2, #4, #5, #7 closed
+
+Everything the audit below flagged as a hardcoded literal or a missing handler
+is now resolved.  What remains is *validation*, not plumbing.
+
+**Cache geometry (#2, #5)** — landed earlier as `costmodel_p0d/e/f`
+(CROSSCUTTING.md III.1): fission, the tiler's reuse analysis, and the LoopFusion
+fork all read `cacheLine` / `memLatency` / `llcSharers` from `MachineModel`, and
+the fusion fork's stale `{.,262144,0,.}` literal is now the unified Zen4 geometry
+`{32768, 1048576, 33554432, 4, 12, 40, 200, 64}`.  NEW here: fission also gained
+the two CLI overrides it lacked (`mem-latency`, `cache-line-size`), so every
+geometry field it consumes follows the full CLI > JSON > built-in contract
+instead of JSON > default.
+
+**Issue width (#4)** — `kIssueWidth = 4` in `CacheCostModel.cpp` is gone.  The
+throughput divisor is `ArchParams::issueWidth`: a per-handler default,
+overridable from the JSON `arch.issue_width`, threaded to all three
+`estimateComputeCost` call sites (`BufferElim.cpp`, `Strategies/PartialRemat.cpp`,
+`DataRecomputation.cpp`) from the ArchParams each already had in scope.  Clamped
+to >= 1 so a malformed `issue_width: 0` cannot divide by zero.
+
+Byte-identical on every target the paper reports: `generic`, `x86-64-avx2`,
+`x86-64-avx512`, and `arm-neon` all default to 4 — the literal's value.  Zen4
+dispatches 6 macro-ops and raising the x86 default is defensible, but it
+re-prices every keep-vs-recompute decision, so it needs its own validation run
+rather than a silent default bump.  `apple-m-series` (8) is the first handler
+that differs.
+
+**Handlers (#7)** — two new handlers behind the existing interface, no new pass:
+
+| handler | vec | issue | gp/fp/vec/pred | selected by |
+|---|---|---|---|---|
+| `apple-m-series` | 128 (NEON) | 8 | 31/32/32/0 | `aarch64-*-darwin` triple, or by name |
+| `arm-sve` | 128 (VL floor) | 4 | 31/32/32/16 | **name only** |
+
+`pickHandlerForTriple` routes aarch64-darwin to `apple-m-series`; SVE is a
+feature, not an architecture, so no triple implies it.  The Apple 128 B cache
+line is deliberately NOT in the handler — it is memory geometry and belongs in a
+probed `cache.cache_line: 128` JSON (one machine, one description).  AMX is not
+modeled: the code generator never targets it.
+
+SVE models the 128-bit architectural VL *floor*.  That direction is the safe
+one: register pressure computed at VL=128 is never under-estimated on a wider
+implementation, so an accepted candidate stays register-legal.  Vector
+throughput, on the other hand, is under-estimated on a 256/512-bit part — model
+that by pinning `arch.vector_width_bits` (and `vector_bits_native`/`_arch` for
+register blocking) to the deployment target's VL.
+
+**Tests** — `test/Analysis/PrintArchHandler/{apple-m,triple-darwin,sve,issue-width-json}.mlir`
+(the last one pins JSON-over-handler-default precedence: apple-m-series' 8
+overridden to 6).  The eight pre-existing expectations gained the `issue=` field.
+
+**Handler vs MachineModel split (know this before running on ARM):** a handler
+supplies register budgets, classification, combiner weights, and issue width.  It
+does NOT feed `MachineModel`'s vector-execution fields — `vectorBitsNative` /
+`vectorBitsArch` / `vecRegBudget` still come from the JSON `arch` block, and
+without them `hasExplicitVectorModel` stays false, so register blocking keeps the
+static `vl` default (8, the Zen4 value) even under `apple-m-series`.  A real
+Apple-M or SVE run therefore needs a JSON that sets the vector model (128/128 for
+NEON-class parts) and the cache block (128 B line on Apple), not just
+`arch.handler`.  Unifying those two sources is the deferred register-budget merge
+in CROSSCUTTING.md III.1 — it changes the VL decision, so it is not a refactor.
+
+**Still open (hardware, not plumbing):**
+- No handler here has been run on the hardware it describes.  They are
+  structurally complete and unvalidated — same status `arm-neon` always had.
+- `mr`/`nr` are still not arch-derived, so the NEON accumulator-oversizing note
+  in gap #1 below stands for `apple-m-series` and `arm-sve` too.
+- `kIssueWidth`'s successor is a single scalar; a real front end has per-port
+  limits (FP vs load/store vs branch).  Only wide independent cones are
+  sensitive, so this is a modeling choice, not a gap.
+
+---
+
 ## WP-G1 update (2026-06-12): `vl` IS now ISA-derived — gap #1 resolved
 
 `ONNX_O3_GAP_STEPS.md` WP-G1.  The register-block vector width is no longer a
