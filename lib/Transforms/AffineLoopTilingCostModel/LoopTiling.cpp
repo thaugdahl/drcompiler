@@ -94,6 +94,30 @@ getTopLevelTileableBands(func::FuncOp f,
   }
 }
 
+/// Get every maximal perfect band that is valid to tile, including bands
+/// nested inside an imperfect enclosing loop.
+///
+/// Top-level-only enumeration is blind to the ping-pong stencil shape
+/// `for %t { for %i { for %j {A} }  for %i { for %j {B} } }`: the band
+/// truncates to `[%t]` and the reuse analysis then rejects it, because every
+/// subscript names the `%i`/`%j` truncation excluded.  Over PolyBench-L that
+/// blindness accounted for every rejected band and left 15 of 30 kernels with
+/// no analyzable band at all.
+static void
+getAllTileableBands(func::FuncOp f,
+                    std::vector<SmallVector<AffineForOp, 6>> &bands) {
+  SmallVector<SmallVector<AffineForOp, 6>, 4> all;
+  drcompiler::reuse::collectMaximalPerfectBands(f, all);
+  // `collectMaximalPerfectBands` uses Operation::walk, whose default order is
+  // POST-order, so a nested band already precedes the band enclosing it.  That
+  // is the order tiling wants: rewriting an inner band leaves the enclosing
+  // loop handles valid, whereas the reverse can hand tiling a band whose loops
+  // a previous rewrite already replaced.  Do not sort this.
+  for (auto &band : all)
+    if (isTilingValid(band))
+      bands.push_back(std::move(band));
+}
+
 // DR-DIVERGE: ctor renamed to match drcompiler conventions.
 std::unique_ptr<Pass> mlir::createDrAffineLoopTilePass() {
   return std::make_unique<DrAffineLoopTilePass>();
@@ -255,6 +279,10 @@ bool DrAffineLoopTilePass::getTileSizesV2(
   int64_t cacheLine = cm.cacheParams().cacheLine
                           ? static_cast<int64_t>(*cm.cacheParams().cacheLine)
                           : 64;
+  // Footprints are rounded to whole lines against the same geometry, so a
+  // column-strided reference is priced at a line per row rather than an
+  // element (otherwise tile candidates 8x too large look feasible).
+  info.cacheLineBytes = cacheLine;
 
   // Gate on evicted temporal reuse.
   bool anyEvicted = false;
@@ -336,9 +364,18 @@ bool DrAffineLoopTilePass::getTileSizesV2(
     // shared helper would also halve untiled dims, so do it here).
     // Upper-bound-trip dims keep their raw size: their bounds are min/max
     // either way.
-    if (avoidMaxMinBounds && info.tripIsExact[l] && t < info.tripCounts[l])
-      while (info.tripCounts[l] % t != 0)
-        --t;
+    // Snapping is only worth it if a divisor is CLOSE: the decrement used to
+    // be unbounded, so a trip count with no nearby divisor collapsed the tile
+    // (trip 398, chosen 16 -> 15, 14, ... -> 2, a quarter of a cache line).
+    // Paying min/max bound overhead beats an order-of-magnitude worse tile.
+    if (avoidMaxMinBounds && info.tripIsExact[l] && t < info.tripCounts[l]) {
+      uint64_t floorSize = std::max<uint64_t>(best[l] / 2, 1);
+      uint64_t snapped = t;
+      while (snapped >= floorSize && info.tripCounts[l] % snapped != 0)
+        --snapped;
+      if (snapped >= floorSize && info.tripCounts[l] % snapped == 0)
+        t = snapped;
+    }
     (*tileSizes)[l] = static_cast<unsigned>(t);
   }
 
@@ -367,7 +404,10 @@ void DrAffineLoopTilePass::runOnOperation() {
 
   // Bands of loops to tile.
   std::vector<SmallVector<AffineForOp, 6>> bands;
-  getTopLevelTileableBands(getOperation(), bands);
+  if (allBands)
+    getAllTileableBands(getOperation(), bands);
+  else
+    getTopLevelTileableBands(getOperation(), bands);
 
   // Tile each band.
   for (auto &band : bands) {
